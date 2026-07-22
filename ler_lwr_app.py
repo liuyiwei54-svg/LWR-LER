@@ -15,7 +15,7 @@ import tempfile
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import colorchooser, filedialog, messagebox, scrolledtext, ttk
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
@@ -44,6 +44,14 @@ MIN_ROI_WIDTH = 24
 MIN_ROI_HEIGHT = 80
 ROI_HANDLE_SIZE = 5
 ROI_HANDLE_HIT = 10
+ANNOTATION_HANDLE_HIT = 10
+ANNOTATION_COLORS = {
+    "length": "#ffde59",
+    "rectangle": "#ff6b6b",
+    "circle": "#a78bfa",
+    "hexagon": "#38bdf8",
+}
+MAX_UNDO_STEPS = 30
 LOCK_PATH = Path(tempfile.gettempdir()) / "sem_ler_lwr_app.lock"
 
 
@@ -64,6 +72,26 @@ class AnalysisResult:
     edge_correlation: float
     pixel_size_nm: float
     rejected_rows: int
+
+
+@dataclass
+class MeasurementAnnotation:
+    """One editable general-purpose measurement drawn in working-image pixels."""
+
+    kind: str
+    bounds_px: tuple[float, float, float, float]
+    color: str | None = None
+
+
+@dataclass
+class EditorState:
+    roi_canvas: tuple[float, float, float, float] | None
+    annotations: list[MeasurementAnnotation]
+    active_annotation_index: int | None
+    rotation_degrees: float
+    preprocess_enabled: bool
+    result: AnalysisResult | None
+    analysis_origin: tuple[int, int] | None
 
 
 def read_sem_pixel_size_nm(image: Image.Image) -> float | None:
@@ -368,7 +396,7 @@ def analyze_roi(image: np.ndarray, pixel_size_nm: float) -> AnalysisResult:
 class LERLWRApp(AppBase):
     def __init__(self) -> None:
         super().__init__()
-        self.title("SEM LER / LWR 测量工具")
+        self.title("SEM 测量工具（LER/LWR + 尺寸标注）")
         self.minsize(1100, 780)
         self.image_path: Path | None = None
         self.original_image: np.ndarray | None = None
@@ -385,6 +413,14 @@ class LERLWRApp(AppBase):
         self.roi_drag_anchor: tuple[float, float] | None = None
         self.roi_start_bounds: tuple[float, float, float, float] | None = None
         self.roi_was_changed = False
+        self.annotations: list[MeasurementAnnotation] = []
+        self.active_annotation_index: int | None = None
+        self.annotation_drag_mode: str | None = None
+        self.annotation_drag_anchor: tuple[float, float] | None = None
+        self.annotation_start_bounds: tuple[float, float, float, float] | None = None
+        self.annotation_was_changed = False
+        self.undo_history: list[EditorState] = []
+        self.pending_undo_state: EditorState | None = None
         self.space_held = False
         self.panning = False
         self.result: AnalysisResult | None = None
@@ -400,35 +436,54 @@ class LERLWRApp(AppBase):
         self.sigma_multiplier_var = tk.DoubleVar(value=1.0)
         self.lcdu_summary_var = tk.StringVar(value="LCDU 样本：0 条线")
         self.rotation_var = tk.StringVar(value="0.00")
+        self.measurement_tool_var = tk.StringVar(value="ROI（LER/LWR）")
+        self.measurement_color = ANNOTATION_COLORS["length"]
         self.zoom_slider_var = tk.DoubleVar(value=1.0)
         self.zoom_percent_var = tk.StringVar(value="100%")
         self.status_var = tk.StringVar(value="打开一张俯视 SEM 图，然后框选一条线及两侧背景。")
         self.result_var = tk.StringVar(value="尚未分析")
 
         self._build_ui()
+        self.pixel_size_var.trace_add("write", self.refresh_annotation_labels)
 
     def _build_ui(self) -> None:
         controls = ttk.Frame(self, padding=10)
         controls.pack(side=tk.TOP, fill=tk.X)
-        ttk.Button(controls, text="打开 SEM 图像", command=self.open_image).grid(row=0, column=0, padx=(0, 8))
-        ttk.Button(controls, text="查看 TIFF 元数据", command=self.show_metadata).grid(row=0, column=1, padx=(0, 10))
-        ttk.Label(controls, text="像素尺寸 (nm/pixel):").grid(row=0, column=2, sticky="e")
-        ttk.Entry(controls, textvariable=self.pixel_size_var, width=10).grid(row=0, column=3, padx=(4, 12))
-        ttk.Label(controls, textvariable=self.metadata_var, foreground="#426b2d").grid(row=0, column=4, padx=(0, 12), sticky="w")
+        file_menu = tk.Menu(controls, tearoff=False)
+        file_menu.add_command(label="打开 SEM 图像", command=self.open_image)
+        file_menu.add_command(label="查看 TIFF 元数据", command=self.show_metadata)
+        file_menu.add_separator()
+        file_menu.add_command(label="导出 CSV", command=self.export_csv)
+        file_menu.add_command(label="导出标注/拟合图片", command=self.export_annotated_image)
+        ttk.Menubutton(controls, text="菜单 ▾", menu=file_menu).grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(controls, text="像素尺寸 (nm/pixel):").grid(row=0, column=1, sticky="e")
+        ttk.Entry(controls, textvariable=self.pixel_size_var, width=10).grid(row=0, column=2, padx=(4, 12))
+        ttk.Label(controls, textvariable=self.metadata_var, foreground="#426b2d").grid(row=0, column=3, padx=(0, 12), sticky="w")
         ttk.Checkbutton(
             controls,
             text="归一化 + 3×3 去噪",
             variable=self.preprocess_var,
             command=self.refresh_preprocessing,
-        ).grid(row=0, column=5, padx=(0, 12))
-        ttk.Button(controls, text="自动校正 ROI 倾角", command=self.auto_align_roi).grid(row=0, column=6, padx=(0, 8))
-        ttk.Button(controls, text="重置角度", command=self.reset_rotation).grid(row=0, column=7, padx=(0, 12))
-        ttk.Button(controls, text="分析选区", command=self.run_analysis).grid(row=0, column=8, padx=(0, 12))
-        ttk.Button(controls, text="导出 CSV", command=self.export_csv).grid(row=0, column=9, padx=(0, 8))
-        ttk.Button(controls, text="导出拟合图片", command=self.export_annotated_image).grid(row=0, column=10)
+        ).grid(row=0, column=4, padx=(0, 12))
+        ttk.Button(controls, text="自动校正 ROI 倾角", command=self.auto_align_roi).grid(row=0, column=5, padx=(0, 8))
+        ttk.Button(controls, text="重置角度", command=self.reset_rotation).grid(row=0, column=6, padx=(0, 12))
+        ttk.Button(controls, text="分析选区", command=self.run_analysis).grid(row=0, column=7, padx=(0, 12))
+        ttk.Label(controls, text="测量工具").grid(row=0, column=8, sticky="e")
+        measurement_tool = ttk.Combobox(
+            controls,
+            textvariable=self.measurement_tool_var,
+            state="readonly",
+            values=("ROI（LER/LWR）", "长度", "矩形", "圆形", "正六边形"),
+            width=13,
+        )
+        measurement_tool.grid(row=0, column=9, padx=(4, 8))
+        measurement_tool.bind("<<ComboboxSelected>>", self.change_measurement_tool)
+        self.color_button = tk.Button(controls, text="线条颜色", command=self.choose_measurement_color, relief=tk.GROOVE)
+        self.color_button.grid(row=0, column=10, padx=(0, 8))
+        self.update_measurement_color_button()
 
         multiplier = ttk.LabelFrame(controls, text="显示/导出倍数", padding=(8, 2))
-        multiplier.grid(row=0, column=11, padx=(20, 0), sticky="ew")
+        multiplier.grid(row=0, column=11, padx=(8, 0), sticky="ew")
         ttk.Scale(
             multiplier,
             from_=0.5,
@@ -475,20 +530,27 @@ class LERLWRApp(AppBase):
         ttk.Button(zoom_controls, text="+0.1°", width=6, command=lambda: self.rotate_manually(0.1)).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(zoom_controls, text="+1°", width=5, command=lambda: self.rotate_manually(1.0)).pack(side=tk.LEFT)
 
+        ttk.Separator(zoom_controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
+        ttk.Label(zoom_controls, text="标注管理").pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(zoom_controls, text="删除标注", command=self.delete_active_annotation).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(zoom_controls, text="清空标注", command=self.clear_annotations).pack(side=tk.LEFT)
+
         self.canvas = tk.Canvas(image_frame, background="#202020", highlightthickness=0, width=780, height=620, takefocus=True)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.bind("<ButtonPress-1>", self.start_roi)
-        self.canvas.bind("<B1-Motion>", self.move_roi)
-        self.canvas.bind("<ButtonRelease-1>", self.finish_roi)
+        self.canvas.bind("<ButtonPress-1>", self.start_canvas_action)
+        self.canvas.bind("<B1-Motion>", self.move_canvas_action)
+        self.canvas.bind("<ButtonRelease-1>", self.finish_canvas_action)
         self.canvas.bind("<MouseWheel>", self.zoom_with_space_wheel)
         self.canvas.bind("<Button-4>", self.zoom_with_space_wheel)
         self.canvas.bind("<Button-5>", self.zoom_with_space_wheel)
         self.canvas.bind("<Enter>", lambda _event: self.canvas.focus_set())
         self.canvas.bind("<Motion>", self.update_canvas_cursor)
-        self.canvas.bind("<BackSpace>", self.clear_roi)
-        self.canvas.bind("<Delete>", self.clear_roi)
+        self.canvas.bind("<BackSpace>", self.clear_selection)
+        self.canvas.bind("<Delete>", self.clear_selection)
         self.bind_all("<KeyPress-space>", self.start_pan_mode)
         self.bind_all("<KeyRelease-space>", self.end_pan_mode)
+        self.bind_all("<Command-z>", self.undo_last_action)
+        self.bind_all("<Control-z>", self.undo_last_action)
         if DND_AVAILABLE:
             self.drop_target_register(DND_FILES)
             self.dnd_bind("<<Drop>>", self.drop_file)
@@ -516,11 +578,14 @@ class LERLWRApp(AppBase):
             "3. 倾斜图案：先框选，再点“自动校正 ROI 倾角”。\n"
             "4. 可用底部手动旋转微调角度，再重新框选分析。\n"
             "5. 默认输出 1σ；拖动滑块可改为 kσ。\n\n"
+            "通用测量：在底部工具中选择长度、矩形、圆形或正六边形后拖动创建。\n"
+            "点击已有图形可移动或调整；尺寸会按 nm/pixel 自动标注。\n"
+            "未填写像素尺寸时，通用测量暂以 px 显示。\n\n"
             "底部缩放条：拖动滑块或点 − / + 调整大小。\n"
             "按住空格 + 鼠标滚轮：以鼠标位置缩放。\n"
             "按住空格 + 左键拖动：平移图像。\n\n"
             "框选后可拖动绿色点调整范围；拖框内或中心点可移动选区。\n"
-            "Backspace 可删除选区。\n\n"
+            "选中通用标注时 Backspace 删除标注，否则删除 ROI。\n\n"
             "默认使用 1%–99% 归一化和 3×3 中值去噪。\n"
             "如需比较原始图，可取消勾选预处理。\n\n"
             "本版假设线条沿竖直方向。\n"
@@ -568,6 +633,8 @@ class LERLWRApp(AppBase):
             messagebox.showerror("无法读取", f"无法读取图像：\n{exc}")
             return
         self.image_path = path
+        self.undo_history.clear()
+        self.pending_undo_state = None
         self.rotation_degrees = 0.0
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
         self.reset_zoom_control()
@@ -583,9 +650,60 @@ class LERLWRApp(AppBase):
         self.lcdu_cd_samples_nm.clear()
         self.update_lcdu_summary_text()
         self.roi_canvas = None
+        self.annotations.clear()
+        self.active_annotation_index = None
         self.draw_image(reset_view=True)
         self.result_var.set("请框选一条线及两侧背景，然后点击“分析选区”。")
         self.status_var.set(f"已打开并完成预处理：{self.image_path.name}  ({self.raw_image.shape[1]} × {self.raw_image.shape[0]} px)")
+
+    def snapshot_editor_state(self) -> EditorState:
+        annotations = [MeasurementAnnotation(item.kind, item.bounds_px, item.color) for item in self.annotations]
+        return EditorState(
+            self.roi_canvas,
+            annotations,
+            self.active_annotation_index,
+            self.rotation_degrees,
+            self.preprocess_var.get(),
+            self.result,
+            self.analysis_origin,
+        )
+
+    def record_undo_state(self) -> None:
+        if self.raw_image is None:
+            return
+        self.undo_history.append(self.snapshot_editor_state())
+        del self.undo_history[:-MAX_UNDO_STEPS]
+
+    def begin_undoable_edit(self) -> None:
+        self.pending_undo_state = self.snapshot_editor_state() if self.raw_image is not None else None
+
+    def commit_undoable_edit(self) -> None:
+        if self.pending_undo_state is not None:
+            self.undo_history.append(self.pending_undo_state)
+            del self.undo_history[:-MAX_UNDO_STEPS]
+        self.pending_undo_state = None
+
+    def undo_last_action(self, _event: tk.Event | None = None) -> str:
+        if not self.undo_history:
+            self.status_var.set("没有可撤销的操作。")
+            return "break"
+        state = self.undo_history.pop()
+        self.roi_canvas = state.roi_canvas
+        self.annotations = [MeasurementAnnotation(item.kind, item.bounds_px, item.color) for item in state.annotations]
+        self.active_annotation_index = state.active_annotation_index
+        self.rotation_degrees = state.rotation_degrees
+        self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        self.preprocess_var.set(state.preprocess_enabled)
+        self.result = state.result
+        self.analysis_origin = state.analysis_origin
+        self.rebuild_working_images()
+        self.draw_image()
+        if self.result is None:
+            self.result_var.set("已撤销上一步操作。")
+        else:
+            self.update_result_text()
+        self.status_var.set("已撤销上一步操作。")
+        return "break"
 
     def rebuild_working_images(self) -> None:
         if self.original_image is None:
@@ -600,6 +718,7 @@ class LERLWRApp(AppBase):
             if abs(correction) < 0.05:
                 self.status_var.set("当前 ROI 已接近竖直，无需旋转。")
                 return
+            self.record_undo_state()
             view_center = self.current_view_center()
             self.rotation_degrees += correction
             self.rotation_var.set(f"{self.rotation_degrees:.2f}")
@@ -607,6 +726,7 @@ class LERLWRApp(AppBase):
             self.result = None
             self.analysis_origin = None
             self.roi_canvas = None
+            self.clear_annotations(redraw=False, record_history=False)
             self.draw_image()
             self.restore_view_center(view_center)
             self.result_var.set("倾角已校正；请在校正后的图像上重新框选 ROI。")
@@ -617,6 +737,7 @@ class LERLWRApp(AppBase):
     def reset_rotation(self) -> None:
         if self.original_image is None or abs(self.rotation_degrees) < 1e-12:
             return
+        self.record_undo_state()
         self.rotation_degrees = 0.0
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
         self.reset_zoom_control()
@@ -624,6 +745,7 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.roi_canvas = None
+        self.clear_annotations(redraw=False, record_history=False)
         self.draw_image(reset_view=True)
         self.result_var.set("已恢复原始图像方向；请重新框选 ROI。")
         self.status_var.set("已重置倾角校正。")
@@ -647,6 +769,7 @@ class LERLWRApp(AppBase):
         if math.isclose(angle_degrees, self.rotation_degrees, abs_tol=1e-9):
             self.rotation_var.set(f"{self.rotation_degrees:.2f}")
             return
+        self.record_undo_state()
         view_center = self.current_view_center()
         self.rotation_degrees = angle_degrees
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
@@ -654,6 +777,7 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.roi_canvas = None
+        self.clear_annotations(redraw=False, record_history=False)
         self.draw_image()
         self.restore_view_center(view_center)
         self.result_var.set("图像角度已手动调整；请重新框选 ROI 并分析。")
@@ -703,6 +827,7 @@ class LERLWRApp(AppBase):
             self.roi_rectangle = None
         self.draw_roi()
         self.render_analysis_overlay()
+        self.draw_annotations()
         if reset_view:
             self.canvas.xview_moveto(0)
             self.canvas.yview_moveto(0)
@@ -775,6 +900,9 @@ class LERLWRApp(AppBase):
         if self.space_held:
             self.canvas.configure(cursor="fleur")
             return
+        if self.annotation_at(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)) is not None:
+            self.canvas.configure(cursor="fleur")
+            return
         hit = self.roi_hit_test(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
         cursors = {
             "nw": "crosshair",
@@ -788,6 +916,333 @@ class LERLWRApp(AppBase):
             "move": "fleur",
         }
         self.canvas.configure(cursor=cursors.get(hit, ""))
+
+    def change_measurement_tool(self, _event: tk.Event | None = None) -> None:
+        tool = self.measurement_tool_var.get()
+        self.status_var.set(f"当前工具：{tool}。拖动可创建；点击已有标注可移动或调整。")
+
+    def update_measurement_color_button(self) -> None:
+        self.color_button.configure(background=self.measurement_color, activebackground=self.measurement_color)
+
+    def choose_measurement_color(self) -> None:
+        color = colorchooser.askcolor(color=self.measurement_color, parent=self, title="选择测量线颜色")[1]
+        if color is None:
+            return
+        self.measurement_color = color
+        self.update_measurement_color_button()
+        if self.active_annotation_index is not None:
+            annotation = self.annotations[self.active_annotation_index]
+            if annotation.kind == "length":
+                self.record_undo_state()
+                annotation.color = color
+                self.draw_annotations()
+                self.status_var.set("已更新选中长度测量线的颜色。")
+                return
+        self.status_var.set("已选择长度测量线颜色；新建长度线会使用此颜色。")
+
+    def selected_annotation_kind(self) -> str | None:
+        return {
+            "长度": "length",
+            "矩形": "rectangle",
+            "圆形": "circle",
+            "正六边形": "hexagon",
+        }.get(self.measurement_tool_var.get())
+
+    def canvas_to_image_point(self, x: float, y: float) -> tuple[float, float]:
+        return x / self.display_scale, y / self.display_scale
+
+    def normalized_annotation_bounds(self, bounds: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        if self.raw_image is None:
+            return bounds
+        x0, y0, x1, y1 = bounds
+        width, height = self.raw_image.shape[1], self.raw_image.shape[0]
+        return (
+            float(np.clip(x0, 0, width)),
+            float(np.clip(y0, 0, height)),
+            float(np.clip(x1, 0, width)),
+            float(np.clip(y1, 0, height)),
+        )
+
+    def regularize_circle_bounds(self, bounds: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        x0, y0, x1, y1 = bounds
+        delta_x, delta_y = x1 - x0, y1 - y0
+        size = max(abs(delta_x), abs(delta_y))
+        if size == 0:
+            return bounds
+        end_x = x0 + math.copysign(size, delta_x if delta_x else 1)
+        end_y = y0 + math.copysign(size, delta_y if delta_y else 1)
+        return x0, y0, end_x, end_y
+
+    def annotation_display_bounds(self, annotation: MeasurementAnnotation) -> tuple[float, float, float, float]:
+        return tuple(value * self.display_scale for value in annotation.bounds_px)
+
+    def annotation_label(self, annotation: MeasurementAnnotation) -> str:
+        x0, y0, x1, y1 = annotation.bounds_px
+        pixel_size = self.measurement_pixel_size()
+        unit = "nm" if pixel_size is not None else "px"
+        scale = pixel_size if pixel_size is not None else 1.0
+        width = abs(x1 - x0) * scale
+        height = abs(y1 - y0) * scale
+        if annotation.kind == "length":
+            return f"L={math.hypot(x1 - x0, y1 - y0) * scale:.3f} {unit}"
+        if annotation.kind == "rectangle":
+            return f"W={width:.3f}, H={height:.3f} {unit}"
+        if annotation.kind == "circle":
+            return f"Ø={min(width, height):.3f} {unit}"
+        radius = min(abs(x1 - x0) / 2, abs(y1 - y0) / math.sqrt(3)) * scale
+        return f"S={radius:.3f}, D={2 * radius:.3f} {unit}"
+
+    def annotation_color(self, annotation: MeasurementAnnotation) -> str:
+        return annotation.color or ANNOTATION_COLORS[annotation.kind]
+
+    def measurement_pixel_size(self) -> float | None:
+        try:
+            pixel_size = float(self.pixel_size_var.get())
+        except ValueError:
+            return None
+        return pixel_size if pixel_size > 0 else None
+
+    def refresh_annotation_labels(self, *_args: str) -> None:
+        if self.raw_image is not None:
+            self.draw_annotations()
+
+    def annotation_polygon(self, annotation: MeasurementAnnotation, scale: float | None = None) -> list[tuple[float, float]]:
+        scale = self.display_scale if scale is None else scale
+        x0, y0, x1, y1 = annotation.bounds_px
+        if annotation.kind == "rectangle":
+            points = [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
+        elif annotation.kind == "circle":
+            return []
+        elif annotation.kind == "hexagon":
+            center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+            radius = min(abs(x1 - x0) / 2, abs(y1 - y0) / math.sqrt(3))
+            points = [
+                (center_x - radius, center_y),
+                (center_x - radius / 2, center_y - math.sqrt(3) * radius / 2),
+                (center_x + radius / 2, center_y - math.sqrt(3) * radius / 2),
+                (center_x + radius, center_y),
+                (center_x + radius / 2, center_y + math.sqrt(3) * radius / 2),
+                (center_x - radius / 2, center_y + math.sqrt(3) * radius / 2),
+                (center_x - radius, center_y),
+            ]
+        else:
+            points = [(x0, y0), (x1, y1)]
+        return [(x * scale, y * scale) for x, y in points]
+
+    def length_end_caps(self, annotation: MeasurementAnnotation, scale: float, cap_half_length: float) -> list[tuple[float, float, float, float]]:
+        x0, y0, x1, y1 = (value * scale for value in annotation.bounds_px)
+        line_length = math.hypot(x1 - x0, y1 - y0)
+        if line_length == 0:
+            return []
+        cap_half_length = min(cap_half_length, line_length * 0.2)
+        offset_x = -(y1 - y0) * cap_half_length / line_length
+        offset_y = (x1 - x0) * cap_half_length / line_length
+        return [
+            (x0 - offset_x, y0 - offset_y, x0 + offset_x, y0 + offset_y),
+            (x1 - offset_x, y1 - offset_y, x1 + offset_x, y1 + offset_y),
+        ]
+
+    def draw_annotations(self) -> None:
+        self.canvas.delete("annotation")
+        for index, annotation in enumerate(self.annotations):
+            color = self.annotation_color(annotation)
+            x0, y0, x1, y1 = self.annotation_display_bounds(annotation)
+            if annotation.kind == "circle":
+                self.canvas.create_oval(x0, y0, x1, y1, outline=color, width=2, tags="annotation")
+            else:
+                points = self.annotation_polygon(annotation)
+                self.canvas.create_line(*[value for point in points for value in point], fill=color, width=2, tags="annotation")
+                if annotation.kind == "length":
+                    for cap in self.length_end_caps(annotation, self.display_scale, 6):
+                        self.canvas.create_line(*cap, fill=color, width=2, tags="annotation")
+            label_x, label_y = min(x0, x1) + 5, min(y0, y1) - 7
+            self.canvas.create_text(
+                label_x,
+                label_y,
+                anchor=tk.SW,
+                text=self.annotation_label(annotation),
+                fill=color,
+                font=("Menlo", 11, "bold"),
+                tags="annotation",
+            )
+            if index == self.active_annotation_index:
+                self.draw_annotation_handles(annotation)
+
+    def draw_annotation_handles(self, annotation: MeasurementAnnotation) -> None:
+        x0, y0, x1, y1 = self.annotation_display_bounds(annotation)
+        if annotation.kind == "length":
+            handles = [(x0, y0), (x1, y1)]
+        else:
+            handles = [(x0, y0), (x1, y0), (x0, y1), (x1, y1), ((x0 + x1) / 2, (y0 + y1) / 2)]
+        for x, y in handles:
+            self.canvas.create_rectangle(
+                x - ROI_HANDLE_SIZE,
+                y - ROI_HANDLE_SIZE,
+                x + ROI_HANDLE_SIZE,
+                y + ROI_HANDLE_SIZE,
+                fill="#ffffff",
+                outline="#202020",
+                tags="annotation",
+            )
+
+    def annotation_at(self, canvas_x: float, canvas_y: float) -> tuple[int, str] | None:
+        for index in range(len(self.annotations) - 1, -1, -1):
+            mode = self.annotation_hit_test(self.annotations[index], canvas_x, canvas_y)
+            if mode is not None:
+                return index, mode
+        return None
+
+    def annotation_hit_test(self, annotation: MeasurementAnnotation, x: float, y: float) -> str | None:
+        x0, y0, x1, y1 = self.annotation_display_bounds(annotation)
+        if annotation.kind == "length":
+            if math.hypot(x - x0, y - y0) <= ANNOTATION_HANDLE_HIT:
+                return "start"
+            if math.hypot(x - x1, y - y1) <= ANNOTATION_HANDLE_HIT:
+                return "end"
+            length = math.hypot(x1 - x0, y1 - y0)
+            if length and abs((x1 - x0) * (y0 - y) - (x0 - x) * (y1 - y0)) / length <= 6:
+                return "move"
+            return None
+        handles = {
+            "nw": (x0, y0),
+            "ne": (x1, y0),
+            "sw": (x0, y1),
+            "se": (x1, y1),
+            "move": ((x0 + x1) / 2, (y0 + y1) / 2),
+        }
+        for name, (handle_x, handle_y) in handles.items():
+            if abs(x - handle_x) <= ANNOTATION_HANDLE_HIT and abs(y - handle_y) <= ANNOTATION_HANDLE_HIT:
+                return name
+        left, right = sorted((x0, x1))
+        top, bottom = sorted((y0, y1))
+        if annotation.kind == "circle":
+            radius_x, radius_y = max((right - left) / 2, 1), max((bottom - top) / 2, 1)
+            return "move" if ((x - (left + right) / 2) / radius_x) ** 2 + ((y - (top + bottom) / 2) / radius_y) ** 2 <= 1 else None
+        return "move" if left <= x <= right and top <= y <= bottom else None
+
+    def start_canvas_action(self, event: tk.Event) -> None:
+        if self.raw_image is None or self.space_held:
+            self.start_roi(event)
+            return
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        existing = self.annotation_at(canvas_x, canvas_y)
+        if existing is not None:
+            self.begin_undoable_edit()
+            self.annotation_was_changed = False
+            self.active_annotation_index, self.annotation_drag_mode = existing
+            self.annotation_drag_anchor = self.canvas_to_image_point(canvas_x, canvas_y)
+            self.annotation_start_bounds = self.annotations[self.active_annotation_index].bounds_px
+            self.draw_annotations()
+            return
+        kind = self.selected_annotation_kind()
+        if kind is None:
+            self.active_annotation_index = None
+            self.begin_undoable_edit()
+            self.start_roi(event)
+            return
+        point = self.canvas_to_image_point(canvas_x, canvas_y)
+        self.begin_undoable_edit()
+        self.annotation_was_changed = False
+        color = self.measurement_color if kind == "length" else None
+        self.annotations.append(MeasurementAnnotation(kind, (*point, *point), color))
+        self.active_annotation_index = len(self.annotations) - 1
+        self.annotation_drag_mode = "create"
+        self.annotation_drag_anchor = point
+        self.annotation_start_bounds = self.annotations[-1].bounds_px
+        self.draw_annotations()
+
+    def move_canvas_action(self, event: tk.Event) -> None:
+        if self.panning:
+            self.move_roi(event)
+            return
+        if self.annotation_drag_mode is None or self.active_annotation_index is None:
+            self.move_roi(event)
+            return
+        point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.update_annotation_from_drag(point)
+        self.annotation_was_changed = True
+        self.draw_annotations()
+
+    def finish_canvas_action(self, event: tk.Event) -> None:
+        if self.panning:
+            self.finish_roi(event)
+            return
+        if self.annotation_drag_mode is None or self.active_annotation_index is None:
+            roi_was_changed = self.roi_was_changed
+            self.finish_roi(event)
+            if roi_was_changed:
+                self.commit_undoable_edit()
+            else:
+                self.pending_undo_state = None
+            return
+        point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.update_annotation_from_drag(point)
+        self.annotation_drag_mode = None
+        self.annotation_drag_anchor = None
+        self.annotation_start_bounds = None
+        if self.annotation_was_changed:
+            self.commit_undoable_edit()
+        else:
+            self.pending_undo_state = None
+        self.draw_annotations()
+        self.status_var.set("通用测量标注已更新；可继续拖动控制点调整尺寸。")
+
+    def update_annotation_from_drag(self, point: tuple[float, float]) -> None:
+        if self.active_annotation_index is None or self.annotation_drag_mode is None or self.annotation_start_bounds is None:
+            return
+        annotation = self.annotations[self.active_annotation_index]
+        x0, y0, x1, y1 = self.annotation_start_bounds
+        x, y = point
+        mode = self.annotation_drag_mode
+        if mode == "create":
+            bounds = (x0, y0, x, y)
+        elif mode == "move" and self.annotation_drag_anchor is not None:
+            anchor_x, anchor_y = self.annotation_drag_anchor
+            bounds = (x0 + x - anchor_x, y0 + y - anchor_y, x1 + x - anchor_x, y1 + y - anchor_y)
+        elif mode == "start":
+            bounds = (x, y, x1, y1)
+        elif mode == "end":
+            bounds = (x0, y0, x, y)
+        elif mode == "nw":
+            bounds = (x, y, x1, y1)
+        elif mode == "ne":
+            bounds = (x0, y, x, y1)
+        elif mode == "sw":
+            bounds = (x, y0, x1, y)
+        else:
+            bounds = (x0, y0, x, y)
+        if annotation.kind == "circle":
+            bounds = self.regularize_circle_bounds(bounds)
+        annotation.bounds_px = self.normalized_annotation_bounds(bounds)
+
+    def delete_active_annotation(self, _event: tk.Event | None = None) -> str:
+        if self.active_annotation_index is None:
+            self.status_var.set("请先点击一个通用测量标注。")
+            return "break"
+        self.record_undo_state()
+        self.annotations.pop(self.active_annotation_index)
+        self.active_annotation_index = None
+        self.draw_annotations()
+        self.status_var.set("已删除选中标注。")
+        return "break"
+
+    def clear_annotations(self, redraw: bool = True, record_history: bool = True) -> None:
+        if record_history and self.annotations:
+            self.record_undo_state()
+        self.annotations.clear()
+        self.active_annotation_index = None
+        self.annotation_drag_mode = None
+        self.annotation_drag_anchor = None
+        self.annotation_start_bounds = None
+        if redraw and self.raw_image is not None:
+            self.draw_annotations()
+        if redraw:
+            self.status_var.set("已清空所有通用测量标注。")
+
+    def clear_selection(self, _event: tk.Event | None = None) -> str:
+        if self.active_annotation_index is not None:
+            return self.delete_active_annotation()
+        return self.clear_roi()
 
     def update_roi_from_drag(self, x: float, y: float) -> None:
         if self.roi_drag_mode is None or self.roi_drag_anchor is None:
@@ -959,6 +1414,7 @@ class LERLWRApp(AppBase):
     def clear_roi(self, _event: tk.Event | None = None) -> str:
         if self.roi_canvas is None:
             return "break"
+        self.record_undo_state()
         self.roi_canvas = None
         self.roi_rectangle = None
         self.drag_start = None
@@ -1102,9 +1558,6 @@ class LERLWRApp(AppBase):
         self.update_lcdu_summary_text()
 
     def export_annotated_image(self) -> None:
-        if self.result is None or self.analysis_origin is None:
-            messagebox.showinfo("暂无拟合图片", "请先完成一次分析。")
-            return
         if self.original_image is None:
             messagebox.showinfo("暂无图像", "请先打开一张 SEM 图像。")
             return
@@ -1112,14 +1565,12 @@ class LERLWRApp(AppBase):
         target = filedialog.asksaveasfilename(
             title="保存拟合图片",
             defaultextension=".png",
-            initialfile=f"{self.image_path.stem if self.image_path else 'sem'}_upright_overlay.png",
+            initialfile=f"{self.image_path.stem if self.image_path else 'sem'}_annotated.png",
             filetypes=[("PNG 图片", "*.png")],
         )
         if not target:
             return
 
-        result = self.result
-        left_offset, top_offset = self.analysis_origin
         height, width = image.shape
         output = Image.fromarray(image).convert("RGB")
         draw = ImageDraw.Draw(output)
@@ -1133,20 +1584,24 @@ class LERLWRApp(AppBase):
             )
             draw.line(roi_points, fill=(0, 255, 102), width=2)
 
-        left_points_rotated = [
-            (float(left + left_offset), float(row + top_offset))
-            for row, left in zip(result.rows_px, result.left_px)
-        ]
-        right_points_rotated = [
-            (float(right + left_offset), float(row + top_offset))
-            for row, right in zip(result.rows_px, result.right_px)
-        ]
-        left_points = rotate_points_about_center(left_points_rotated, -self.rotation_degrees, width, height)
-        right_points = rotate_points_about_center(right_points_rotated, -self.rotation_degrees, width, height)
-        if len(left_points) >= 2:
-            draw.line(left_points, fill=(0, 229, 255), width=2)
-        if len(right_points) >= 2:
-            draw.line(right_points, fill=(255, 176, 0), width=2)
+        self.draw_exported_annotations(draw, width, height)
+        if self.result is not None and self.analysis_origin is not None:
+            result = self.result
+            left_offset, top_offset = self.analysis_origin
+            left_points_rotated = [
+                (float(left + left_offset), float(row + top_offset))
+                for row, left in zip(result.rows_px, result.left_px)
+            ]
+            right_points_rotated = [
+                (float(right + left_offset), float(row + top_offset))
+                for row, right in zip(result.rows_px, result.right_px)
+            ]
+            left_points = rotate_points_about_center(left_points_rotated, -self.rotation_degrees, width, height)
+            right_points = rotate_points_about_center(right_points_rotated, -self.rotation_degrees, width, height)
+            if len(left_points) >= 2:
+                draw.line(left_points, fill=(0, 229, 255), width=2)
+            if len(right_points) >= 2:
+                draw.line(right_points, fill=(255, 176, 0), width=2)
 
         try:
             output.save(target, "PNG")
@@ -1155,35 +1610,71 @@ class LERLWRApp(AppBase):
             return
         self.status_var.set(f"已导出拟合图片：{target}")
 
+    def annotation_image_points(self, annotation: MeasurementAnnotation) -> list[tuple[float, float]]:
+        if annotation.kind != "circle":
+            return self.annotation_polygon(annotation, scale=1.0)
+        x0, y0, x1, y1 = annotation.bounds_px
+        center_x, center_y = (x0 + x1) / 2, (y0 + y1) / 2
+        radius_x, radius_y = abs(x1 - x0) / 2, abs(y1 - y0) / 2
+        return [
+            (center_x + radius_x * math.cos(angle), center_y + radius_y * math.sin(angle))
+            for angle in np.linspace(0, 2 * math.pi, 41)
+        ]
+
+    def draw_exported_annotations(self, draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
+        for annotation in self.annotations:
+            points = rotate_points_about_center(
+                self.annotation_image_points(annotation),
+                -self.rotation_degrees,
+                width,
+                height,
+            )
+            if len(points) >= 2:
+                draw.line(points, fill=self.annotation_color(annotation), width=2)
+            if annotation.kind == "length":
+                for cap in self.length_end_caps(annotation, 1.0, 6):
+                    cap_points = rotate_points_about_center(
+                        [(cap[0], cap[1]), (cap[2], cap[3])],
+                        -self.rotation_degrees,
+                        width,
+                        height,
+                    )
+                    draw.line(cap_points, fill=self.annotation_color(annotation), width=2)
+            x0, y0, _x1, _y1 = annotation.bounds_px
+            label_point = rotate_points_about_center([(x0, y0)], -self.rotation_degrees, width, height)[0]
+            draw.text((label_point[0] + 4, label_point[1] - 14), self.annotation_label(annotation), fill=self.annotation_color(annotation))
+
     def export_csv(self) -> None:
-        if self.result is None:
-            messagebox.showinfo("暂无结果", "请先完成一次分析。")
+        if self.result is None and not self.annotations:
+            messagebox.showinfo("暂无结果", "请先完成 LER/LWR 分析或添加通用测量标注。")
             return
         target = filedialog.asksaveasfilename(
             title="保存测量结果",
             defaultextension=".csv",
-            initialfile=f"{self.image_path.stem if self.image_path else 'sem'}_ler_lwr.csv",
+            initialfile=f"{self.image_path.stem if self.image_path else 'sem'}_measurements.csv",
             filetypes=[("CSV 文件", "*.csv")],
         )
         if not target:
             return
         multiplier = self.sigma_multiplier_var.get()
-        result = self.result
         try:
             with open(target, "w", newline="", encoding="utf-8-sig") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(["source", str(self.image_path) if self.image_path else ""])
-                writer.writerow(["pixel_size_nm_per_px", result.pixel_size_nm])
+                pixel_size = self.measurement_pixel_size()
+                writer.writerow(["pixel_size_nm_per_px", "" if pixel_size is None else pixel_size])
                 writer.writerow(["sigma_multiplier", multiplier])
-                writer.writerow(["ler_left_sigma_nm", result.ler_left_sigma_nm])
-                writer.writerow(["ler_right_sigma_nm", result.ler_right_sigma_nm])
-                writer.writerow(["lwr_sigma_nm", result.lwr_sigma_nm])
-                writer.writerow(["total_ler_sigma_nm", result.total_ler_sigma_nm])
-                writer.writerow(["edge_correlation_rho", result.edge_correlation])
-                writer.writerow(["ler_left_display_nm", multiplier * result.ler_left_sigma_nm])
-                writer.writerow(["ler_right_display_nm", multiplier * result.ler_right_sigma_nm])
-                writer.writerow(["lwr_display_nm", multiplier * result.lwr_sigma_nm])
-                writer.writerow(["mean_width_nm", result.mean_width_nm])
+                if self.result is not None:
+                    result = self.result
+                    writer.writerow(["ler_left_sigma_nm", result.ler_left_sigma_nm])
+                    writer.writerow(["ler_right_sigma_nm", result.ler_right_sigma_nm])
+                    writer.writerow(["lwr_sigma_nm", result.lwr_sigma_nm])
+                    writer.writerow(["total_ler_sigma_nm", result.total_ler_sigma_nm])
+                    writer.writerow(["edge_correlation_rho", result.edge_correlation])
+                    writer.writerow(["ler_left_display_nm", multiplier * result.ler_left_sigma_nm])
+                    writer.writerow(["ler_right_display_nm", multiplier * result.ler_right_sigma_nm])
+                    writer.writerow(["lwr_display_nm", multiplier * result.lwr_sigma_nm])
+                    writer.writerow(["mean_width_nm", result.mean_width_nm])
                 lcdu_sigma = self.lcdu_sigma_nm()
                 writer.writerow(["multi_line_lcdu_sample_count", len(self.lcdu_cd_samples_nm)])
                 writer.writerow(["multi_line_lcdu_sigma_nm", "" if lcdu_sigma is None else lcdu_sigma])
@@ -1193,17 +1684,23 @@ class LERLWRApp(AppBase):
                 for index, mean_cd_nm in enumerate(self.lcdu_cd_samples_nm, start=1):
                     writer.writerow([index, mean_cd_nm])
                 writer.writerow([])
-                writer.writerow(["row_px", "left_edge_px", "right_edge_px", "left_residual_nm", "right_residual_nm", "width_nm", "width_residual_nm"])
-                for row in zip(
-                    result.rows_px,
-                    result.left_px,
-                    result.right_px,
-                    result.left_residual_nm,
-                    result.right_residual_nm,
-                    result.width_nm,
-                    result.width_residual_nm,
-                ):
-                    writer.writerow(row)
+                writer.writerow(["annotation_index", "type", "x0_px", "y0_px", "x1_px", "y1_px", "display_label"])
+                for index, annotation in enumerate(self.annotations, start=1):
+                    writer.writerow([index, annotation.kind, *annotation.bounds_px, self.annotation_label(annotation)])
+                if self.result is not None:
+                    result = self.result
+                    writer.writerow([])
+                    writer.writerow(["row_px", "left_edge_px", "right_edge_px", "left_residual_nm", "right_residual_nm", "width_nm", "width_residual_nm"])
+                    for row in zip(
+                        result.rows_px,
+                        result.left_px,
+                        result.right_px,
+                        result.left_residual_nm,
+                        result.right_residual_nm,
+                        result.width_nm,
+                        result.width_residual_nm,
+                    ):
+                        writer.writerow(row)
         except OSError as exc:
             messagebox.showerror("导出失败", str(exc))
             return
