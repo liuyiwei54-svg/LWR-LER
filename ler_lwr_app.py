@@ -52,6 +52,12 @@ ANNOTATION_COLORS = {
     "hexagon": "#38bdf8",
 }
 MAX_UNDO_STEPS = 30
+OUTLIER_LEVELS = {
+    "严格（8 px）": 8.0,
+    "标准（12 px，默认）": 12.0,
+    "宽松（16 px）": 16.0,
+}
+DEFAULT_OUTLIER_LEVEL = "标准（12 px，默认）"
 LOCK_PATH = Path(tempfile.gettempdir()) / "sem_ler_lwr_app.lock"
 
 
@@ -296,7 +302,7 @@ def replace_outliers(trace: np.ndarray, max_jump_px: float = 12.0) -> tuple[np.n
     return repaired, valid
 
 
-def locate_edges(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def locate_edges(image: np.ndarray, max_jump_px: float = 12.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Locate the two edges of one vertical line in a grayscale ROI.
 
     The input ROI must contain one line and some background on both sides.
@@ -331,13 +337,13 @@ def locate_edges(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]
         left[row] = parabola_peak(gradient[row], left_index)
         right[row] = parabola_peak(gradient[row], right_index)
 
-    left, left_valid = replace_outliers(left)
-    right, right_valid = replace_outliers(right)
+    left, left_valid = replace_outliers(left, max_jump_px)
+    right, right_valid = replace_outliers(right, max_jump_px)
     valid = left_valid & right_valid & (right > left)
     return left, right, valid
 
 
-def analyze_roi(image: np.ndarray, pixel_size_nm: float) -> AnalysisResult:
+def analyze_roi(image: np.ndarray, pixel_size_nm: float, max_jump_px: float = 12.0) -> AnalysisResult:
     """Calculate standard RMS LER and LWR for one vertical SEM line ROI.
 
     A linear baseline is removed from each edge (LER), while only the average
@@ -350,7 +356,7 @@ def analyze_roi(image: np.ndarray, pixel_size_nm: float) -> AnalysisResult:
     if width < MIN_ROI_WIDTH or height < MIN_ROI_HEIGHT:
         raise ValueError("分析区域过小；请至少包含 80 个沿线方向的像素。")
 
-    left, right, valid = locate_edges(image)
+    left, right, valid = locate_edges(image, max_jump_px)
     rows = np.arange(height, dtype=float)
     if valid.sum() < max(30, height * 0.6):
         raise ValueError("有效边缘点太少；请检查 ROI 是否只包含一条线。")
@@ -396,7 +402,7 @@ def analyze_roi(image: np.ndarray, pixel_size_nm: float) -> AnalysisResult:
 class LERLWRApp(AppBase):
     def __init__(self) -> None:
         super().__init__()
-        self.title("SEM 测量工具（LER/LWR + 尺寸标注）")
+        self.title("SEM measure（LER/LWR + 尺寸标注）")
         self.minsize(1100, 780)
         self.image_path: Path | None = None
         self.original_image: np.ndarray | None = None
@@ -434,6 +440,7 @@ class LERLWRApp(AppBase):
         self.metadata_var = tk.StringVar(value="尚未读取 TIFF 元数据")
         self.preprocess_var = tk.BooleanVar(value=True)
         self.sigma_multiplier_var = tk.DoubleVar(value=1.0)
+        self.outlier_level_var = tk.StringVar(value=DEFAULT_OUTLIER_LEVEL)
         self.lcdu_summary_var = tk.StringVar(value="LCDU 样本：0 条线")
         self.rotation_var = tk.StringVar(value="0.00")
         self.measurement_tool_var = tk.StringVar(value="ROI（LER/LWR）")
@@ -452,6 +459,16 @@ class LERLWRApp(AppBase):
         file_menu = tk.Menu(controls, tearoff=False)
         file_menu.add_command(label="打开 SEM 图像", command=self.open_image)
         file_menu.add_command(label="查看 TIFF 元数据", command=self.show_metadata)
+        file_menu.add_separator()
+        outlier_menu = tk.Menu(file_menu, tearoff=False)
+        for label in OUTLIER_LEVELS:
+            outlier_menu.add_radiobutton(
+                label=label,
+                variable=self.outlier_level_var,
+                value=label,
+                command=self.change_outlier_level,
+            )
+        file_menu.add_cascade(label="异常点剔除", menu=outlier_menu)
         file_menu.add_separator()
         file_menu.add_command(label="导出 CSV", command=self.export_csv)
         file_menu.add_command(label="导出标注/拟合图片", command=self.export_annotated_image)
@@ -920,6 +937,16 @@ class LERLWRApp(AppBase):
     def change_measurement_tool(self, _event: tk.Event | None = None) -> None:
         tool = self.measurement_tool_var.get()
         self.status_var.set(f"当前工具：{tool}。拖动可创建；点击已有标注可移动或调整。")
+
+    def change_outlier_level(self, _event: tk.Event | None = None) -> None:
+        if self.result is None:
+            self.status_var.set(f"异常点剔除：{self.outlier_level_var.get()}。请点击“分析选区”应用。")
+            return
+        self.result = None
+        self.analysis_origin = None
+        self.draw_image()
+        self.result_var.set("剔除档位已更改；请重新点击“分析选区”。")
+        self.status_var.set("已更改异常点剔除设置，旧分析结果已清除。")
 
     def update_measurement_color_button(self) -> None:
         self.color_button.configure(background=self.measurement_color, activebackground=self.measurement_color)
@@ -1506,13 +1533,16 @@ class LERLWRApp(AppBase):
         try:
             pixel_size = float(self.pixel_size_var.get())
             roi, left_offset, top_offset = self.selected_roi()
-            self.result = analyze_roi(roi, pixel_size)
+            self.result = analyze_roi(roi, pixel_size, self.outlier_threshold_px())
             self.analysis_origin = (left_offset, top_offset)
             self.draw_image()
             self.update_result_text()
             self.status_var.set("分析完成。可调整 σ 倍数，或导出轨迹和结果。")
         except ValueError as exc:
             messagebox.showwarning("无法分析", str(exc))
+
+    def outlier_threshold_px(self) -> float:
+        return OUTLIER_LEVELS.get(self.outlier_level_var.get(), OUTLIER_LEVELS[DEFAULT_OUTLIER_LEVEL])
 
     def render_analysis_overlay(self) -> None:
         self.canvas.delete("edge")
@@ -1550,7 +1580,8 @@ class LERLWRApp(AppBase):
             f"边缘相关系数 ρ  {result.edge_correlation:.3f}\n\n"
             f"平均线宽  {result.mean_width_nm:.3f} nm\n"
             f"有效点数  {len(result.rows_px)}\n"
-            f"剔除点数  {result.rejected_rows}"
+            f"剔除点数  {result.rejected_rows}\n"
+            f"剔除阈值  {self.outlier_threshold_px():.0f} px"
         )
 
     def update_displayed_results(self) -> None:
@@ -1664,6 +1695,7 @@ class LERLWRApp(AppBase):
                 pixel_size = self.measurement_pixel_size()
                 writer.writerow(["pixel_size_nm_per_px", "" if pixel_size is None else pixel_size])
                 writer.writerow(["sigma_multiplier", multiplier])
+                writer.writerow(["outlier_rejection_threshold_px", self.outlier_threshold_px()])
                 if self.result is not None:
                     result = self.result
                     writer.writerow(["ler_left_sigma_nm", result.ler_left_sigma_nm])

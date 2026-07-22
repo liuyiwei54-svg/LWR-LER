@@ -1,3 +1,6 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+.sem-measure-build/
+release/
+build/
