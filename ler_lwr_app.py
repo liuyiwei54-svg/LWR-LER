@@ -1,4 +1,4 @@
-"""Interactive SEM line-edge roughness (LER) and line-width roughness (LWR) tool.
+"""Interactive SEM LER/LWR and perpendicular BCP dot-array measurement tool.
 
 The program intentionally reports standard deviation by default.  The user-selected
 sigma multiplier only changes the displayed and exported multiplied metrics.
@@ -59,6 +59,35 @@ OUTLIER_LEVELS = {
 }
 DEFAULT_OUTLIER_LEVEL = "标准（12 px，默认）"
 LOCK_PATH = Path(tempfile.gettempdir()) / "sem_ler_lwr_app.lock"
+INFO_BAR_SEARCH_START = 0.72
+INFO_BAR_MIN_HEIGHT_PX = 24
+GAUSSIAN_KERNEL_SIZES = (3, 4, 5, 7)
+GAUSSIAN_SIGMA_SCALE_MIN = 0.4
+GAUSSIAN_SIGMA_SCALE_MAX = 2.5
+CD_RAY_STEP_PX = 0.25
+PITCH_DIRECTION_LABELS = ("水平（0°）", "+60°", "−60°")
+PITCH_DIRECTION_ANGLES = (0.0, 60.0, 120.0)
+PITCH_DIRECTION_TOLERANCE_DEGREES = 15.0
+GRAIN_BOUNDARY_ORIENTATION_THRESHOLD_DEGREES = 8.0
+MIN_GRAIN_DOTS = 3
+GRAIN_OVERLAY_ALPHA = 72
+GRAIN_OVERLAY_MAX_SIDE_PX = 360
+CENTROID_LAYOUT_OUTLINE_COLOR = (198, 56, 255, 235)
+CENTROID_LAYOUT_ANCHOR_COLOR = (255, 55, 72, 255)
+GRAIN_OVERLAY_COLORS = np.asarray(
+    (
+        (239, 111, 108), (78, 161, 255), (255, 190, 80), (106, 203, 138),
+        (181, 126, 220), (65, 196, 193), (240, 139, 190), (170, 185, 95),
+    ),
+    dtype=np.uint8,
+)
+TRIANGULATION_DISPLAY_ALL = "全部方向"
+TRIANGULATION_DISPLAY_MODES = (TRIANGULATION_DISPLAY_ALL, "主方向", "主方向 +60°", "主方向 −60°")
+BCP_LOCAL_PITCH_NEIGHBORS = 3
+BCP_MUTUAL_NEIGHBORS = 6
+BCP_MAX_LOCAL_LINK_FACTOR = 1.45
+BCP_BLOCKING_CORRIDOR_FACTOR = 0.35
+BCP_BLOCKING_PROJECTION_MARGIN = 0.12
 
 
 @dataclass
@@ -81,6 +110,28 @@ class AnalysisResult:
 
 
 @dataclass
+class BCPAnalysisResult:
+    """Detected perpendicular BCP dots and grain-boundary segments in image pixels."""
+
+    centers_px: np.ndarray
+    equivalent_diameters_px: np.ndarray
+    major_axes_px: np.ndarray
+    minor_axes_px: np.ndarray
+    angles_degrees: np.ndarray
+    areas_px: np.ndarray
+    contour_segments_px: list[np.ndarray]
+    components_px: list[np.ndarray]
+    directional_cds_px: np.ndarray
+    cd_means_px: np.ndarray
+    triangulation_segments_px: np.ndarray
+    pitch_values_by_direction_px: dict[str, np.ndarray]
+    boundary_segments_px: np.ndarray
+    boundary_dot_indices: np.ndarray
+    lattice_spacing_px: float
+    pixel_size_nm: float
+
+
+@dataclass
 class MeasurementAnnotation:
     """One editable general-purpose measurement drawn in working-image pixels."""
 
@@ -95,9 +146,15 @@ class EditorState:
     annotations: list[MeasurementAnnotation]
     active_annotation_index: int | None
     rotation_degrees: float
-    preprocess_enabled: bool
+    normalize_enabled: bool
+    gaussian_denoise_enabled: bool
+    gaussian_kernel_size: str
+    gaussian_sigma_scale: float
+    bcp_dog_enabled: bool
     result: AnalysisResult | None
     analysis_origin: tuple[int, int] | None
+    bcp_result: BCPAnalysisResult | None
+    bcp_metrics_finalized: bool
 
 
 def read_sem_pixel_size_nm(image: Image.Image) -> float | None:
@@ -156,18 +213,83 @@ def format_tiff_metadata(image: Image.Image, source_path: Path) -> str:
     return "\n".join(lines)
 
 
-def normalize_and_denoise(image: np.ndarray) -> np.ndarray:
-    """Apply robust contrast normalization and a light 3×3 median denoise.
-
-    The original image is never modified.  Percentile normalization makes the
-    preview legible while avoiding the influence of isolated bright SEM pixels.
-    """
+def normalize_intensity(image: np.ndarray) -> np.ndarray:
+    """Apply 1%–99% intensity normalization without changing the source image."""
     low, high = np.percentile(image.astype(float), (1.0, 99.0))
     if high <= low:
-        normalized = np.zeros(image.shape, dtype=np.uint8)
-    else:
-        normalized = np.clip((image - low) * 255.0 / (high - low), 0, 255).astype(np.uint8)
-    return np.asarray(Image.fromarray(normalized).filter(ImageFilter.MedianFilter(size=3)))
+        return np.zeros(image.shape, dtype=np.uint8)
+    return np.clip((image - low) * 255.0 / (high - low), 0, 255).astype(np.uint8)
+
+
+def gaussian_kernel(size: int, sigma_scale: float = 1.0) -> np.ndarray:
+    """Return a normalized Gaussian kernel, preserving binomial weights at default strength."""
+    if size not in GAUSSIAN_KERNEL_SIZES:
+        raise ValueError("高斯卷积核仅支持 3×3、4×4、5×5 或 7×7。")
+    row = np.array([math.comb(size - 1, index) for index in range(size)], dtype=float)
+    if math.isclose(sigma_scale, 1.0, abs_tol=1e-9):
+        kernel = np.outer(row, row)
+        return kernel / kernel.sum()
+    base_sigma = 0.5 + 0.175 * (size - 1)
+    sigma = base_sigma * float(np.clip(sigma_scale, GAUSSIAN_SIGMA_SCALE_MIN, GAUSSIAN_SIGMA_SCALE_MAX))
+    positions = np.arange(size, dtype=float) - (size - 1) / 2
+    row = np.exp(-(positions**2) / (2 * sigma**2))
+    kernel = np.outer(row, row)
+    return kernel / kernel.sum()
+
+
+def gaussian_kernel_preview(size: int, sigma_scale: float = 1.0) -> str:
+    """Format the selected integer convolution weights for the compact UI preview."""
+    if math.isclose(sigma_scale, 1.0, abs_tol=1e-9):
+        row = [math.comb(size - 1, index) for index in range(size)]
+        denominator = sum(row) ** 2
+        lines = ["  ".join(f"{left * right:>2}" for right in row) for left in row]
+        return f"{size}×{size} 核（标准 ÷{denominator}）\n" + "\n".join(lines)
+    kernel = gaussian_kernel(size, sigma_scale)
+    lines = ["  ".join(f"{weight:.3f}" for weight in row) for row in kernel]
+    return f"{size}×{size} 核（σ×{sigma_scale:.2f}）\n" + "\n".join(lines)
+
+
+def gaussian_convolve(image: np.ndarray, size: int, sigma_scale: float = 1.0) -> np.ndarray:
+    """Apply an edge-preserving-size two-dimensional Gaussian convolution."""
+    top_pad, bottom_pad = size // 2, size - 1 - size // 2
+    padded = np.pad(image.astype(float), ((top_pad, bottom_pad), (top_pad, bottom_pad)), mode="edge")
+    convolved = np.zeros(image.shape, dtype=float)
+    for row, weights in enumerate(gaussian_kernel(size, sigma_scale)):
+        for column, weight in enumerate(weights):
+            convolved += weight * padded[row : row + image.shape[0], column : column + image.shape[1]]
+    return np.clip(convolved, 0, 255).astype(np.uint8)
+
+
+def preprocess_image(
+    image: np.ndarray,
+    normalize: bool = True,
+    gaussian_denoise: bool = True,
+    gaussian_size: int = 3,
+    gaussian_sigma_scale: float = 1.0,
+) -> np.ndarray:
+    """Build the selected display and measurement image from raw grayscale data."""
+    processed = normalize_intensity(image) if normalize else image.copy()
+    return gaussian_convolve(processed, gaussian_size, gaussian_sigma_scale) if gaussian_denoise else processed
+
+
+def normalize_and_denoise(image: np.ndarray) -> np.ndarray:
+    """Keep the former public helper available with the new 3×3 default."""
+    return preprocess_image(image, normalize=True, gaussian_denoise=True, gaussian_size=3)
+
+
+def remove_bottom_information_bar(image: np.ndarray) -> tuple[np.ndarray, int]:
+    """Crop a sustained dark SEM instrument-information bar from the image bottom."""
+    height = image.shape[0]
+    start = int(height * INFO_BAR_SEARCH_START)
+    if height - start < INFO_BAR_MIN_HEIGHT_PX:
+        return image, 0
+    row_means = image.astype(float).mean(axis=1)
+    for row in range(start, height - INFO_BAR_MIN_HEIGHT_PX):
+        preceding = row_means[max(0, row - 40) : row]
+        following = row_means[row : row + INFO_BAR_MIN_HEIGHT_PX]
+        if len(preceding) and np.median(following) < np.median(preceding) - 25.0:
+            return image[:row].copy(), height - row
+    return image, 0
 
 
 def rotate_grayscale_image(image: np.ndarray, angle_degrees: float) -> np.ndarray:
@@ -399,15 +521,918 @@ def analyze_roi(image: np.ndarray, pixel_size_nm: float, max_jump_px: float = 12
     )
 
 
+def connected_pixel_components(mask: np.ndarray, connectivity: int = 8) -> list[np.ndarray]:
+    """Return binary connected components without adding a SciPy dependency."""
+    if connectivity not in (4, 8):
+        raise ValueError("连通性只能为 4 或 8。")
+    height, width = mask.shape
+    visited = np.zeros(mask.shape, dtype=bool)
+    components = []
+    offsets = ((-1, 0), (0, -1), (0, 1), (1, 0)) if connectivity == 4 else (
+        (-1, -1), (-1, 0), (-1, 1),
+        (0, -1), (0, 1),
+        (1, -1), (1, 0), (1, 1),
+    )
+    for start_y, start_x in zip(*np.nonzero(mask)):
+        if visited[start_y, start_x]:
+            continue
+        stack = [(int(start_y), int(start_x))]
+        visited[start_y, start_x] = True
+        points = []
+        while stack:
+            y, x = stack.pop()
+            points.append((y, x))
+            for offset_y, offset_x in offsets:
+                neighbor_y, neighbor_x = y + offset_y, x + offset_x
+                if (
+                    0 <= neighbor_y < height
+                    and 0 <= neighbor_x < width
+                    and mask[neighbor_y, neighbor_x]
+                    and not visited[neighbor_y, neighbor_x]
+                ):
+                    visited[neighbor_y, neighbor_x] = True
+                    stack.append((neighbor_y, neighbor_x))
+        components.append(np.asarray(points, dtype=float))
+    return components
+
+
+def lattice_support_score(dots: list[tuple[float, float, float, float, float, float, float]]) -> float:
+    """Score whether candidate centers form a repeated point lattice rather than edge noise."""
+    if len(dots) < 4:
+        return 0.0
+    centers = np.asarray(dots, dtype=float)[:, :2]
+    nearest = []
+    for index, center in enumerate(centers):
+        distances = np.hypot(*(centers - center).T)
+        distances[index] = np.inf
+        nearest.append(float(np.min(distances)))
+    spacing = float(np.median(nearest))
+    if spacing <= 0:
+        return 0.0
+    support = 0
+    for index, center in enumerate(centers):
+        distances = np.hypot(*(centers - center).T)
+        support += int(np.count_nonzero((distances >= spacing * 0.55) & (distances <= spacing * 1.6)) >= 2)
+    return support / (1.0 + float(np.std(nearest) / spacing))
+
+
+def reference_bcp_polarity(image: np.ndarray, references: list[tuple[float, float, float]]) -> float:
+    """Infer whether manually marked BCP dots appear bright or dark."""
+    contrasts = []
+    for center_x, center_y, radius in references:
+        top, bottom = max(0, int(center_y - radius)), min(image.shape[0], int(center_y + radius + 1))
+        left, right = max(0, int(center_x - radius)), min(image.shape[1], int(center_x + radius + 1))
+        yy, xx = np.indices((bottom - top, right - left), dtype=float)
+        distances = np.hypot(xx + left - center_x, yy + top - center_y)
+        core = image[top:bottom, left:right][distances <= radius * 0.35]
+        ring = image[top:bottom, left:right][(distances >= radius * 0.65) & (distances <= radius)]
+        if len(core) and len(ring):
+            contrasts.append(float(np.mean(core) - np.mean(ring)))
+    return 1.0 if not contrasts or np.median(contrasts) >= 0 else -1.0
+
+
+def bcp_response(
+    image: np.ndarray,
+    polarity: float,
+    diameter_px: float,
+    use_dog_contrast: bool = True,
+) -> np.ndarray:
+    """Return either the optional DoG contrast response or the original intensity."""
+    if not use_dog_contrast:
+        return polarity * image.astype(float)
+    small_radius = float(np.clip(diameter_px * 0.08, 1.0, 3.0))
+    large_radius = float(np.clip(diameter_px * 0.65, 4.0, max(12, min(image.shape) / 50)))
+    small = np.asarray(Image.fromarray(image).filter(ImageFilter.GaussianBlur(radius=small_radius)), dtype=float)
+    large = np.asarray(Image.fromarray(image).filter(ImageFilter.GaussianBlur(radius=large_radius)), dtype=float)
+    return polarity * (small - large)
+
+
+def bcp_reference_diameter(references: list[tuple[float, float, float]], expected_diameter_px: float | None) -> float:
+    """Choose the explicit expected diameter, otherwise the median manual-circle diameter."""
+    if expected_diameter_px is not None:
+        return expected_diameter_px
+    if references:
+        return float(np.median([radius * 2 for _x, _y, radius in references]))
+    raise ValueError("自动识别需要输入圆柱大致直径，或至少标示 3 个样本圆柱。")
+
+
+def bcp_minimum_component_area(
+    references: list[tuple[float, float, float]],
+    area_fraction: float,
+    diameter_px: float,
+) -> float:
+    """Convert the user-selected sample-area fraction to a pixel-area threshold."""
+    if area_fraction <= 0:
+        return 0.0
+    return float(area_fraction * bcp_reference_area(references, diameter_px))
+
+
+def bcp_reference_area(references: list[tuple[float, float, float]], diameter_px: float) -> float:
+    """Return the manual-sample or expected-cylinder reference area in pixels."""
+    sample_areas = [math.pi * radius**2 for _x, _y, radius in references]
+    return float(np.median(sample_areas)) if sample_areas else math.pi * (diameter_px / 2) ** 2
+
+
+def fill_bcp_internal_holes(mask: np.ndarray, maximum_hole_area_px: float) -> np.ndarray:
+    """Fill small background islands enclosed by a foreground BCP region."""
+    if maximum_hole_area_px <= 0:
+        return mask
+    filled = mask.copy()
+    height, width = mask.shape
+    for hole in connected_pixel_components(~mask, connectivity=4):
+        rows, columns = hole.astype(int).T
+        touches_image_edge = (
+            np.any(rows == 0) or np.any(rows == height - 1)
+            or np.any(columns == 0) or np.any(columns == width - 1)
+        )
+        if not touches_image_edge and len(hole) <= maximum_hole_area_px:
+            filled[rows, columns] = True
+    return filled
+
+
+def retain_bcp_components(mask: np.ndarray, minimum_area_px: float) -> np.ndarray:
+    """Keep only 8-connected binary foreground components meeting the area limit."""
+    if minimum_area_px <= 0:
+        return mask
+    retained = np.zeros_like(mask, dtype=bool)
+    for component in connected_pixel_components(mask):
+        if len(component) >= minimum_area_px:
+            rows, columns = component.astype(int).T
+            retained[rows, columns] = True
+    return retained
+
+
+def adaptive_bcp_foreground(
+    response: np.ndarray,
+    horizontal_sections: int,
+    vertical_sections: int,
+) -> tuple[np.ndarray, float]:
+    """Threshold every user-defined two-dimensional image section independently."""
+    section_width = max(1, math.ceil(response.shape[1] / horizontal_sections))
+    section_height = max(1, math.ceil(response.shape[0] / vertical_sections))
+    foreground = np.zeros(response.shape, dtype=bool)
+    thresholds = []
+    for top in range(0, response.shape[0], section_height):
+        for left in range(0, response.shape[1], section_width):
+            section = response[top : top + section_height, left : left + section_width]
+            baseline = float(np.median(section))
+            high = float(np.percentile(section, 95))
+            threshold = baseline + 0.28 * max(high - baseline, 0.0)
+            foreground[top : top + section.shape[0], left : left + section.shape[1]] = section >= threshold
+            thresholds.append(threshold)
+    return foreground, float(np.median(thresholds))
+
+
+def global_bcp_foreground(response: np.ndarray) -> tuple[np.ndarray, float]:
+    """Build one whole-image foreground mask when local splitting is disabled."""
+    baseline = float(np.median(response))
+    high = float(np.percentile(response, 95))
+    threshold = baseline + 0.28 * max(high - baseline, 0.0)
+    return response >= threshold, threshold
+
+
+def bcp_foreground(
+    response: np.ndarray,
+    horizontal_sections: int,
+    vertical_sections: int,
+    use_local_segmentation: bool,
+) -> tuple[np.ndarray, float]:
+    """Choose the optional local or global binary segmentation path."""
+    if use_local_segmentation:
+        return adaptive_bcp_foreground(response, horizontal_sections, vertical_sections)
+    return global_bcp_foreground(response)
+
+
+def fit_bcp_component(component: np.ndarray) -> tuple[float, float, float, float, float, float, float] | None:
+    """Fit binary connected-component geometry without using internal intensity peaks."""
+    if len(component) < 6:
+        return None
+    y, x = component[:, 0], component[:, 1]
+    center_x, center_y = float(np.mean(x)), float(np.mean(y))
+    dx, dy = x - center_x, y - center_y
+    covariance = np.array([
+        [float(np.mean(dx * dx)), float(np.mean(dx * dy))],
+        [float(np.mean(dx * dy)), float(np.mean(dy * dy))],
+    ])
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    minor_axis, major_axis = 4.0 * np.sqrt(np.maximum(eigenvalues, 0.0))
+    if minor_axis < 2.0 or major_axis / minor_axis > 3.0:
+        return None
+    angle = math.degrees(math.atan2(eigenvectors[1, 1], eigenvectors[0, 1]))
+    area = float(len(component))
+    return center_x, center_y, 2.0 * math.sqrt(area / math.pi), major_axis, minor_axis, angle, area
+
+
+def component_contour_segments(component: np.ndarray) -> np.ndarray:
+    """Trace the pixel-edge contour of one binary connected component."""
+    pixels = {tuple(point.astype(int)) for point in component}
+    segments = []
+    for y, x in pixels:
+        if (y - 1, x) not in pixels:
+            segments.append((x - 0.5, y - 0.5, x + 0.5, y - 0.5))
+        if (y + 1, x) not in pixels:
+            segments.append((x - 0.5, y + 0.5, x + 0.5, y + 0.5))
+        if (y, x - 1) not in pixels:
+            segments.append((x - 0.5, y - 0.5, x - 0.5, y + 0.5))
+        if (y, x + 1) not in pixels:
+            segments.append((x + 0.5, y - 0.5, x + 0.5, y + 0.5))
+    return np.asarray(segments, dtype=float).reshape(-1, 4)
+
+
+def bcp_dots_from_foreground(
+    foreground: np.ndarray,
+    diameter_px: float,
+    minimum_area_px: float,
+) -> tuple[list[tuple[float, float, float, float, float, float, float]], list[np.ndarray], list[np.ndarray]]:
+    """Fit every eligible connected foreground component and trace its contour."""
+    lower, upper = diameter_px * 0.4, diameter_px * 1.8
+    dots, contours, components = [], [], []
+    for component in connected_pixel_components(foreground):
+        dot = fit_bcp_component(component)
+        if dot is not None and minimum_area_px <= dot[6] and lower <= dot[2] <= upper:
+            dots.append(dot)
+            contours.append(component_contour_segments(component))
+            components.append(component)
+    return dots, contours, components
+
+
+def connected_component_bcp_dots(
+    response: np.ndarray,
+    diameter_px: float,
+    minimum_area_px: float,
+    maximum_hole_area_px: float,
+    local_horizontal_sections: int,
+    local_vertical_sections: int,
+    use_local_segmentation: bool,
+) -> tuple[list[tuple[float, float, float, float, float, float, float]], list[np.ndarray], list[np.ndarray]]:
+    """Identify one cylinder per binary connected region and trace its contour."""
+    foreground, _threshold = bcp_foreground(
+        response,
+        local_horizontal_sections,
+        local_vertical_sections,
+        use_local_segmentation,
+    )
+    foreground = fill_bcp_internal_holes(foreground, maximum_hole_area_px)
+    foreground = retain_bcp_components(foreground, minimum_area_px)
+    return bcp_dots_from_foreground(foreground, diameter_px, minimum_area_px)
+
+
+def bcp_candidate_contrast_score(
+    image: np.ndarray,
+    dots: list[tuple[float, float, float, float, float, float, float]],
+    polarity: float,
+    diameter_px: float,
+) -> float:
+    """Score whether candidate centers have the requested bright or dark core contrast."""
+    radius = diameter_px / 2
+    contrasts = []
+    for center_x, center_y, *_values in dots:
+        top, bottom = max(0, int(center_y - radius)), min(image.shape[0], int(center_y + radius + 1))
+        left, right = max(0, int(center_x - radius)), min(image.shape[1], int(center_x + radius + 1))
+        yy, xx = np.indices((bottom - top, right - left), dtype=float)
+        distances = np.hypot(xx + left - center_x, yy + top - center_y)
+        core = image[top:bottom, left:right][distances <= radius * 0.35]
+        ring = image[top:bottom, left:right][(distances >= radius * 0.65) & (distances <= radius)]
+        if len(core) and len(ring):
+            contrasts.append(polarity * float(np.mean(core) - np.mean(ring)))
+    return max(0.0, float(np.median(contrasts))) if contrasts else 0.0
+
+
+def automatic_bcp_polarity(
+    image: np.ndarray,
+    diameter_px: float,
+    minimum_area_px: float,
+    maximum_hole_area_px: float,
+    local_horizontal_sections: int,
+    local_vertical_sections: int,
+    use_local_segmentation: bool,
+    use_dog_contrast: bool = True,
+) -> float:
+    """Choose polarity from the selected binary-region and contour-detection result."""
+    scores = {}
+    for polarity in (1.0, -1.0):
+        response = bcp_response(image, polarity, diameter_px, use_dog_contrast)
+        dots, _contours, _components = connected_component_bcp_dots(
+            response,
+            diameter_px,
+            minimum_area_px,
+            maximum_hole_area_px,
+            local_horizontal_sections,
+            local_vertical_sections,
+            use_local_segmentation,
+        )
+        scores[polarity] = bcp_candidate_contrast_score(image, dots, polarity, diameter_px) * lattice_support_score(dots)
+    return max(scores, key=scores.get)
+
+
+def connected_region_bcp_dots(
+    image: np.ndarray,
+    references: list[tuple[float, float, float]],
+    expected_diameter_px: float | None,
+    min_area_fraction: float,
+    internal_hole_fraction: float,
+    local_horizontal_sections: int,
+    local_vertical_sections: int,
+    use_local_segmentation: bool,
+    use_dog_contrast: bool = True,
+) -> tuple[list[tuple[float, float, float, float, float, float, float]], list[np.ndarray], list[np.ndarray]]:
+    """Detect BCP dots from thresholded connected regions and their contours."""
+    diameter = bcp_reference_diameter(references, expected_diameter_px)
+    minimum_area_px = bcp_minimum_component_area(references, min_area_fraction, diameter)
+    maximum_hole_area_px = internal_hole_fraction * bcp_reference_area(references, diameter)
+    polarity = reference_bcp_polarity(image, references) if references else automatic_bcp_polarity(
+        image,
+        diameter,
+        minimum_area_px,
+        maximum_hole_area_px,
+        local_horizontal_sections,
+        local_vertical_sections,
+        use_local_segmentation,
+        use_dog_contrast,
+    )
+    response = bcp_response(image, polarity, diameter, use_dog_contrast)
+    return connected_component_bcp_dots(
+        response,
+        diameter,
+        minimum_area_px,
+        maximum_hole_area_px,
+        local_horizontal_sections,
+        local_vertical_sections,
+        use_local_segmentation,
+    )
+
+
+def polygon_pixel_mask(shape: tuple[int, int], polygon_px: list[tuple[float, float]]) -> np.ndarray:
+    """Rasterize an image-coordinate polygon into a boolean inclusion mask."""
+    mask = Image.new("1", (shape[1], shape[0]), 0)
+    ImageDraw.Draw(mask).polygon([(round(x), round(y)) for x, y in polygon_px], fill=1)
+    return np.asarray(mask, dtype=bool)
+
+
+def polygon_bcp_foreground(response: np.ndarray, selection_mask: np.ndarray) -> np.ndarray:
+    """Threshold the response using only pixels inside a manually drawn polygon."""
+    values = response[selection_mask]
+    if not len(values):
+        raise ValueError("局部补漏区域没有有效像素。")
+    baseline = float(np.median(values))
+    high = float(np.percentile(values, 99))
+    threshold = baseline + 0.28 * max(high - baseline, 0.0)
+    return (response >= threshold) & selection_mask
+
+
+def component_intersects_mask(component: np.ndarray, mask: np.ndarray) -> bool:
+    """Return whether a component has any actual foreground pixel inside a mask."""
+    rows, columns = component.astype(int).T
+    return bool(np.any(mask[rows, columns]))
+
+
+def components_share_pixels(first: np.ndarray, second: np.ndarray) -> bool:
+    """Test overlap from component pixels, never from fitted centers or peak locations."""
+    smaller, larger = (first, second) if len(first) <= len(second) else (second, first)
+    larger_pixels = {tuple(point.astype(int)) for point in larger}
+    return any(tuple(point.astype(int)) in larger_pixels for point in smaller)
+
+
+def local_bcp_completion_candidates(
+    image: np.ndarray,
+    selection_mask: np.ndarray,
+    references: list[tuple[float, float, float]],
+    expected_diameter_px: float | None,
+    min_area_fraction: float,
+    internal_hole_fraction: float,
+    use_dog_contrast: bool,
+) -> tuple[list[tuple[float, float, float, float, float, float, float]], list[np.ndarray], list[np.ndarray]]:
+    """Find contour candidates from one manually selected local threshold region."""
+    diameter = bcp_reference_diameter(references, expected_diameter_px)
+    minimum_area_px = bcp_minimum_component_area(references, min_area_fraction, diameter)
+    maximum_hole_area_px = internal_hole_fraction * bcp_reference_area(references, diameter)
+    polarity = reference_bcp_polarity(image, references) if references else automatic_bcp_polarity(
+        image, diameter, minimum_area_px, maximum_hole_area_px, 1, 1, False, use_dog_contrast
+    )
+    foreground = polygon_bcp_foreground(bcp_response(image, polarity, diameter, use_dog_contrast), selection_mask)
+    foreground = fill_bcp_internal_holes(foreground, maximum_hole_area_px)
+    foreground = retain_bcp_components(foreground, minimum_area_px)
+    return bcp_dots_from_foreground(foreground, diameter, minimum_area_px)
+
+
+def bcp_result_dimension_scale(result: BCPAnalysisResult) -> float:
+    """Recover the existing result's manual-reference calibration scale."""
+    if not result.components_px:
+        return 1.0
+    raw_diameters = np.asarray([2.0 * math.sqrt(len(component) / math.pi) for component in result.components_px])
+    valid = raw_diameters > 0
+    return float(np.median(result.equivalent_diameters_px[valid] / raw_diameters[valid])) if np.any(valid) else 1.0
+
+
+def bcp_layout_diameter_px(result: BCPAnalysisResult) -> float:
+    """Return the measured mean CD as the displayed virtual-cylinder diameter."""
+    return float(np.mean(result.cd_means_px))
+
+
+def append_bcp_completion(
+    result: BCPAnalysisResult,
+    candidates: tuple[list[tuple[float, float, float, float, float, float, float]], list[np.ndarray], list[np.ndarray]],
+    selection_mask: np.ndarray,
+) -> tuple[BCPAnalysisResult, int]:
+    """Add local components without moving, replacing, or re-deduplicating old ones."""
+    dots, contours, components = candidates
+    accepted = [
+        index for index, component in enumerate(components)
+        if component_intersects_mask(component, selection_mask)
+        and not any(components_share_pixels(component, existing) for existing in result.components_px)
+    ]
+    if not accepted:
+        return result, 0
+    dot_array = np.asarray([dots[index] for index in accepted], dtype=float)
+    scale = bcp_result_dimension_scale(result)
+    dot_array[:, 2:5] *= scale
+    dot_array[:, 6] *= scale**2
+    directional_cds = np.asarray([component_directional_cds(components[index]) for index in accepted]) * scale
+    centers = np.vstack((result.centers_px, dot_array[:, :2]))
+    _orientations, spacing, _neighbors = local_hexagonal_orientations(centers)
+    updated = BCPAnalysisResult(
+        centers_px=centers,
+        equivalent_diameters_px=np.concatenate((result.equivalent_diameters_px, dot_array[:, 2])),
+        major_axes_px=np.concatenate((result.major_axes_px, dot_array[:, 3])),
+        minor_axes_px=np.concatenate((result.minor_axes_px, dot_array[:, 4])),
+        angles_degrees=np.concatenate((result.angles_degrees, dot_array[:, 5])),
+        areas_px=np.concatenate((result.areas_px, dot_array[:, 6])),
+        contour_segments_px=result.contour_segments_px + [contours[index] for index in accepted],
+        components_px=result.components_px + [components[index] for index in accepted],
+        directional_cds_px=np.vstack((result.directional_cds_px, directional_cds)),
+        cd_means_px=np.concatenate((result.cd_means_px, np.mean(directional_cds, axis=1))),
+        triangulation_segments_px=result.triangulation_segments_px,
+        pitch_values_by_direction_px=result.pitch_values_by_direction_px,
+        boundary_segments_px=result.boundary_segments_px,
+        boundary_dot_indices=result.boundary_dot_indices,
+        lattice_spacing_px=spacing,
+        pixel_size_nm=result.pixel_size_nm,
+    )
+    return updated, len(accepted)
+
+
+def local_hexagonal_orientations(centers_px: np.ndarray) -> tuple[np.ndarray, float, list[np.ndarray]]:
+    """Estimate local BCP lattice orientation modulo 60 degrees from nearby dots."""
+    count = len(centers_px)
+    nearest_distances = np.empty(count, dtype=float)
+    for index, center in enumerate(centers_px):
+        distances = np.hypot(*(centers_px - center).T)
+        distances[index] = np.inf
+        nearest_distances[index] = np.min(distances)
+    spacing = float(np.median(nearest_distances))
+    neighbor_radius = spacing * 1.45
+    orientations = np.full(count, np.nan)
+    neighbors: list[np.ndarray] = []
+    for index, center in enumerate(centers_px):
+        offsets = centers_px - center
+        distances = np.hypot(offsets[:, 0], offsets[:, 1])
+        nearby = np.flatnonzero((distances > 0) & (distances <= neighbor_radius))
+        neighbors.append(nearby)
+        if len(nearby) < 3:
+            continue
+        bond_angles = np.arctan2(offsets[nearby, 1], offsets[nearby, 0])
+        order = np.mean(np.exp(6j * bond_angles))
+        if abs(order) >= 0.45:
+            orientations[index] = math.degrees(np.angle(order) / 6.0) % 60.0
+    return orientations, spacing, neighbors
+
+
+def hexagonal_angle_difference(first: float, second: float) -> float:
+    """Return the smallest orientation difference for a sixfold-symmetric lattice."""
+    return abs((first - second + 30.0) % 60.0 - 30.0)
+
+
+def component_ray_origin(component: np.ndarray) -> tuple[float, float]:
+    """Return the binary centroid, or the nearest foreground pixel when it lies outside."""
+    center_x, center_y = float(np.mean(component[:, 1])), float(np.mean(component[:, 0]))
+    pixels = {tuple(point.astype(int)) for point in component}
+    if (int(math.floor(center_y + 0.5)), int(math.floor(center_x + 0.5))) in pixels:
+        return center_x, center_y
+    distances = (component[:, 1] - center_x) ** 2 + (component[:, 0] - center_y) ** 2
+    row, column = component[int(np.argmin(distances))]
+    return float(column), float(row)
+
+
+def ray_exit_distance(component: np.ndarray, origin: tuple[float, float], angle_degrees: float) -> float:
+    """Measure one binary-region radius by ray marching until the foreground ends."""
+    pixels = {tuple(point.astype(int)) for point in component}
+    angle = math.radians(angle_degrees)
+    step_x, step_y = math.cos(angle) * CD_RAY_STEP_PX, math.sin(angle) * CD_RAY_STEP_PX
+    max_distance = math.hypot(np.ptp(component[:, 1]), np.ptp(component[:, 0])) + 4.0
+    distance = 0.0
+    while distance <= max_distance:
+        x = origin[0] + step_x * (distance / CD_RAY_STEP_PX)
+        y = origin[1] + step_y * (distance / CD_RAY_STEP_PX)
+        if (int(math.floor(y + 0.5)), int(math.floor(x + 0.5))) not in pixels:
+            return max(0.0, distance - CD_RAY_STEP_PX / 2)
+        distance += CD_RAY_STEP_PX
+    return max_distance
+
+
+def component_directional_cds(component: np.ndarray) -> np.ndarray:
+    """Measure CD on the horizontal, +60°, and −60° axes through the region centroid."""
+    origin = component_ray_origin(component)
+    return np.asarray([
+        ray_exit_distance(component, origin, angle) + ray_exit_distance(component, origin, angle + 180.0)
+        for angle in (0.0, 60.0, 120.0)
+    ])
+
+
+def circumcircle(points: np.ndarray, triangle: tuple[int, int, int]) -> tuple[float, float, float] | None:
+    """Return a triangle circumcircle as center x/y and squared radius."""
+    first, second, third = points[list(triangle)]
+    ax, ay = first
+    bx, by = second
+    cx, cy = third
+    denominator = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(denominator) < 1e-10:
+        return None
+    a2, b2, c2 = ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy
+    center_x = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / denominator
+    center_y = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / denominator
+    return center_x, center_y, (center_x - ax) ** 2 + (center_y - ay) ** 2
+
+
+def delaunay_edge_indices(points: np.ndarray) -> np.ndarray:
+    """Build Delaunay neighbor edges with Bowyer-Watson triangulation."""
+    if len(points) < 3:
+        return np.empty((0, 2), dtype=int)
+    lower, upper = np.min(points, axis=0), np.max(points, axis=0)
+    center, span = (lower + upper) / 2, max(float(np.max(upper - lower)), 1.0)
+    supertriangle = np.asarray([
+        (center[0] - 20 * span, center[1] - 10 * span),
+        (center[0], center[1] + 20 * span),
+        (center[0] + 20 * span, center[1] - 10 * span),
+    ])
+    all_points = np.vstack((points, supertriangle))
+    triangles = [(len(points), len(points) + 1, len(points) + 2)]
+    for point_index, point in enumerate(points):
+        bad = []
+        for triangle in triangles:
+            circle = circumcircle(all_points, triangle)
+            if circle is not None and (point[0] - circle[0]) ** 2 + (point[1] - circle[1]) ** 2 <= circle[2] * (1 + 1e-10):
+                bad.append(triangle)
+        boundary: dict[tuple[int, int], int] = {}
+        for triangle in bad:
+            for edge in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0])):
+                edge = tuple(sorted(edge))
+                boundary[edge] = boundary.get(edge, 0) + 1
+        triangles = [triangle for triangle in triangles if triangle not in bad]
+        triangles.extend((first, second, point_index) for (first, second), count in boundary.items() if count == 1)
+    edges = {
+        tuple(sorted(edge))
+        for triangle in triangles
+        if all(index < len(points) for index in triangle)
+        for edge in ((triangle[0], triangle[1]), (triangle[1], triangle[2]), (triangle[2], triangle[0]))
+    }
+    return np.asarray(sorted(edges), dtype=int).reshape(-1, 2)
+
+
+def nearest_center_indices(centers_px: np.ndarray, count: int) -> list[np.ndarray]:
+    """Return each center's closest other-center indices."""
+    neighbors = []
+    for index, center in enumerate(centers_px):
+        distances = np.hypot(*(centers_px - center).T)
+        distances[index] = np.inf
+        neighbors.append(np.argsort(distances)[:min(count, len(centers_px) - 1)])
+    return neighbors
+
+
+def local_pitch_estimates(centers_px: np.ndarray) -> np.ndarray:
+    """Estimate local Pitch from each center's nearest lattice neighbors."""
+    nearby = nearest_center_indices(centers_px, BCP_LOCAL_PITCH_NEIGHBORS)
+    pitches = []
+    for index, indices in enumerate(nearby):
+        distances = np.hypot(*(centers_px[indices] - centers_px[index]).T)
+        pitches.append(float(np.median(distances)) if len(distances) else float("nan"))
+    return np.asarray(pitches, dtype=float)
+
+
+def link_has_intermediate_center(
+    centers_px: np.ndarray,
+    first: int,
+    second: int,
+    local_pitch: float,
+) -> bool:
+    """Reject a link when another pillar center lies in its physical corridor."""
+    start, end = centers_px[first], centers_px[second]
+    vector = end - start
+    squared_length = float(np.dot(vector, vector))
+    if squared_length == 0:
+        return True
+    offsets = centers_px - start
+    projection = offsets @ vector / squared_length
+    perpendicular = np.abs(offsets[:, 0] * vector[1] - offsets[:, 1] * vector[0]) / math.sqrt(squared_length)
+    between = (projection >= BCP_BLOCKING_PROJECTION_MARGIN) & (projection <= 1.0 - BCP_BLOCKING_PROJECTION_MARGIN)
+    between[first] = False
+    between[second] = False
+    return bool(np.any(between & (perpendicular <= local_pitch * BCP_BLOCKING_CORRIDOR_FACTOR)))
+
+
+def retain_local_bcp_edges(centers_px: np.ndarray, candidate_edges: np.ndarray) -> np.ndarray:
+    """Keep only mutually local, unblocked Delaunay links for BCP metrology."""
+    local_pitches = local_pitch_estimates(centers_px)
+    mutual_neighbors = nearest_center_indices(centers_px, BCP_MUTUAL_NEIGHBORS)
+    retained = []
+    for first, second in candidate_edges:
+        local_pitch = float(np.median((local_pitches[first], local_pitches[second])))
+        length = float(np.hypot(*(centers_px[second] - centers_px[first])))
+        if not np.isfinite(local_pitch) or length > local_pitch * BCP_MAX_LOCAL_LINK_FACTOR:
+            continue
+        if second not in mutual_neighbors[first] or first not in mutual_neighbors[second]:
+            continue
+        if link_has_intermediate_center(centers_px, int(first), int(second), local_pitch):
+            continue
+        retained.append((int(first), int(second)))
+    return np.asarray(retained, dtype=int).reshape(-1, 2)
+
+
+def triangulation_primary_axis_degrees(segments_px: np.ndarray) -> float:
+    """Infer the first of the three sixfold axes from retained neighbor links."""
+    if not len(segments_px):
+        return 0.0
+    offsets = segments_px[:, 2:4] - segments_px[:, :2]
+    angles = np.arctan2(offsets[:, 1], offsets[:, 0])
+    order = np.mean(np.exp(6j * angles))
+    return math.degrees(np.angle(order) / 6.0) % 60.0 if abs(order) > 1e-10 else 0.0
+
+
+def filter_triangulation_display_segments(
+    segments_px: np.ndarray,
+    display_mode: str,
+    primary_axis_degrees: float | None = None,
+) -> np.ndarray:
+    """Return all links or only one automatically aligned hexagonal direction."""
+    if display_mode == TRIANGULATION_DISPLAY_ALL or not len(segments_px):
+        return segments_px
+    try:
+        direction_index = TRIANGULATION_DISPLAY_MODES.index(display_mode) - 1
+    except ValueError:
+        return segments_px
+    primary_axis = triangulation_primary_axis_degrees(segments_px) if primary_axis_degrees is None else primary_axis_degrees
+    target_axis = (primary_axis + 60.0 * direction_index) % 180.0
+    offsets = segments_px[:, 2:4] - segments_px[:, :2]
+    angles = np.degrees(np.arctan2(offsets[:, 1], offsets[:, 0])) % 180.0
+    differences = np.abs((angles - target_axis + 90.0) % 180.0 - 90.0)
+    return segments_px[differences <= PITCH_DIRECTION_TOLERANCE_DEGREES]
+
+
+def pitch_values_by_direction(centers_px: np.ndarray, edges: np.ndarray) -> dict[str, np.ndarray]:
+    """Group Delaunay edge lengths into the three hexagonal lattice directions."""
+    grouped = {label: [] for label in PITCH_DIRECTION_LABELS}
+    for first, second in edges:
+        offset = centers_px[second] - centers_px[first]
+        angle = math.degrees(math.atan2(offset[1], offset[0])) % 180.0
+        differences = [abs((angle - reference + 90.0) % 180.0 - 90.0) for reference in PITCH_DIRECTION_ANGLES]
+        direction = int(np.argmin(differences))
+        if differences[direction] <= PITCH_DIRECTION_TOLERANCE_DEGREES:
+            grouped[PITCH_DIRECTION_LABELS[direction]].append(float(np.hypot(*offset)))
+    return {label: np.asarray(values, dtype=float) for label, values in grouped.items()}
+
+
+def bcp_grain_labels(centers_px: np.ndarray) -> np.ndarray:
+    """Group locally connected pillars whose sixfold orientations agree."""
+    count = len(centers_px)
+    labels = np.full(count, -1, dtype=int)
+    if count < MIN_GRAIN_DOTS:
+        return labels
+    edges = retain_local_bcp_edges(centers_px, delaunay_edge_indices(centers_px))
+    orientations, _spacing, _neighbors = local_hexagonal_orientations(centers_px)
+    parents = np.arange(count)
+
+    def root(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = int(parents[index])
+        return index
+
+    for first, second in edges:
+        if not (np.isfinite(orientations[first]) and np.isfinite(orientations[second])):
+            continue
+        if hexagonal_angle_difference(orientations[first], orientations[second]) < GRAIN_BOUNDARY_ORIENTATION_THRESHOLD_DEGREES:
+            root_first, root_second = root(int(first)), root(int(second))
+            if root_first != root_second:
+                parents[root_second] = root_first
+    groups: dict[int, list[int]] = {}
+    for index in np.flatnonzero(np.isfinite(orientations)):
+        groups.setdefault(root(int(index)), []).append(int(index))
+    for label, members in enumerate(group for group in groups.values() if len(group) >= MIN_GRAIN_DOTS):
+        labels[members] = label
+    return labels
+
+
+def bcp_grain_overlay_image(
+    centers_px: np.ndarray,
+    grain_labels: np.ndarray,
+    width: int,
+    height: int,
+    display_size: tuple[int, int],
+) -> Image.Image | None:
+    """Create a transparent nearest-pillar tessellation colored by grain label."""
+    valid = grain_labels >= 0
+    if not np.any(valid):
+        return None
+    stride = max(1, math.ceil(max(width, height) / GRAIN_OVERLAY_MAX_SIDE_PX))
+    x_coordinates = np.arange(math.ceil(width / stride)) * stride + stride / 2
+    y_coordinates = np.arange(math.ceil(height / stride)) * stride + stride / 2
+    grid_x, grid_y = np.meshgrid(x_coordinates, y_coordinates)
+    closest_distance = np.full(grid_x.shape, np.inf)
+    closest_label = np.full(grid_x.shape, -1, dtype=int)
+    for (center_x, center_y), label in zip(centers_px, grain_labels):
+        distance = (grid_x - center_x) ** 2 + (grid_y - center_y) ** 2
+        replace = distance < closest_distance
+        closest_distance[replace] = distance[replace]
+        closest_label[replace] = label
+    rgba = np.zeros((*closest_label.shape, 4), dtype=np.uint8)
+    mask = closest_label >= 0
+    rgba[mask, :3] = GRAIN_OVERLAY_COLORS[closest_label[mask] % len(GRAIN_OVERLAY_COLORS)]
+    rgba[mask, 3] = GRAIN_OVERLAY_ALPHA
+    return Image.fromarray(rgba, "RGBA").resize(display_size, Image.Resampling.NEAREST)
+
+
+def central_bcp_centroid(centers_px: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Return the detected centroid closest to the image center."""
+    image_center = np.array((width / 2, height / 2), dtype=float)
+    return centers_px[np.argmin(np.sum((centers_px - image_center) ** 2, axis=1))]
+
+
+def centroid_layout_overlay_image(
+    centers_px: np.ndarray,
+    anchor_px: np.ndarray,
+    diameter_px: float,
+    width: int,
+    height: int,
+    display_size: tuple[int, int],
+) -> Image.Image | None:
+    """Render equal-size virtual cylinders centered on the detected centroids."""
+    if not len(centers_px):
+        return None
+    display_width, display_height = display_size
+    scale_x, scale_y = display_width / width, display_height / height
+    radius = float(np.clip(diameter_px * min(scale_x, scale_y) / 2, 1.5, 9.0))
+    overlay = Image.new("RGBA", display_size)
+    draw = ImageDraw.Draw(overlay)
+    for x, y in centers_px:
+        x, y = x * scale_x, y * scale_y
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=CENTROID_LAYOUT_OUTLINE_COLOR, width=1)
+    anchor_x, anchor_y = anchor_px[0] * scale_x, anchor_px[1] * scale_y
+    draw.ellipse((anchor_x - 4, anchor_y - 4, anchor_x + 4, anchor_y + 4), fill=CENTROID_LAYOUT_ANCHOR_COLOR, outline=(255, 245, 245, 255), width=1)
+    return overlay
+
+
+def bcp_lattice_geometry(centers_px: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, np.ndarray, float]:
+    """Return physically local Delaunay segments, Pitch, and grain candidates."""
+    edges = retain_local_bcp_edges(centers_px, delaunay_edge_indices(centers_px))
+    segments = np.asarray([(*centers_px[first], *centers_px[second]) for first, second in edges], dtype=float).reshape(-1, 4)
+    orientations, spacing, _neighbors = local_hexagonal_orientations(centers_px)
+    boundary_segments, boundary_indices = [], set()
+    for first, second in edges:
+        if (
+            np.isfinite(orientations[first])
+            and np.isfinite(orientations[second])
+            and hexagonal_angle_difference(orientations[first], orientations[second])
+            >= GRAIN_BOUNDARY_ORIENTATION_THRESHOLD_DEGREES
+        ):
+            boundary_segments.append((*centers_px[first], *centers_px[second]))
+            boundary_indices.update((int(first), int(second)))
+    return (
+        segments,
+        pitch_values_by_direction(centers_px, edges),
+        np.asarray(boundary_segments, dtype=float).reshape(-1, 4),
+        np.asarray(sorted(boundary_indices), dtype=int),
+        spacing,
+    )
+
+
+def mean_and_standard_error(values: np.ndarray) -> tuple[float, float]:
+    """Return a sample mean and its standard error."""
+    if not len(values):
+        return float("nan"), float("nan")
+    if len(values) == 1:
+        return float(values[0]), 0.0
+    return float(np.mean(values)), float(np.std(values, ddof=1) / math.sqrt(len(values)))
+
+
+def mean_and_three_sigma(values: np.ndarray) -> tuple[float, float]:
+    """Return a sample mean and its three-sigma spread."""
+    if not len(values):
+        return float("nan"), float("nan")
+    return float(np.mean(values)), float(np.std(values, ddof=1) * 3) if len(values) > 1 else 0.0
+
+
+def bcp_calibration_scale(dot_array: np.ndarray, references: list[tuple[float, float, float]]) -> float:
+    """Infer the manual-reference dimensional scale without changing point positions."""
+    ratios = []
+    for center_x, center_y, radius in references:
+        distances = np.hypot(dot_array[:, 0] - center_x, dot_array[:, 1] - center_y)
+        nearest = int(np.argmin(distances))
+        if distances[nearest] <= radius:
+            ratios.append(radius * 2 / dot_array[nearest, 2])
+    return float(np.median(ratios)) if ratios else 1.0
+
+
+def calibrate_bcp_dimensions(
+    dot_array: np.ndarray,
+    references: list[tuple[float, float, float]],
+) -> np.ndarray:
+    """Use manually marked dot diameters to calibrate the fitted intensity-core size."""
+    scale = bcp_calibration_scale(dot_array, references)
+    calibrated = dot_array.copy()
+    calibrated[:, 2:5] *= scale
+    calibrated[:, 6] *= scale**2
+    return calibrated
+
+
+def analyze_bcp_dots(
+    image: np.ndarray,
+    pixel_size_nm: float | None,
+    references: list[tuple[float, float, float]] | None = None,
+    expected_diameter_px: float | None = None,
+    min_area_fraction: float = 0.25,
+    local_horizontal_sections: int = 4,
+    local_vertical_sections: int = 4,
+    use_local_segmentation: bool = True,
+    use_dog_contrast: bool = True,
+    internal_hole_fraction: float = 0.12,
+) -> BCPAnalysisResult:
+    """Detect perpendicular BCP dots, fit their dimensions, and mark grain boundaries."""
+    if min(image.shape) < 32:
+        raise ValueError("图像过小，无法识别 BCP 点阵。")
+    references = references or []
+    dots, contour_segments, components = connected_region_bcp_dots(
+        image,
+        references,
+        expected_diameter_px,
+        min_area_fraction,
+        internal_hole_fraction,
+        local_horizontal_sections,
+        local_vertical_sections,
+        use_local_segmentation,
+        use_dog_contrast,
+    )
+    if len(dots) < 4:
+        raise ValueError("识别到的 BCP 点太少；请使用对比度更清晰的俯视图，或关闭预处理后重试。")
+    dot_array = np.asarray(dots, dtype=float)
+    calibration_scale = bcp_calibration_scale(dot_array, references)
+    dot_array = calibrate_bcp_dimensions(dot_array, references)
+    centers = dot_array[:, :2]
+    directional_cds = np.asarray([component_directional_cds(component) for component in components]) * calibration_scale
+    triangulation_segments, directional_pitches, boundary_segments, boundary_indices, spacing = bcp_lattice_geometry(centers)
+    return BCPAnalysisResult(
+        centers_px=centers,
+        equivalent_diameters_px=dot_array[:, 2],
+        major_axes_px=dot_array[:, 3],
+        minor_axes_px=dot_array[:, 4],
+        angles_degrees=dot_array[:, 5],
+        areas_px=dot_array[:, 6],
+        contour_segments_px=contour_segments,
+        components_px=components,
+        directional_cds_px=directional_cds,
+        cd_means_px=np.mean(directional_cds, axis=1),
+        triangulation_segments_px=triangulation_segments,
+        pitch_values_by_direction_px=directional_pitches,
+        boundary_segments_px=boundary_segments,
+        boundary_dot_indices=boundary_indices,
+        lattice_spacing_px=spacing,
+        pixel_size_nm=pixel_size_nm if pixel_size_nm and pixel_size_nm > 0 else float("nan"),
+    )
+
+
+def finalize_bcp_measurements(result: BCPAnalysisResult) -> BCPAnalysisResult:
+    """Calculate CD, Delaunay Pitch, and grain candidates after recognition is complete."""
+    scale = bcp_result_dimension_scale(result)
+    directional_cds = np.asarray([component_directional_cds(component) for component in result.components_px]) * scale
+    triangulation_segments, directional_pitches, boundary_segments, boundary_indices, spacing = bcp_lattice_geometry(result.centers_px)
+    return BCPAnalysisResult(
+        centers_px=result.centers_px,
+        equivalent_diameters_px=result.equivalent_diameters_px,
+        major_axes_px=result.major_axes_px,
+        minor_axes_px=result.minor_axes_px,
+        angles_degrees=result.angles_degrees,
+        areas_px=result.areas_px,
+        contour_segments_px=result.contour_segments_px,
+        components_px=result.components_px,
+        directional_cds_px=directional_cds,
+        cd_means_px=np.mean(directional_cds, axis=1),
+        triangulation_segments_px=triangulation_segments,
+        pitch_values_by_direction_px=directional_pitches,
+        boundary_segments_px=boundary_segments,
+        boundary_dot_indices=boundary_indices,
+        lattice_spacing_px=spacing,
+        pixel_size_nm=result.pixel_size_nm,
+    )
+
+
 class LERLWRApp(AppBase):
     def __init__(self) -> None:
         super().__init__()
-        self.title("SEM measure（LER/LWR + 尺寸标注）")
+        self.title("SEM measure（LER/LWR + BCP 点阵 + 尺寸标注）")
         self.minsize(1100, 780)
         self.image_path: Path | None = None
         self.original_image: np.ndarray | None = None
         self.raw_image: np.ndarray | None = None
         self.processed_image: np.ndarray | None = None
+        self.bcp_preview_image: np.ndarray | None = None
         self.display_image: ImageTk.PhotoImage | None = None
         self.base_scale = 1.0
         self.display_scale = 1.0
@@ -431,14 +1456,35 @@ class LERLWRApp(AppBase):
         self.panning = False
         self.result: AnalysisResult | None = None
         self.analysis_origin: tuple[int, int] | None = None
+        self.bcp_result: BCPAnalysisResult | None = None
+        self.bcp_metrics_finalized = False
+        self.bcp_reference_circles: list[tuple[float, float, float]] = []
+        self.bcp_reference_start: tuple[float, float] | None = None
+        self.bcp_reference_preview_radius = 0.0
+        self.bcp_reference_mode = False
+        self.bcp_reference_active_index: int | None = None
+        self.bcp_reference_drag_mode: str | None = None
+        self.bcp_reference_drag_anchor: tuple[float, float] | None = None
+        self.bcp_reference_start_circle: tuple[float, float, float] | None = None
+        self.bcp_completion_mode = False
+        self.bcp_completion_drawing = False
+        self.bcp_completion_polygon_px: list[tuple[float, float]] = []
+        self.bcp_dialog: tk.Toplevel | None = None
         self.lcdu_cd_samples_nm: list[float] = []
         self.lcdu_sample_listbox: tk.Listbox | None = None
         self.metadata_text = "尚未导入 TIFF 文件。"
         self.rotation_degrees = 0.0
+        self.info_bar_crop_height_px = 0
 
         self.pixel_size_var = tk.StringVar(value="")
         self.metadata_var = tk.StringVar(value="尚未读取 TIFF 元数据")
-        self.preprocess_var = tk.BooleanVar(value=True)
+        self.normalize_var = tk.BooleanVar(value=True)
+        self.gaussian_denoise_var = tk.BooleanVar(value=True)
+        self.gaussian_kernel_size_var = tk.StringVar(value="3 × 3")
+        self.gaussian_sigma_scale_var = tk.DoubleVar(value=1.0)
+        self.gaussian_sigma_text_var = tk.StringVar(value="1.00（标准）")
+        self.gaussian_kernel_preview_var = tk.StringVar(value=gaussian_kernel_preview(3, 1.0))
+        self.bcp_use_dog_var = tk.BooleanVar(value=True)
         self.sigma_multiplier_var = tk.DoubleVar(value=1.0)
         self.outlier_level_var = tk.StringVar(value=DEFAULT_OUTLIER_LEVEL)
         self.lcdu_summary_var = tk.StringVar(value="LCDU 样本：0 条线")
@@ -447,8 +1493,22 @@ class LERLWRApp(AppBase):
         self.measurement_color = ANNOTATION_COLORS["length"]
         self.zoom_slider_var = tk.DoubleVar(value=1.0)
         self.zoom_percent_var = tk.StringVar(value="100%")
-        self.status_var = tk.StringVar(value="打开一张俯视 SEM 图，然后框选一条线及两侧背景。")
+        self.status_var = tk.StringVar(value="打开 SEM 图像后，可框选线条分析，或直接识别整图 BCP 点阵。")
         self.result_var = tk.StringVar(value="尚未分析")
+        self.bcp_reference_var = tk.StringVar(value="当前没有手动样本。")
+        self.bcp_expected_diameter_var = tk.StringVar(value="")
+        self.bcp_expected_unit_var = tk.StringVar(value="nm")
+        self.bcp_min_area_fraction_var = tk.StringVar(value="0.25")
+        self.bcp_internal_hole_fraction_var = tk.StringVar(value="0.12")
+        self.bcp_horizontal_sections_var = tk.StringVar(value="4")
+        self.bcp_vertical_sections_var = tk.StringVar(value="4")
+        self.bcp_use_local_segmentation_var = tk.BooleanVar(value=True)
+        self.bcp_line_display_var = tk.StringVar(value=TRIANGULATION_DISPLAY_ALL)
+        self.bcp_triangulation_overlay_var = tk.BooleanVar(value=True)
+        self.bcp_grain_overlay_var = tk.BooleanVar(value=True)
+        self.bcp_centroid_layout_overlay_var = tk.BooleanVar(value=False)
+        self.grain_overlay_image: ImageTk.PhotoImage | None = None
+        self.centroid_layout_overlay_image: ImageTk.PhotoImage | None = None
 
         self._build_ui()
         self.pixel_size_var.trace_add("write", self.refresh_annotation_labels)
@@ -476,16 +1536,13 @@ class LERLWRApp(AppBase):
         ttk.Label(controls, text="像素尺寸 (nm/pixel):").grid(row=0, column=1, sticky="e")
         ttk.Entry(controls, textvariable=self.pixel_size_var, width=10).grid(row=0, column=2, padx=(4, 12))
         ttk.Label(controls, textvariable=self.metadata_var, foreground="#426b2d").grid(row=0, column=3, padx=(0, 12), sticky="w")
-        ttk.Checkbutton(
-            controls,
-            text="归一化 + 3×3 去噪",
-            variable=self.preprocess_var,
-            command=self.refresh_preprocessing,
-        ).grid(row=0, column=4, padx=(0, 12))
+        self.image_processing_button = ttk.Button(controls, text="图像处理 ▸", command=self.toggle_image_processing_panel)
+        self.image_processing_button.grid(row=0, column=4, padx=(0, 12))
         ttk.Button(controls, text="自动校正 ROI 倾角", command=self.auto_align_roi).grid(row=0, column=5, padx=(0, 8))
         ttk.Button(controls, text="重置角度", command=self.reset_rotation).grid(row=0, column=6, padx=(0, 12))
-        ttk.Button(controls, text="分析选区", command=self.run_analysis).grid(row=0, column=7, padx=(0, 12))
-        ttk.Label(controls, text="测量工具").grid(row=0, column=8, sticky="e")
+        ttk.Button(controls, text="分析选区", command=self.run_analysis).grid(row=0, column=7, padx=(0, 8))
+        ttk.Button(controls, text="识别 BCP 点阵", command=self.open_bcp_recognition_dialog).grid(row=0, column=8, padx=(0, 12))
+        ttk.Label(controls, text="测量工具").grid(row=0, column=9, sticky="e")
         measurement_tool = ttk.Combobox(
             controls,
             textvariable=self.measurement_tool_var,
@@ -493,14 +1550,14 @@ class LERLWRApp(AppBase):
             values=("ROI（LER/LWR）", "长度", "矩形", "圆形", "正六边形"),
             width=13,
         )
-        measurement_tool.grid(row=0, column=9, padx=(4, 8))
+        measurement_tool.grid(row=0, column=10, padx=(4, 8))
         measurement_tool.bind("<<ComboboxSelected>>", self.change_measurement_tool)
         self.color_button = tk.Button(controls, text="线条颜色", command=self.choose_measurement_color, relief=tk.GROOVE)
-        self.color_button.grid(row=0, column=10, padx=(0, 8))
+        self.color_button.grid(row=0, column=11, padx=(0, 8))
         self.update_measurement_color_button()
 
         multiplier = ttk.LabelFrame(controls, text="显示/导出倍数", padding=(8, 2))
-        multiplier.grid(row=0, column=11, padx=(8, 0), sticky="ew")
+        multiplier.grid(row=0, column=12, padx=(8, 0), sticky="ew")
         ttk.Scale(
             multiplier,
             from_=0.5,
@@ -512,10 +1569,65 @@ class LERLWRApp(AppBase):
         ).grid(row=0, column=0, padx=(0, 8))
         ttk.Label(multiplier, textvariable=self.sigma_multiplier_var, width=4).grid(row=0, column=1)
 
+        self.image_processing_panel = ttk.LabelFrame(self, text="图像处理", padding=(10, 6))
+        self.image_processing_panel_visible = False
+        ttk.Checkbutton(
+            self.image_processing_panel,
+            text="归一化（1%–99%）",
+            variable=self.normalize_var,
+            command=self.refresh_image_preprocessing,
+        ).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(
+            self.image_processing_panel,
+            text="高斯卷积去噪",
+            variable=self.gaussian_denoise_var,
+            command=self.refresh_image_preprocessing,
+        ).pack(side=tk.LEFT, padx=(0, 5))
+        kernel_selector = ttk.Combobox(
+            self.image_processing_panel,
+            textvariable=self.gaussian_kernel_size_var,
+            state="readonly",
+            values=tuple(f"{size} × {size}" for size in GAUSSIAN_KERNEL_SIZES),
+            width=7,
+        )
+        kernel_selector.pack(side=tk.LEFT, padx=(0, 18))
+        kernel_selector.bind("<<ComboboxSelected>>", self.refresh_image_preprocessing)
+        sigma_controls = ttk.Frame(self.image_processing_panel)
+        sigma_controls.pack(side=tk.LEFT, padx=(0, 18))
+        ttk.Label(sigma_controls, text="σ（相对默认）：").pack(side=tk.LEFT)
+        ttk.Scale(
+            sigma_controls,
+            from_=GAUSSIAN_SIGMA_SCALE_MIN,
+            to=GAUSSIAN_SIGMA_SCALE_MAX,
+            orient=tk.HORIZONTAL,
+            variable=self.gaussian_sigma_scale_var,
+            command=self.refresh_image_preprocessing,
+            length=95,
+        ).pack(side=tk.LEFT, padx=(3, 5))
+        ttk.Label(sigma_controls, textvariable=self.gaussian_sigma_text_var, width=10).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            self.image_processing_panel,
+            text="BCP DoG 对比增强（显示/识别）",
+            variable=self.bcp_use_dog_var,
+            command=self.refresh_bcp_contrast,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            self.image_processing_panel,
+            text="DoG 过强时可取消勾选，改以原始亮暗强度分割。",
+            foreground="#666666",
+        ).pack(side=tk.LEFT)
+        ttk.Label(
+            self.image_processing_panel,
+            textvariable=self.gaussian_kernel_preview_var,
+            justify=tk.LEFT,
+            font=("Menlo", 9),
+        ).pack(side=tk.RIGHT, padx=(18, 0))
+
         content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        self.main_content = content
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        image_frame = ttk.LabelFrame(content, text="图像：倾斜线先框选 ROI，再点击“自动校正 ROI 倾角”", padding=5)
+        image_frame = ttk.LabelFrame(content, text="图像：线条可先校正 ROI 倾角；BCP 点阵直接识别整图", padding=5)
         result_frame = ttk.LabelFrame(content, text="测量结果", padding=12)
         content.add(image_frame, weight=4)
         content.add(result_frame, weight=2)
@@ -603,13 +1715,14 @@ class LERLWRApp(AppBase):
             "按住空格 + 左键拖动：平移图像。\n\n"
             "框选后可拖动绿色点调整范围；拖框内或中心点可移动选区。\n"
             "选中通用标注时 Backspace 删除标注，否则删除 ROI。\n\n"
-            "默认使用 1%–99% 归一化和 3×3 中值去噪。\n"
-            "如需比较原始图，可取消勾选预处理。\n\n"
+            "“图像处理”可独立切换归一化、可调高斯卷积和 BCP DoG 对比增强。\n"
+            "取消 DoG 后，BCP 将以原始亮暗强度进行分割。\n\n"
             "本版假设线条沿竖直方向。\n"
             "LER 对左右边分别线性去趋势；LWR 只减去平均线宽。\n"
             "LCDU 由多条线的平均 CD 样本计算。\n"
             "LCDU 样本列表可选中单条删除。\n"
             "ER 的行业标准记号是 LER；总边缘 RMS 不等于 LWR。"
+            "\n\nBCP 点阵：点击“识别 BCP 点阵”，先标示至少 3 个代表圆柱，再识别整图点位；绿色线为二值连通区域轮廓，蓝线为 Delaunay 三角网，红线为依据局部六重对称取向变化推断的晶界。"
         )
         ttk.Label(result_frame, text=hint, justify=tk.LEFT, wraplength=290).pack(anchor="nw")
         ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(12, 6)).pack(side=tk.BOTTOM, fill=tk.X)
@@ -645,7 +1758,7 @@ class LERLWRApp(AppBase):
                 metadata_pixel_size = read_sem_pixel_size_nm(source)
                 self.metadata_text = format_tiff_metadata(source, path)
                 image = source.convert("L")
-                self.original_image = np.asarray(image)
+                self.original_image, self.info_bar_crop_height_px = remove_bottom_information_bar(np.asarray(image))
         except (OSError, ValueError) as exc:
             messagebox.showerror("无法读取", f"无法读取图像：\n{exc}")
             return
@@ -659,11 +1772,16 @@ class LERLWRApp(AppBase):
         if metadata_pixel_size is None:
             self.pixel_size_var.set("")
             self.metadata_var.set("无 SEM 像素尺寸；请手动输入")
+            self.bcp_expected_unit_var.set("px")
         else:
             self.pixel_size_var.set(f"{metadata_pixel_size:.8g}")
             self.metadata_var.set(f"TIFF 元数据：{metadata_pixel_size:.6g} nm/pixel")
+            self.bcp_expected_unit_var.set("nm")
         self.result = None
         self.analysis_origin = None
+        self.bcp_result = None
+        self.clear_bcp_completion_selection(redraw=False)
+        self.discard_bcp_reference_circles()
         self.lcdu_cd_samples_nm.clear()
         self.update_lcdu_summary_text()
         self.roi_canvas = None
@@ -671,7 +1789,11 @@ class LERLWRApp(AppBase):
         self.active_annotation_index = None
         self.draw_image(reset_view=True)
         self.result_var.set("请框选一条线及两侧背景，然后点击“分析选区”。")
-        self.status_var.set(f"已打开并完成预处理：{self.image_path.name}  ({self.raw_image.shape[1]} × {self.raw_image.shape[0]} px)")
+        crop_note = f"；已自动裁掉底部信息栏 {self.info_bar_crop_height_px} px" if self.info_bar_crop_height_px else ""
+        self.status_var.set(
+            f"已打开：{self.image_path.name}  ({self.raw_image.shape[1]} × {self.raw_image.shape[0]} px)；"
+            f"当前图像处理：{self.preprocessing_description()}{crop_note}"
+        )
 
     def snapshot_editor_state(self) -> EditorState:
         annotations = [MeasurementAnnotation(item.kind, item.bounds_px, item.color) for item in self.annotations]
@@ -680,9 +1802,15 @@ class LERLWRApp(AppBase):
             annotations,
             self.active_annotation_index,
             self.rotation_degrees,
-            self.preprocess_var.get(),
+            self.normalize_var.get(),
+            self.gaussian_denoise_var.get(),
+            self.gaussian_kernel_size_var.get(),
+            self.gaussian_sigma_scale_var.get(),
+            self.bcp_use_dog_var.get(),
             self.result,
             self.analysis_origin,
+            self.bcp_result,
+            self.bcp_metrics_finalized,
         )
 
     def record_undo_state(self) -> None:
@@ -710,15 +1838,24 @@ class LERLWRApp(AppBase):
         self.active_annotation_index = state.active_annotation_index
         self.rotation_degrees = state.rotation_degrees
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
-        self.preprocess_var.set(state.preprocess_enabled)
+        self.normalize_var.set(state.normalize_enabled)
+        self.gaussian_denoise_var.set(state.gaussian_denoise_enabled)
+        self.gaussian_kernel_size_var.set(state.gaussian_kernel_size)
+        self.gaussian_sigma_scale_var.set(state.gaussian_sigma_scale)
+        self.bcp_use_dog_var.set(state.bcp_dog_enabled)
+        self.update_gaussian_kernel_preview()
         self.result = state.result
         self.analysis_origin = state.analysis_origin
+        self.bcp_result = state.bcp_result
+        self.bcp_metrics_finalized = state.bcp_metrics_finalized
         self.rebuild_working_images()
         self.draw_image()
-        if self.result is None:
-            self.result_var.set("已撤销上一步操作。")
-        else:
+        if self.result is not None:
             self.update_result_text()
+        elif self.bcp_result is not None:
+            self.update_bcp_result_text()
+        else:
+            self.result_var.set("已撤销上一步操作。")
         self.status_var.set("已撤销上一步操作。")
         return "break"
 
@@ -726,7 +1863,40 @@ class LERLWRApp(AppBase):
         if self.original_image is None:
             return
         self.raw_image = rotate_grayscale_image(self.original_image, self.rotation_degrees)
-        self.processed_image = normalize_and_denoise(self.raw_image)
+        self.processed_image = preprocess_image(
+            self.raw_image,
+            self.normalize_var.get(),
+            self.gaussian_denoise_var.get(),
+            self.gaussian_kernel_size(),
+            self.gaussian_sigma_scale(),
+        )
+        self.rebuild_bcp_preview()
+
+    def bcp_preview_diameter_px(self) -> float:
+        """Choose a stable DoG preview scale without requiring BCP dialog input."""
+        if self.bcp_reference_circles:
+            return float(np.median([radius * 2 for _x, _y, radius in self.bcp_reference_circles]))
+        try:
+            diameter = float(self.bcp_expected_diameter_var.get())
+        except ValueError:
+            diameter = 0.0
+        if diameter > 0:
+            if self.bcp_expected_unit_var.get() == "px":
+                return diameter
+            pixel_size = self.measurement_pixel_size()
+            if pixel_size is not None:
+                return diameter / pixel_size
+        if self.processed_image is None:
+            return 12.0
+        return float(np.clip(min(self.processed_image.shape) / 30, 8.0, 48.0))
+
+    def rebuild_bcp_preview(self) -> None:
+        """Create the optional DoG canvas preview without changing analysis input."""
+        self.bcp_preview_image = None
+        if self.processed_image is None or not self.bcp_use_dog_var.get():
+            return
+        response = bcp_response(self.processed_image, 1.0, self.bcp_preview_diameter_px())
+        self.bcp_preview_image = normalize_intensity(response)
 
     def auto_align_roi(self) -> None:
         try:
@@ -742,6 +1912,9 @@ class LERLWRApp(AppBase):
             self.rebuild_working_images()
             self.result = None
             self.analysis_origin = None
+            self.bcp_result = None
+            self.clear_bcp_completion_selection(redraw=False)
+            self.discard_bcp_reference_circles()
             self.roi_canvas = None
             self.clear_annotations(redraw=False, record_history=False)
             self.draw_image()
@@ -761,6 +1934,9 @@ class LERLWRApp(AppBase):
         self.rebuild_working_images()
         self.result = None
         self.analysis_origin = None
+        self.bcp_result = None
+        self.clear_bcp_completion_selection(redraw=False)
+        self.discard_bcp_reference_circles()
         self.roi_canvas = None
         self.clear_annotations(redraw=False, record_history=False)
         self.draw_image(reset_view=True)
@@ -793,6 +1969,9 @@ class LERLWRApp(AppBase):
         self.rebuild_working_images()
         self.result = None
         self.analysis_origin = None
+        self.bcp_result = None
+        self.clear_bcp_completion_selection(redraw=False)
+        self.discard_bcp_reference_circles()
         self.roi_canvas = None
         self.clear_annotations(redraw=False, record_history=False)
         self.draw_image()
@@ -809,20 +1988,66 @@ class LERLWRApp(AppBase):
         viewer.insert("1.0", self.metadata_text)
         viewer.configure(state=tk.DISABLED)
 
-    def refresh_preprocessing(self) -> None:
+    def toggle_image_processing_panel(self) -> None:
+        if self.image_processing_panel_visible:
+            self.image_processing_panel.pack_forget()
+            self.image_processing_button.configure(text="图像处理 ▸")
+        else:
+            self.image_processing_panel.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 6), before=self.main_content)
+            self.image_processing_button.configure(text="图像处理 ▾")
+        self.image_processing_panel_visible = not self.image_processing_panel_visible
+
+    def gaussian_kernel_size(self) -> int:
+        return int(self.gaussian_kernel_size_var.get().split()[0])
+
+    def gaussian_sigma_scale(self) -> float:
+        return float(np.clip(self.gaussian_sigma_scale_var.get(), GAUSSIAN_SIGMA_SCALE_MIN, GAUSSIAN_SIGMA_SCALE_MAX))
+
+    def update_gaussian_kernel_preview(self) -> None:
+        sigma_scale = self.gaussian_sigma_scale()
+        sigma_text = "1.00（标准）" if math.isclose(sigma_scale, 1.0, abs_tol=0.005) else f"{sigma_scale:.2f}"
+        self.gaussian_sigma_text_var.set(sigma_text)
+        self.gaussian_kernel_preview_var.set(gaussian_kernel_preview(self.gaussian_kernel_size(), sigma_scale))
+
+    def preprocessing_description(self) -> str:
+        parts = []
+        if self.normalize_var.get():
+            parts.append("归一化")
+        if self.gaussian_denoise_var.get():
+            parts.append(f"{self.gaussian_kernel_size_var.get()} 高斯卷积（σ×{self.gaussian_sigma_scale():.2f}）")
+        if self.bcp_use_dog_var.get():
+            parts.append("BCP DoG 预览")
+        return " + ".join(parts) if parts else "原始灰度图"
+
+    def refresh_image_preprocessing(self, _event: object = None) -> None:
         if self.raw_image is None:
+            self.update_gaussian_kernel_preview()
             return
+        self.update_gaussian_kernel_preview()
         self.result = None
         self.analysis_origin = None
+        self.bcp_result = None
+        self.clear_bcp_completion_selection(redraw=False)
+        self.rebuild_working_images()
         self.draw_image()
-        mode = "归一化 + 3×3 去噪" if self.preprocess_var.get() else "原始灰度图"
         self.result_var.set("处理方式已切换；请重新点击“分析选区”。")
-        self.status_var.set(f"当前使用：{mode}")
+        self.status_var.set(f"当前使用：{self.preprocessing_description()}")
+
+    def refresh_bcp_contrast(self) -> None:
+        if self.raw_image is None:
+            return
+        self.bcp_result = None
+        self.clear_bcp_completion_selection(redraw=False)
+        self.rebuild_bcp_preview()
+        self.draw_image()
+        mode = "DoG 对比增强" if self.bcp_use_dog_var.get() else "原始亮暗强度"
+        self.result_var.set("BCP 对比方式已切换；画布预览已刷新，请重新点击“开始识别”。")
+        self.status_var.set(f"画布已切换为：{mode}；LER/LWR 分析输入不变。")
 
     def draw_image(self, reset_view: bool = False) -> None:
         if self.raw_image is None:
             return
-        image = self.processed_image if self.preprocess_var.get() else self.raw_image
+        image = self.bcp_preview_image if self.bcp_use_dog_var.get() else self.processed_image
         if image is None:
             return
         height, width = image.shape
@@ -844,6 +2069,9 @@ class LERLWRApp(AppBase):
             self.roi_rectangle = None
         self.draw_roi()
         self.render_analysis_overlay()
+        self.render_bcp_overlay()
+        self.draw_bcp_completion_polygon()
+        self.draw_bcp_reference_circles()
         self.draw_annotations()
         if reset_view:
             self.canvas.xview_moveto(0)
@@ -914,6 +2142,12 @@ class LERLWRApp(AppBase):
         return None
 
     def update_canvas_cursor(self, event: tk.Event) -> None:
+        if self.bcp_completion_mode:
+            self.canvas.configure(cursor="pencil")
+            return
+        if self.bcp_reference_mode:
+            self.canvas.configure(cursor="crosshair")
+            return
         if self.space_held:
             self.canvas.configure(cursor="fleur")
             return
@@ -1148,6 +2382,12 @@ class LERLWRApp(AppBase):
         return "move" if left <= x <= right and top <= y <= bottom else None
 
     def start_canvas_action(self, event: tk.Event) -> None:
+        if self.bcp_completion_mode and not self.space_held:
+            self.start_bcp_completion_draw(event)
+            return
+        if self.bcp_reference_mode and not self.space_held:
+            self.start_bcp_reference(event)
+            return
         if self.raw_image is None or self.space_held:
             self.start_roi(event)
             return
@@ -1179,6 +2419,12 @@ class LERLWRApp(AppBase):
         self.draw_annotations()
 
     def move_canvas_action(self, event: tk.Event) -> None:
+        if self.bcp_completion_mode and self.bcp_completion_drawing:
+            self.move_bcp_completion_draw(event)
+            return
+        if self.bcp_reference_mode and (self.bcp_reference_start is not None or self.bcp_reference_active_index is not None):
+            self.move_bcp_reference(event)
+            return
         if self.panning:
             self.move_roi(event)
             return
@@ -1191,6 +2437,12 @@ class LERLWRApp(AppBase):
         self.draw_annotations()
 
     def finish_canvas_action(self, event: tk.Event) -> None:
+        if self.bcp_completion_mode and self.bcp_completion_drawing:
+            self.finish_bcp_completion_draw(event)
+            return
+        if self.bcp_reference_mode and (self.bcp_reference_start is not None or self.bcp_reference_active_index is not None):
+            self.finish_bcp_reference(event)
+            return
         if self.panning:
             self.finish_roi(event)
             return
@@ -1267,6 +2519,10 @@ class LERLWRApp(AppBase):
             self.status_var.set("已清空所有通用测量标注。")
 
     def clear_selection(self, _event: tk.Event | None = None) -> str:
+        if self.bcp_completion_mode or self.bcp_completion_polygon_px:
+            self.clear_bcp_completion_selection()
+            self.status_var.set("已清除局部补漏框选。")
+            return "break"
         if self.active_annotation_index is not None:
             return self.delete_active_annotation()
         return self.clear_roi()
@@ -1464,7 +2720,7 @@ class LERLWRApp(AppBase):
         bottom = min(self.raw_image.shape[0], math.ceil(y1 / self.display_scale))
         if right - left < MIN_ROI_WIDTH or bottom - top < MIN_ROI_HEIGHT:
             raise ValueError("选区过小；请框选更长的一段线及两侧背景。")
-        analysis_image = self.processed_image if self.preprocess_var.get() else self.raw_image
+        analysis_image = self.processed_image
         if analysis_image is None:
             raise ValueError("图像未准备完成。")
         return analysis_image[top:bottom, left:right], left, top
@@ -1535,11 +2791,354 @@ class LERLWRApp(AppBase):
             roi, left_offset, top_offset = self.selected_roi()
             self.result = analyze_roi(roi, pixel_size, self.outlier_threshold_px())
             self.analysis_origin = (left_offset, top_offset)
+            self.bcp_result = None
+            self.clear_bcp_completion_selection(redraw=False)
             self.draw_image()
             self.update_result_text()
             self.status_var.set("分析完成。可调整 σ 倍数，或导出轨迹和结果。")
         except ValueError as exc:
             messagebox.showwarning("无法分析", str(exc))
+
+    def open_bcp_recognition_dialog(self) -> None:
+        if self.raw_image is None:
+            messagebox.showinfo("暂无图像", "请先打开一张俯视 BCP SEM 图像。")
+            return
+        if self.bcp_dialog is not None and self.bcp_dialog.winfo_exists():
+            self.close_bcp_recognition_dialog()
+            return
+        self.bcp_dialog = tk.Toplevel(self)
+        self.bcp_dialog.title("BCP 点阵识别")
+        self.bcp_dialog.geometry("470x865")
+        self.bcp_dialog.transient(self)
+        self.bcp_dialog.protocol("WM_DELETE_WINDOW", self.close_bcp_recognition_dialog)
+        content = ttk.Frame(self.bcp_dialog, padding=16)
+        content.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(content, text="BCP 点阵识别", font=("Helvetica", 15, "bold")).pack(anchor="w")
+        ttk.Label(content, text="自动识别可使用 DoG 或原始亮暗强度，再经局部分割、二值连通区域和轮廓描绘完成；样本和局部分割均为可选辅助。", wraplength=430).pack(anchor="w", pady=(8, 8))
+
+        assistance = ttk.LabelFrame(content, text="样本与局部分割（可选辅助）", padding=10)
+        assistance.pack(fill=tk.X, pady=(0, 10))
+        ttk.Checkbutton(
+            assistance,
+            text="启用局部分割（各图块独立计算当前响应阈值）",
+            variable=self.bcp_use_local_segmentation_var,
+        ).pack(anchor="w")
+        tile_controls = ttk.Frame(assistance)
+        tile_controls.pack(anchor="w", pady=(5, 0))
+        ttk.Label(tile_controls, text="横向分块：").pack(side=tk.LEFT)
+        ttk.Entry(tile_controls, textvariable=self.bcp_horizontal_sections_var, width=5).pack(side=tk.LEFT, padx=(2, 4))
+        ttk.Label(tile_controls, text="竖向分块：").pack(side=tk.LEFT)
+        ttk.Entry(tile_controls, textvariable=self.bcp_vertical_sections_var, width=5).pack(side=tk.LEFT, padx=(2, 4))
+        ttk.Label(tile_controls, text="份（默认 4 × 4）").pack(side=tk.LEFT)
+        area_controls = ttk.Frame(assistance)
+        area_controls.pack(anchor="w", pady=(5, 0))
+        ttk.Label(area_controls, text="最小保留面积：").pack(side=tk.LEFT)
+        ttk.Entry(area_controls, textvariable=self.bcp_min_area_fraction_var, width=6).pack(side=tk.LEFT, padx=(2, 5))
+        ttk.Label(area_controls, text="× 样本圈/柱径面积").pack(side=tk.LEFT)
+        hole_controls = ttk.Frame(assistance)
+        hole_controls.pack(anchor="w", pady=(5, 0))
+        ttk.Label(hole_controls, text="柱内空洞忽略上限：").pack(side=tk.LEFT)
+        ttk.Entry(hole_controls, textvariable=self.bcp_internal_hole_fraction_var, width=6).pack(side=tk.LEFT, padx=(2, 5))
+        ttk.Label(hole_controls, text="× 样本圈/柱径面积（0 = 关闭）").pack(side=tk.LEFT)
+        ttk.Label(
+            assistance,
+            text="样本用于亮暗极性、尺度、面积参数和尺寸校准；局部分割可应对亮度不均，关闭后使用整图阈值。柱内小暗斑会被忽略，不绘制内轮廓。",
+            foreground="#666666",
+            wraplength=430,
+        ).pack(anchor="w", pady=(3, 0))
+        ttk.Label(assistance, text="建议标示 3 个以上清晰、孤立的样本；拖蓝圈内部可移动，拖外缘可改大小。", wraplength=430).pack(anchor="w", pady=(8, 2))
+        ttk.Label(assistance, textvariable=self.bcp_reference_var, foreground="#2369b0").pack(anchor="w", pady=(0, 5))
+        buttons = ttk.Frame(assistance)
+        buttons.pack(anchor="w")
+        ttk.Button(buttons, text="标示/编辑样本", command=self.start_bcp_reference_marking).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="结束编辑", command=self.stop_bcp_reference_marking).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="清除样本", command=self.clear_bcp_reference_circles).pack(side=tk.LEFT)
+
+        recognition = ttk.LabelFrame(content, text="识别", padding=10)
+        recognition.pack(fill=tk.X)
+        diameter_controls = ttk.Frame(recognition)
+        diameter_controls.pack(anchor="w")
+        ttk.Label(diameter_controls, text="圆柱大致直径：").pack(side=tk.LEFT)
+        ttk.Entry(diameter_controls, textvariable=self.bcp_expected_diameter_var, width=9).pack(side=tk.LEFT, padx=(2, 5))
+        ttk.Combobox(diameter_controls, textvariable=self.bcp_expected_unit_var, state="readonly", values=("nm", "px"), width=4).pack(side=tk.LEFT)
+        ttk.Label(diameter_controls, text="（无样本时必填）").pack(side=tk.LEFT, padx=(6, 0))
+        recognition_buttons = ttk.Frame(recognition)
+        recognition_buttons.pack(anchor="w", pady=(10, 0))
+        ttk.Button(recognition_buttons, text="开始识别", command=self.perform_bcp_analysis).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(recognition_buttons, text="清除当前结果", command=self.clear_bcp_analysis).pack(side=tk.LEFT)
+
+        line_display = ttk.LabelFrame(content, text="三角网与晶粒显示（完成计算后）", padding=8)
+        line_display.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(line_display, text="三角网可按主方向筛选；同一晶粒会以同色半透明区域显示。", foreground="#666666").pack(anchor="w")
+        ttk.Checkbutton(
+            line_display,
+            text="显示三角网叠加层（蓝色）",
+            variable=self.bcp_triangulation_overlay_var,
+            command=self.refresh_bcp_line_display,
+        ).pack(anchor="w", pady=(5, 0))
+        display_choices = ttk.Frame(line_display)
+        display_choices.pack(anchor="w", pady=(3, 0))
+        for mode in TRIANGULATION_DISPLAY_MODES:
+            ttk.Radiobutton(
+                display_choices,
+                text=mode,
+                value=mode,
+                variable=self.bcp_line_display_var,
+                command=self.refresh_bcp_line_display,
+            ).pack(side=tk.LEFT, padx=(0, 9))
+        ttk.Checkbutton(
+            line_display,
+            text="显示晶粒取向叠加层（彩色）",
+            variable=self.bcp_grain_overlay_var,
+            command=self.refresh_bcp_line_display,
+        ).pack(anchor="w", pady=(5, 0))
+        ttk.Checkbutton(
+            line_display,
+            text="显示质心虚拟圆柱布局（紫色，红点为锚点）",
+            variable=self.bcp_centroid_layout_overlay_var,
+            command=self.refresh_bcp_line_display,
+        ).pack(anchor="w", pady=(5, 0))
+
+        completion = ttk.LabelFrame(content, text="局部补漏（保留已识别区域）", padding=10)
+        completion.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(completion, text="在图上徒手框选不规则区域；局部阈值只由框内像素计算，框外绿色轮廓不会重算。", wraplength=430).pack(anchor="w")
+        completion_buttons = ttk.Frame(completion)
+        completion_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(completion_buttons, text="框选补漏区域", command=self.start_bcp_completion_selection).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(completion_buttons, text="识别此区域", command=self.perform_bcp_completion).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(completion_buttons, text="清除框选", command=self.clear_bcp_completion_selection).pack(side=tk.LEFT)
+        ttk.Button(completion, text="完成补漏并计算 CD / Pitch", command=self.finalize_bcp_measurements).pack(anchor="w", pady=(8, 0))
+
+    def close_bcp_recognition_dialog(self) -> None:
+        if self.bcp_dialog is not None and self.bcp_dialog.winfo_exists():
+            self.bcp_dialog.destroy()
+        self.bcp_dialog = None
+
+    def perform_bcp_analysis(self) -> None:
+        if self.raw_image is None:
+            messagebox.showinfo("暂无图像", "请先打开一张俯视 BCP SEM 图像。")
+            return
+        image = self.processed_image
+        if image is None:
+            return
+        try:
+            expected_diameter_px = self.expected_bcp_diameter_px()
+            if len(self.bcp_reference_circles) < 3 and expected_diameter_px is None:
+                raise ValueError("自动识别请先输入圆柱大致直径；或者标示至少 3 个样本圆柱。")
+            min_area_fraction = self.bcp_min_area_fraction()
+            internal_hole_fraction = self.bcp_internal_hole_fraction()
+            use_local_segmentation = self.bcp_use_local_segmentation_var.get()
+            local_horizontal_sections, local_vertical_sections = self.bcp_grid_sections() if use_local_segmentation else (0, 0)
+            self.bcp_result = analyze_bcp_dots(
+                image,
+                self.measurement_pixel_size(),
+                self.bcp_reference_circles,
+                expected_diameter_px,
+                min_area_fraction,
+                local_horizontal_sections,
+                local_vertical_sections,
+                use_local_segmentation,
+                self.bcp_use_dog_var.get(),
+                internal_hole_fraction,
+            )
+            self.bcp_metrics_finalized = False
+        except ValueError as exc:
+            messagebox.showwarning("无法识别 BCP 点阵", str(exc))
+            return
+        self.result = None
+        self.analysis_origin = None
+        self.clear_bcp_completion_selection(redraw=False)
+        self.rebuild_bcp_preview()
+        self.draw_image()
+        self.update_bcp_result_text()
+        response_mode = "DoG 对比增强" if self.bcp_use_dog_var.get() else "原始亮暗强度"
+        segmentation = f"局部分割：横向 {local_horizontal_sections} × 竖向 {local_vertical_sections}" if use_local_segmentation else "整图分割"
+        self.status_var.set(
+            f"BCP 点阵识别完成（{response_mode}；{segmentation}；"
+            f"最小连通面积 {min_area_fraction:.2f} × 参考面积；"
+            f"柱内空洞忽略上限 {internal_hole_fraction:.2f} × 参考面积）："
+            "请先检查绿色轮廓并完成局部补漏，再计算 CD / Pitch。"
+        )
+
+    def expected_bcp_diameter_px(self) -> float | None:
+        text = self.bcp_expected_diameter_var.get().strip()
+        if not text:
+            return None
+        diameter = float(text)
+        if diameter <= 0:
+            raise ValueError("圆柱大致直径必须大于 0。")
+        if self.bcp_expected_unit_var.get() == "px":
+            return diameter
+        pixel_size = self.measurement_pixel_size()
+        if pixel_size is None:
+            raise ValueError("输入 nm 尺寸前，请先填写像素尺寸；或把单位改为 px。")
+        return diameter / pixel_size
+
+    def bcp_min_area_fraction(self) -> float:
+        fraction = float(self.bcp_min_area_fraction_var.get())
+        if not 0.0 <= fraction <= 0.80:
+            raise ValueError("最小保留面积应在 0–0.80 倍参考面积之间。")
+        return fraction
+
+    def bcp_internal_hole_fraction(self) -> float:
+        fraction = float(self.bcp_internal_hole_fraction_var.get())
+        if not 0.0 <= fraction <= 0.30:
+            raise ValueError("柱内空洞忽略上限应在 0–0.30 倍参考面积之间。")
+        return fraction
+
+    def bcp_grid_sections(self) -> tuple[int, int]:
+        horizontal = int(self.bcp_horizontal_sections_var.get())
+        vertical = int(self.bcp_vertical_sections_var.get())
+        if not 1 <= horizontal <= 30 or not 1 <= vertical <= 30:
+            raise ValueError("横向和竖向分块数均应为 1–30 的整数。")
+        return horizontal, vertical
+
+    def clear_bcp_analysis(self) -> None:
+        if self.bcp_result is None:
+            return
+        self.bcp_result = None
+        self.bcp_metrics_finalized = False
+        self.clear_bcp_completion_selection(redraw=False)
+        self.draw_image()
+        self.result_var.set("已清除 BCP 点阵识别结果。")
+        self.status_var.set("已清除 BCP 绿色轮廓、蓝色三角网和红色晶界标记；蓝色样本圈仍保留。")
+
+    def start_bcp_completion_selection(self) -> None:
+        if self.bcp_result is None:
+            messagebox.showinfo("请先识别", "请先完成整图 BCP 识别，再使用局部补漏。")
+            return
+        if self.bcp_metrics_finalized:
+            self.bcp_metrics_finalized = False
+            self.draw_image()
+            self.update_bcp_result_text()
+        self.stop_bcp_reference_marking()
+        self.bcp_completion_mode = True
+        self.bcp_completion_drawing = False
+        self.bcp_completion_polygon_px.clear()
+        self.draw_bcp_completion_polygon()
+        self.canvas.configure(cursor="pencil")
+        self.status_var.set("局部补漏框选：按住鼠标左键徒手圈出遗漏区域；松开后点击“识别此区域”。")
+
+    def start_bcp_completion_draw(self, event: tk.Event) -> None:
+        point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.bcp_completion_polygon_px = [point]
+        self.bcp_completion_drawing = True
+        self.draw_bcp_completion_polygon()
+
+    def move_bcp_completion_draw(self, event: tk.Event) -> None:
+        point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if not self.bcp_completion_polygon_px or math.dist(point, self.bcp_completion_polygon_px[-1]) >= 1.5:
+            self.bcp_completion_polygon_px.append(point)
+            self.draw_bcp_completion_polygon()
+
+    def finish_bcp_completion_draw(self, event: tk.Event) -> None:
+        self.move_bcp_completion_draw(event)
+        self.bcp_completion_drawing = False
+        self.bcp_completion_mode = False
+        self.canvas.configure(cursor="")
+        if len(self.bcp_completion_polygon_px) < 3:
+            self.bcp_completion_polygon_px.clear()
+            self.status_var.set("框选区域过小；请重新圈选。")
+        else:
+            self.status_var.set("局部补漏区域已框选；点击“识别此区域”只补充该区域内遗漏的轮廓。")
+        self.draw_bcp_completion_polygon()
+
+    def clear_bcp_completion_selection(self, redraw: bool = True) -> None:
+        self.bcp_completion_mode = False
+        self.bcp_completion_drawing = False
+        self.bcp_completion_polygon_px.clear()
+        if self.raw_image is not None:
+            self.canvas.configure(cursor="")
+        if redraw and self.raw_image is not None:
+            self.draw_bcp_completion_polygon()
+
+    def perform_bcp_completion(self) -> None:
+        if self.bcp_result is None or self.processed_image is None:
+            messagebox.showinfo("请先识别", "请先完成整图 BCP 识别，再使用局部补漏。")
+            return
+        if len(self.bcp_completion_polygon_px) < 3:
+            messagebox.showinfo("请先框选", "请先使用“框选补漏区域”徒手圈出不规则区域。")
+            return
+        try:
+            expected_diameter_px = self.expected_bcp_diameter_px()
+            if len(self.bcp_reference_circles) < 3 and expected_diameter_px is None:
+                raise ValueError("局部补漏需要输入圆柱大致直径，或保留至少 3 个样本圆柱。")
+            selection_mask = polygon_pixel_mask(self.processed_image.shape, self.bcp_completion_polygon_px)
+            candidates = local_bcp_completion_candidates(
+                self.processed_image,
+                selection_mask,
+                self.bcp_reference_circles,
+                expected_diameter_px,
+                self.bcp_min_area_fraction(),
+                self.bcp_internal_hole_fraction(),
+                self.bcp_use_dog_var.get(),
+            )
+            self.bcp_result, added = append_bcp_completion(self.bcp_result, candidates, selection_mask)
+            self.bcp_metrics_finalized = False
+        except ValueError as exc:
+            messagebox.showwarning("无法局部补漏", str(exc))
+            return
+        self.result = None
+        self.analysis_origin = None
+        self.draw_image()
+        self.update_bcp_result_text()
+        self.start_bcp_completion_selection()
+        self.status_var.set(f"局部补漏完成：新增 {added} 个轮廓；现在可直接框选下一处遗漏，确认后再计算 CD / Pitch。")
+
+    def finalize_bcp_measurements(self) -> None:
+        if self.bcp_result is None:
+            messagebox.showinfo("请先识别", "请先完成整图识别和局部补漏。")
+            return
+        self.bcp_result = finalize_bcp_measurements(self.bcp_result)
+        self.bcp_metrics_finalized = True
+        self.draw_image()
+        self.update_bcp_result_text()
+        self.status_var.set("已按当前全部柱子计算 CD、Pitch、Delaunay 三角网和晶界候选。")
+
+    def displayed_bcp_line_segments(self, segments_px: np.ndarray) -> np.ndarray:
+        if self.bcp_result is None or not self.bcp_triangulation_overlay_var.get():
+            return np.empty((0, 4), dtype=float)
+        primary_axis = triangulation_primary_axis_degrees(self.bcp_result.triangulation_segments_px)
+        return filter_triangulation_display_segments(segments_px, self.bcp_line_display_var.get(), primary_axis)
+
+    def bcp_grain_overlay_preview(self) -> Image.Image | None:
+        """Build the optional colored grain layer in current canvas coordinates."""
+        if self.bcp_result is None or not self.bcp_metrics_finalized or not self.bcp_grain_overlay_var.get():
+            return None
+        image = self.bcp_preview_image if self.bcp_use_dog_var.get() else self.processed_image
+        if image is None:
+            return None
+        height, width = image.shape
+        display_size = (max(1, round(width * self.display_scale)), max(1, round(height * self.display_scale)))
+        return bcp_grain_overlay_image(self.bcp_result.centers_px, bcp_grain_labels(self.bcp_result.centers_px), width, height, display_size)
+
+    def bcp_centroid_layout_preview(self) -> Image.Image | None:
+        """Build equal-size virtual cylinders centered on the detected dots."""
+        if self.bcp_result is None or not self.bcp_metrics_finalized or not self.bcp_centroid_layout_overlay_var.get():
+            return None
+        image = self.bcp_preview_image if self.bcp_use_dog_var.get() else self.processed_image
+        if image is None:
+            return None
+        height, width = image.shape
+        display_size = (max(1, round(width * self.display_scale)), max(1, round(height * self.display_scale)))
+        result = self.bcp_result
+        anchor = central_bcp_centroid(result.centers_px, width, height)
+        return centroid_layout_overlay_image(result.centers_px, anchor, bcp_layout_diameter_px(result), width, height, display_size)
+
+    def bcp_centroid_layout_anchor(self) -> np.ndarray | None:
+        """Return the original detected centroid used as the layout anchor."""
+        if self.bcp_result is None or not self.bcp_metrics_finalized or not self.bcp_centroid_layout_overlay_var.get():
+            return None
+        image = self.bcp_preview_image if self.bcp_use_dog_var.get() else self.processed_image
+        if image is None:
+            return None
+        height, width = image.shape
+        return central_bcp_centroid(self.bcp_result.centers_px, width, height)
+
+    def refresh_bcp_line_display(self) -> None:
+        if self.bcp_metrics_finalized:
+            self.draw_image()
+            self.update_bcp_result_text()
 
     def outlier_threshold_px(self) -> float:
         return OUTLIER_LEVELS.get(self.outlier_level_var.get(), OUTLIER_LEVELS[DEFAULT_OUTLIER_LEVEL])
@@ -1560,6 +3159,226 @@ class LERLWRApp(AppBase):
             self.canvas.create_line(*points_left, fill="#00e5ff", width=1, tags="edge")
         if len(points_right) >= 4:
             self.canvas.create_line(*points_right, fill="#ffb000", width=1, tags="edge")
+
+    def render_bcp_overlay(self) -> None:
+        self.canvas.delete("bcp")
+        self.grain_overlay_image = None
+        self.centroid_layout_overlay_image = None
+        if self.bcp_result is None:
+            return
+        scale = self.display_scale
+        result = self.bcp_result
+        if self.bcp_metrics_finalized:
+            overlay = self.bcp_grain_overlay_preview()
+            if overlay is not None:
+                self.grain_overlay_image = ImageTk.PhotoImage(overlay)
+                self.canvas.create_image(0, 0, image=self.grain_overlay_image, anchor=tk.NW, tags="bcp")
+            centroid_layout = self.bcp_centroid_layout_preview()
+            if centroid_layout is not None:
+                self.centroid_layout_overlay_image = ImageTk.PhotoImage(centroid_layout)
+                self.canvas.create_image(0, 0, image=self.centroid_layout_overlay_image, anchor=tk.NW, tags="bcp")
+            for x0, y0, x1, y1 in self.displayed_bcp_line_segments(result.triangulation_segments_px):
+                self.canvas.create_line(x0 * scale, y0 * scale, x1 * scale, y1 * scale, fill="#4db8ff", width=1, tags="bcp")
+        for contour in result.contour_segments_px:
+            for x0, y0, x1, y1 in contour:
+                self.canvas.create_line(x0 * scale, y0 * scale, x1 * scale, y1 * scale, fill="#39ff8e", width=1, tags="bcp")
+        for center_x, center_y in result.centers_px:
+            display_x, display_y = center_x * scale, center_y * scale
+            self.canvas.create_oval(
+                display_x - 2,
+                display_y - 2,
+                display_x + 2,
+                display_y + 2,
+                fill="#ffe066",
+                outline="#4a3b00",
+                width=1,
+                tags="bcp",
+            )
+        anchor = self.bcp_centroid_layout_anchor()
+        if anchor is not None:
+            anchor_x, anchor_y = anchor * scale
+            self.canvas.create_oval(
+                anchor_x - 5,
+                anchor_y - 5,
+                anchor_x + 5,
+                anchor_y + 5,
+                fill="#ff3748",
+                outline="#fff5f5",
+                width=1,
+                tags="bcp",
+            )
+
+    def draw_bcp_completion_polygon(self) -> None:
+        self.canvas.delete("bcp_completion")
+        if len(self.bcp_completion_polygon_px) < 2:
+            return
+        scale = self.display_scale
+        points = [(x * scale, y * scale) for x, y in self.bcp_completion_polygon_px]
+        if not self.bcp_completion_drawing and len(points) >= 3:
+            points.append(points[0])
+        self.canvas.create_line(*[coordinate for point in points for coordinate in point], fill="#ffd43b", width=2, dash=(5, 3), tags="bcp_completion")
+
+    def draw_bcp_reference_circles(self) -> None:
+        self.canvas.delete("bcp_reference")
+        scale = self.display_scale
+        for index, (center_x, center_y, radius) in enumerate(self.bcp_reference_circles, start=1):
+            is_active = index - 1 == self.bcp_reference_active_index
+            color = "#ffffff" if is_active else "#4ea1ff"
+            self.canvas.create_oval(
+                (center_x - radius) * scale,
+                (center_y - radius) * scale,
+                (center_x + radius) * scale,
+                (center_y + radius) * scale,
+                outline=color,
+                width=2,
+                tags="bcp_reference",
+            )
+            self.canvas.create_text(center_x * scale, (center_y - radius) * scale - 5, text=f"样本 {index}", fill="#4ea1ff", tags="bcp_reference")
+            if is_active:
+                for x, y in ((center_x, center_y), (center_x + radius, center_y)):
+                    self.canvas.create_rectangle(x * scale - 4, y * scale - 4, x * scale + 4, y * scale + 4, fill="#ffffff", outline="#2369b0", tags="bcp_reference")
+        if self.bcp_reference_start is not None:
+            center_x, center_y = self.bcp_reference_start
+            radius = self.bcp_reference_preview_radius
+            self.canvas.create_oval(
+                (center_x - radius) * scale,
+                (center_y - radius) * scale,
+                (center_x + radius) * scale,
+                (center_y + radius) * scale,
+                outline="#4ea1ff",
+                dash=(4, 2),
+                width=2,
+                tags="bcp_reference",
+            )
+
+    def update_bcp_reference_text(self) -> None:
+        count = len(self.bcp_reference_circles)
+        self.bcp_reference_var.set("当前没有手动样本；输入柱径后可自动识别。" if not count else f"已标示 {count} 个代表圆柱（建议至少 3 个）。")
+
+    def start_bcp_reference(self, event: tk.Event) -> None:
+        if self.raw_image is None:
+            return
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        point = self.canvas_to_image_point(canvas_x, canvas_y)
+        hit = self.bcp_reference_hit_test(point)
+        if hit is not None:
+            self.bcp_reference_active_index, self.bcp_reference_drag_mode = hit
+            self.bcp_reference_drag_anchor = point
+            self.bcp_reference_start_circle = self.bcp_reference_circles[self.bcp_reference_active_index]
+            self.draw_bcp_reference_circles()
+            return
+        self.bcp_reference_active_index = None
+        self.bcp_reference_drag_mode = "create"
+        self.bcp_reference_start = point
+        self.bcp_reference_preview_radius = 0.0
+        self.draw_bcp_reference_circles()
+
+    def bcp_reference_hit_test(self, point: tuple[float, float]) -> tuple[int, str] | None:
+        x, y = point
+        for index in range(len(self.bcp_reference_circles) - 1, -1, -1):
+            center_x, center_y, radius = self.bcp_reference_circles[index]
+            distance = math.hypot(x - center_x, y - center_y)
+            if abs(distance - radius) <= 8 / self.display_scale:
+                return index, "resize"
+            if distance <= radius:
+                return index, "move"
+        return None
+
+    def move_bcp_reference(self, event: tk.Event) -> None:
+        point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        if self.bcp_reference_drag_mode == "create" and self.bcp_reference_start is not None:
+            self.bcp_reference_preview_radius = math.dist(self.bcp_reference_start, point)
+            self.draw_bcp_reference_circles()
+            return
+        if self.bcp_reference_active_index is None or self.bcp_reference_start_circle is None:
+            return
+        center_x, center_y, radius = self.bcp_reference_start_circle
+        if self.bcp_reference_drag_mode == "move" and self.bcp_reference_drag_anchor is not None:
+            anchor_x, anchor_y = self.bcp_reference_drag_anchor
+            center_x += point[0] - anchor_x
+            center_y += point[1] - anchor_y
+        elif self.bcp_reference_drag_mode == "resize":
+            radius = math.dist((center_x, center_y), point)
+        candidate = self.clamp_bcp_reference_circle(center_x, center_y, radius)
+        if not self.bcp_reference_overlaps(candidate, skip_index=self.bcp_reference_active_index):
+            self.bcp_reference_circles[self.bcp_reference_active_index] = candidate
+        self.draw_bcp_reference_circles()
+
+    def finish_bcp_reference(self, event: tk.Event) -> None:
+        self.move_bcp_reference(event)
+        if self.bcp_reference_drag_mode == "create" and self.bcp_reference_start is not None and self.bcp_reference_preview_radius >= 2.0:
+            candidate = self.clamp_bcp_reference_circle(*self.bcp_reference_start, self.bcp_reference_preview_radius)
+            if self.bcp_reference_overlaps(candidate):
+                self.status_var.set("样本圆柱不能重叠；请重新圈选另一个独立圆柱。")
+            else:
+                self.bcp_reference_circles.append(candidate)
+        self.bcp_reference_start = None
+        self.bcp_reference_preview_radius = 0.0
+        self.bcp_reference_drag_mode = None
+        self.bcp_reference_drag_anchor = None
+        self.bcp_reference_start_circle = None
+        self.update_bcp_reference_text()
+        self.draw_bcp_reference_circles()
+        self.status_var.set("可继续添加任意数量的蓝色样本圈；有 3 个以上时尺寸校准更稳定。")
+
+    def clamp_bcp_reference_circle(self, center_x: float, center_y: float, radius: float) -> tuple[float, float, float]:
+        if self.raw_image is None:
+            return center_x, center_y, radius
+        radius = float(np.clip(radius, 2.0, min(self.raw_image.shape) / 2 - 1))
+        center_x = float(np.clip(center_x, radius, self.raw_image.shape[1] - radius))
+        center_y = float(np.clip(center_y, radius, self.raw_image.shape[0] - radius))
+        return center_x, center_y, radius
+
+    def bcp_reference_overlaps(self, circle: tuple[float, float, float], skip_index: int | None = None) -> bool:
+        center_x, center_y, radius = circle
+        for index, (other_x, other_y, other_radius) in enumerate(self.bcp_reference_circles):
+            if index != skip_index and math.hypot(center_x - other_x, center_y - other_y) < radius + other_radius:
+                return True
+        return False
+
+    def start_bcp_reference_marking(self) -> None:
+        if self.raw_image is None:
+            return
+        self.clear_bcp_completion_selection()
+        self.bcp_reference_mode = True
+        self.status_var.set("样本编辑模式：拖蓝圈内部移动；拖外缘或白色控制点改大小；空白处拖动可添加更多互不重叠的样本。")
+        self.canvas.configure(cursor="crosshair")
+
+    def stop_bcp_reference_marking(self) -> None:
+        self.bcp_reference_mode = False
+        self.bcp_reference_active_index = None
+        self.bcp_reference_drag_mode = None
+        self.bcp_reference_start = None
+        self.canvas.configure(cursor="")
+        self.draw_bcp_reference_circles()
+        self.status_var.set("已结束样本编辑；蓝色样本仍可用于识别。")
+
+    def clear_bcp_reference_circles(self) -> None:
+        self.bcp_reference_mode = False
+        self.bcp_reference_start = None
+        self.bcp_reference_preview_radius = 0.0
+        self.bcp_reference_active_index = None
+        self.bcp_reference_drag_mode = None
+        self.bcp_reference_drag_anchor = None
+        self.bcp_reference_start_circle = None
+        self.bcp_reference_circles.clear()
+        self.canvas.configure(cursor="")
+        self.update_bcp_reference_text()
+        if self.raw_image is not None:
+            self.draw_bcp_reference_circles()
+        self.status_var.set("已清除 BCP 样本标示。")
+
+    def discard_bcp_reference_circles(self) -> None:
+        self.bcp_reference_mode = False
+        self.bcp_reference_start = None
+        self.bcp_reference_preview_radius = 0.0
+        self.bcp_reference_active_index = None
+        self.bcp_reference_drag_mode = None
+        self.bcp_reference_drag_anchor = None
+        self.bcp_reference_start_circle = None
+        self.bcp_reference_circles.clear()
+        self.update_bcp_reference_text()
+
 
     def update_result_text(self) -> None:
         if self.result is None:
@@ -1584,15 +3403,73 @@ class LERLWRApp(AppBase):
             f"剔除阈值  {self.outlier_threshold_px():.0f} px"
         )
 
+    def update_bcp_result_text(self) -> None:
+        if self.bcp_result is None:
+            return
+        result = self.bcp_result
+        if not self.bcp_metrics_finalized:
+            self.result_var.set(
+                "BCP 轮廓识别\n\n"
+                f"识别点数        {len(result.centers_px)}\n\n"
+                "绿色为轮廓，黄色小点为几何质心；如有遗漏，可反复使用“局部补漏”。\n"
+                "确认无遗漏后，点击“完成补漏并计算 CD / Pitch”。"
+            )
+            return
+        scale = result.pixel_size_nm if np.isfinite(result.pixel_size_nm) else 1.0
+        unit = "nm" if np.isfinite(result.pixel_size_nm) else "px"
+        mean_diameter = float(np.mean(result.equivalent_diameters_px) * scale)
+        diameter_sigma = float(np.std(result.equivalent_diameters_px, ddof=1) * scale) if len(result.centers_px) > 1 else 0.0
+        mean_major = float(np.mean(result.major_axes_px) * scale)
+        mean_minor = float(np.mean(result.minor_axes_px) * scale)
+        spacing = result.lattice_spacing_px * scale
+        cd_mean, cd_standard_error = mean_and_standard_error(result.cd_means_px * scale)
+        grain_labels = bcp_grain_labels(result.centers_px)
+        grain_count = len(np.unique(grain_labels[grain_labels >= 0]))
+        pitch_lines = []
+        for label in PITCH_DIRECTION_LABELS:
+            pitch_mean, pitch_three_sigma = mean_and_three_sigma(result.pitch_values_by_direction_px[label] * scale)
+            value = "无有效边" if not np.isfinite(pitch_mean) else f"{pitch_mean:.3f} ± {pitch_three_sigma:.3f} {unit}（3σ）"
+            pitch_lines.append(f"Pitch {label:<7} {value}")
+        self.result_var.set(
+            "BCP 垂直点阵识别\n\n"
+            f"识别点数        {len(result.centers_px)}\n"
+            f"CD 平均值       {cd_mean:.3f} {unit}\n"
+            f"CD 标准误差     {cd_standard_error:.3f} {unit}\n"
+            f"等效直径        {mean_diameter:.3f} {unit}\n"
+            f"直径标准差      {diameter_sigma:.3f} {unit}\n"
+            f"区域长轴均值    {mean_major:.3f} {unit}\n"
+            f"区域短轴均值    {mean_minor:.3f} {unit}\n"
+            f"最近邻间距      {spacing:.3f} {unit}\n"
+            + "\n".join(pitch_lines)
+            + "\n\n"
+            + f"三角网边数      {len(result.triangulation_segments_px)}\n"
+            f"晶界候选线段    {len(result.boundary_segments_px)}\n"
+            f"晶界相关点      {len(result.boundary_dot_indices)}\n\n"
+            "绿色：二值连通区域轮廓\n"
+            "黄色：区域几何质心\n"
+            f"蓝色：Delaunay 三角网（{'显示：' + self.bcp_line_display_var.get() if self.bcp_triangulation_overlay_var.get() else '隐藏'}）\n"
+            f"彩色：晶粒取向分区（{grain_count} 个晶粒，{'显示' if self.bcp_grain_overlay_var.get() else '隐藏'}）\n"
+            f"紫色：质心虚拟圆柱布局（{'显示' if self.bcp_centroid_layout_overlay_var.get() else '隐藏'}，红点为锚点）"
+        )
+
     def update_displayed_results(self) -> None:
-        self.update_result_text()
+        if self.result is not None:
+            self.update_result_text()
+        elif self.bcp_result is not None:
+            self.update_bcp_result_text()
         self.update_lcdu_summary_text()
 
     def export_annotated_image(self) -> None:
         if self.original_image is None:
             messagebox.showinfo("暂无图像", "请先打开一张 SEM 图像。")
             return
-        image = normalize_and_denoise(self.original_image) if self.preprocess_var.get() else self.original_image
+        image = preprocess_image(
+            self.original_image,
+            self.normalize_var.get(),
+            self.gaussian_denoise_var.get(),
+            self.gaussian_kernel_size(),
+            self.gaussian_sigma_scale(),
+        )
         target = filedialog.asksaveasfilename(
             title="保存拟合图片",
             defaultextension=".png",
@@ -1604,6 +3481,8 @@ class LERLWRApp(AppBase):
 
         height, width = image.shape
         output = Image.fromarray(image).convert("RGB")
+        self.apply_exported_bcp_grain_overlay(output, width, height)
+        self.apply_exported_bcp_centroid_layout_overlay(output, width, height)
         draw = ImageDraw.Draw(output)
         if self.roi_canvas is not None and self.display_scale > 0:
             x0, y0, x1, y1 = (value / self.display_scale for value in self.roi_canvas)
@@ -1633,6 +3512,7 @@ class LERLWRApp(AppBase):
                 draw.line(left_points, fill=(0, 229, 255), width=2)
             if len(right_points) >= 2:
                 draw.line(right_points, fill=(255, 176, 0), width=2)
+        self.draw_exported_bcp(draw, width, height)
 
         try:
             output.save(target, "PNG")
@@ -1640,6 +3520,62 @@ class LERLWRApp(AppBase):
             messagebox.showerror("导出失败", str(exc))
             return
         self.status_var.set(f"已导出拟合图片：{target}")
+
+    def apply_exported_bcp_grain_overlay(self, output: Image.Image, width: int, height: int) -> None:
+        """Blend the optional working-image grain layer back into original orientation."""
+        if self.bcp_result is None or not self.bcp_metrics_finalized or not self.bcp_grain_overlay_var.get():
+            return
+        overlay = bcp_grain_overlay_image(
+            self.bcp_result.centers_px,
+            bcp_grain_labels(self.bcp_result.centers_px),
+            width,
+            height,
+            (width, height),
+        )
+        if overlay is None:
+            return
+        if self.rotation_degrees:
+            overlay = overlay.rotate(-self.rotation_degrees, resample=Image.Resampling.NEAREST, expand=False)
+        output.paste(overlay, (0, 0), overlay)
+
+    def apply_exported_bcp_centroid_layout_overlay(self, output: Image.Image, width: int, height: int) -> None:
+        """Blend the optional centroid-centered layout back into original orientation."""
+        if self.bcp_result is None or not self.bcp_metrics_finalized or not self.bcp_centroid_layout_overlay_var.get():
+            return
+        result = self.bcp_result
+        anchor = central_bcp_centroid(result.centers_px, width, height)
+        overlay = centroid_layout_overlay_image(result.centers_px, anchor, bcp_layout_diameter_px(result), width, height, (width, height))
+        if overlay is None:
+            return
+        if self.rotation_degrees:
+            overlay = overlay.rotate(-self.rotation_degrees, resample=Image.Resampling.NEAREST, expand=False)
+        output.paste(overlay, (0, 0), overlay)
+
+    def draw_exported_bcp(self, draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
+        if self.bcp_result is None:
+            return
+        result = self.bcp_result
+        if self.bcp_metrics_finalized:
+            for x0, y0, x1, y1 in self.displayed_bcp_line_segments(result.triangulation_segments_px):
+                points = rotate_points_about_center([(x0, y0), (x1, y1)], -self.rotation_degrees, width, height)
+                draw.line(points, fill=(77, 184, 255), width=1)
+        for contour in result.contour_segments_px:
+            for x0, y0, x1, y1 in contour:
+                points = rotate_points_about_center([(x0, y0), (x1, y1)], -self.rotation_degrees, width, height)
+                draw.line(points, fill=(57, 255, 142), width=1)
+        for center_x, center_y in result.centers_px:
+            output_x, output_y = rotate_points_about_center([(center_x, center_y)], -self.rotation_degrees, width, height)[0]
+            draw.ellipse((output_x - 2, output_y - 2, output_x + 2, output_y + 2), fill=(255, 224, 102), outline=(74, 59, 0))
+        for center_x, center_y, radius in self.bcp_reference_circles:
+            circle = [
+                (center_x + radius * math.cos(phase), center_y + radius * math.sin(phase))
+                for phase in np.linspace(0, 2 * math.pi, 25)
+            ]
+            draw.line(rotate_points_about_center(circle, -self.rotation_degrees, width, height), fill=(78, 161, 255), width=2)
+        if self.bcp_centroid_layout_overlay_var.get() and self.bcp_metrics_finalized:
+            anchor = central_bcp_centroid(result.centers_px, width, height)
+            anchor_x, anchor_y = rotate_points_about_center([tuple(anchor)], -self.rotation_degrees, width, height)[0]
+            draw.ellipse((anchor_x - 5, anchor_y - 5, anchor_x + 5, anchor_y + 5), fill=CENTROID_LAYOUT_ANCHOR_COLOR, outline=(255, 245, 245), width=1)
 
     def annotation_image_points(self, annotation: MeasurementAnnotation) -> list[tuple[float, float]]:
         if annotation.kind != "circle":
@@ -1676,8 +3612,11 @@ class LERLWRApp(AppBase):
             draw.text((label_point[0] + 4, label_point[1] - 14), self.annotation_label(annotation), fill=self.annotation_color(annotation))
 
     def export_csv(self) -> None:
-        if self.result is None and not self.annotations:
-            messagebox.showinfo("暂无结果", "请先完成 LER/LWR 分析或添加通用测量标注。")
+        if self.result is None and self.bcp_result is None and not self.annotations:
+            messagebox.showinfo("暂无结果", "请先完成 LER/LWR、BCP 点阵分析或添加通用测量标注。")
+            return
+        if self.bcp_result is not None and not self.bcp_metrics_finalized:
+            messagebox.showinfo("请先完成补漏", "请确认所有柱子已补全，再点击“完成补漏并计算 CD / Pitch”后导出。")
             return
         target = filedialog.asksaveasfilename(
             title="保存测量结果",
@@ -1707,6 +3646,26 @@ class LERLWRApp(AppBase):
                     writer.writerow(["ler_right_display_nm", multiplier * result.ler_right_sigma_nm])
                     writer.writerow(["lwr_display_nm", multiplier * result.lwr_sigma_nm])
                     writer.writerow(["mean_width_nm", result.mean_width_nm])
+                if self.bcp_result is not None:
+                    bcp = self.bcp_result
+                    bcp_scale = bcp.pixel_size_nm if np.isfinite(bcp.pixel_size_nm) else 1.0
+                    bcp_unit = "nm" if np.isfinite(bcp.pixel_size_nm) else "px"
+                    writer.writerow(["bcp_dot_count", len(bcp.centers_px)])
+                    writer.writerow(["bcp_size_unit", bcp_unit])
+                    writer.writerow(["bcp_mean_equivalent_diameter", float(np.mean(bcp.equivalent_diameters_px) * bcp_scale)])
+                    writer.writerow(["bcp_mean_major_axis", float(np.mean(bcp.major_axes_px) * bcp_scale)])
+                    writer.writerow(["bcp_mean_minor_axis", float(np.mean(bcp.minor_axes_px) * bcp_scale)])
+                    cd_mean, cd_standard_error = mean_and_standard_error(bcp.cd_means_px * bcp_scale)
+                    writer.writerow(["bcp_cd_mean", cd_mean])
+                    writer.writerow(["bcp_cd_standard_error", cd_standard_error])
+                    writer.writerow(["bcp_lattice_spacing", bcp.lattice_spacing_px * bcp_scale])
+                    writer.writerow(["bcp_delaunay_edge_count", len(bcp.triangulation_segments_px)])
+                    for label in PITCH_DIRECTION_LABELS:
+                        pitch_mean, pitch_three_sigma = mean_and_three_sigma(bcp.pitch_values_by_direction_px[label] * bcp_scale)
+                        writer.writerow([f"bcp_pitch_{label}_mean", pitch_mean])
+                        writer.writerow([f"bcp_pitch_{label}_3sigma", pitch_three_sigma])
+                    writer.writerow(["bcp_grain_boundary_segment_count", len(bcp.boundary_segments_px)])
+                    writer.writerow(["bcp_reference_sample_count", len(self.bcp_reference_circles)])
                 lcdu_sigma = self.lcdu_sigma_nm()
                 writer.writerow(["multi_line_lcdu_sample_count", len(self.lcdu_cd_samples_nm)])
                 writer.writerow(["multi_line_lcdu_sigma_nm", "" if lcdu_sigma is None else lcdu_sigma])
@@ -1719,6 +3678,33 @@ class LERLWRApp(AppBase):
                 writer.writerow(["annotation_index", "type", "x0_px", "y0_px", "x1_px", "y1_px", "display_label"])
                 for index, annotation in enumerate(self.annotations, start=1):
                     writer.writerow([index, annotation.kind, *annotation.bounds_px, self.annotation_label(annotation)])
+                if self.bcp_result is not None:
+                    bcp = self.bcp_result
+                    writer.writerow([])
+                    writer.writerow([
+                        "bcp_dot_index", "center_x_px", "center_y_px", "equivalent_diameter_px",
+                        "major_axis_px", "minor_axis_px", "ellipse_angle_degrees", "area_px2",
+                        "cd_horizontal_px", "cd_plus60_px", "cd_minus60_px", "cd_mean_px", "is_grain_boundary_dot",
+                    ])
+                    boundary_indices = set(bcp.boundary_dot_indices.tolist())
+                    for index, values in enumerate(zip(
+                        bcp.centers_px[:, 0], bcp.centers_px[:, 1], bcp.equivalent_diameters_px,
+                        bcp.major_axes_px, bcp.minor_axes_px, bcp.angles_degrees, bcp.areas_px,
+                        bcp.directional_cds_px[:, 0], bcp.directional_cds_px[:, 1], bcp.directional_cds_px[:, 2], bcp.cd_means_px,
+                    ), start=1):
+                        writer.writerow([index, *values, index - 1 in boundary_indices])
+                    writer.writerow([])
+                    writer.writerow(["bcp_delaunay_edge_index", "x0_px", "y0_px", "x1_px", "y1_px"])
+                    for index, segment in enumerate(bcp.triangulation_segments_px, start=1):
+                        writer.writerow([index, *segment])
+                    writer.writerow([])
+                    writer.writerow(["bcp_boundary_segment_index", "x0_px", "y0_px", "x1_px", "y1_px"])
+                    for index, segment in enumerate(bcp.boundary_segments_px, start=1):
+                        writer.writerow([index, *segment])
+                    writer.writerow([])
+                    writer.writerow(["bcp_reference_sample_index", "center_x_px", "center_y_px", "radius_px"])
+                    for index, circle in enumerate(self.bcp_reference_circles, start=1):
+                        writer.writerow([index, *circle])
                 if self.result is not None:
                     result = self.result
                     writer.writerow([])
