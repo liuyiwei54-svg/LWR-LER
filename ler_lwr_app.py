@@ -12,6 +12,7 @@ import math
 import re
 import sys
 import tempfile
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,6 +89,7 @@ BCP_MUTUAL_NEIGHBORS = 6
 BCP_MAX_LOCAL_LINK_FACTOR = 1.45
 BCP_BLOCKING_CORRIDOR_FACTOR = 0.35
 BCP_BLOCKING_PROJECTION_MARGIN = 0.12
+MANUAL_BCP_SPLIT_LINE_WIDTH_PX = 3
 
 
 @dataclass
@@ -587,7 +589,7 @@ def reference_bcp_polarity(image: np.ndarray, references: list[tuple[float, floa
         core = image[top:bottom, left:right][distances <= radius * 0.35]
         ring = image[top:bottom, left:right][(distances >= radius * 0.65) & (distances <= radius)]
         if len(core) and len(ring):
-            contrasts.append(float(np.mean(core) - np.mean(ring)))
+            contrasts.append(float(np.mean(core, dtype=float) - np.mean(ring, dtype=float)))
     return 1.0 if not contrasts or np.median(contrasts) >= 0 else -1.0
 
 
@@ -869,6 +871,18 @@ def polygon_pixel_mask(shape: tuple[int, int], polygon_px: list[tuple[float, flo
     return np.asarray(mask, dtype=bool)
 
 
+def line_pixel_mask(
+    shape: tuple[int, int],
+    start_px: tuple[float, float],
+    end_px: tuple[float, float],
+    width_px: int = MANUAL_BCP_SPLIT_LINE_WIDTH_PX,
+) -> np.ndarray:
+    """Rasterize a user-drawn cut line into a foreground-pixel removal mask."""
+    mask = Image.new("1", (shape[1], shape[0]), 0)
+    ImageDraw.Draw(mask).line([start_px, end_px], fill=1, width=width_px)
+    return np.asarray(mask, dtype=bool)
+
+
 def polygon_bcp_foreground(response: np.ndarray, selection_mask: np.ndarray) -> np.ndarray:
     """Threshold the response using only pixels inside a manually drawn polygon."""
     values = response[selection_mask]
@@ -927,6 +941,66 @@ def bcp_result_dimension_scale(result: BCPAnalysisResult) -> float:
 def bcp_layout_diameter_px(result: BCPAnalysisResult) -> float:
     """Return the measured mean CD as the displayed virtual-cylinder diameter."""
     return float(np.mean(result.cd_means_px))
+
+
+def split_bcp_component(
+    result: BCPAnalysisResult,
+    cut_mask: np.ndarray,
+    minimum_area_px: float,
+) -> tuple[BCPAnalysisResult, int]:
+    """Replace one manually cut connected region with its valid disconnected pieces."""
+    touched = [index for index, component in enumerate(result.components_px) if component_intersects_mask(component, cut_mask)]
+    if len(touched) != 1:
+        raise ValueError("分割线应只穿过一个粘连轮廓。")
+    component_index = touched[0]
+    component = result.components_px[component_index]
+    rows, columns = component.astype(int).T
+    remaining = np.zeros(cut_mask.shape, dtype=bool)
+    keep = ~cut_mask[rows, columns]
+    remaining[rows[keep], columns[keep]] = True
+    pieces = [piece for piece in connected_pixel_components(remaining) if len(piece) >= minimum_area_px]
+    dots = [fit_bcp_component(piece) for piece in pieces]
+    valid = [(dot, piece) for dot, piece in zip(dots, pieces) if dot is not None]
+    if len(valid) < 2:
+        raise ValueError("分割后没有得到至少两个有效区域；请让分割线完整穿过两柱的粘连处。")
+    split_dots, split_components = zip(*valid)
+    return replace_bcp_component(result, component_index, list(split_dots), list(split_components))
+
+
+def replace_bcp_component(
+    result: BCPAnalysisResult,
+    component_index: int,
+    split_dots: list[tuple[float, float, float, float, float, float, float]],
+    split_components: list[np.ndarray],
+) -> tuple[BCPAnalysisResult, int]:
+    """Rebuild result geometry after replacing one component with manual split pieces."""
+    keep = np.arange(len(result.components_px)) != component_index
+    scale = bcp_result_dimension_scale(result)
+    dots = np.asarray(split_dots, dtype=float)
+    dots[:, 2:5] *= scale
+    dots[:, 6] *= scale**2
+    directional_cds = np.asarray([component_directional_cds(component) for component in split_components]) * scale
+    centers = np.vstack((result.centers_px[keep], dots[:, :2]))
+    _orientations, spacing, _neighbors = local_hexagonal_orientations(centers)
+    updated = BCPAnalysisResult(
+        centers_px=centers,
+        equivalent_diameters_px=np.concatenate((result.equivalent_diameters_px[keep], dots[:, 2])),
+        major_axes_px=np.concatenate((result.major_axes_px[keep], dots[:, 3])),
+        minor_axes_px=np.concatenate((result.minor_axes_px[keep], dots[:, 4])),
+        angles_degrees=np.concatenate((result.angles_degrees[keep], dots[:, 5])),
+        areas_px=np.concatenate((result.areas_px[keep], dots[:, 6])),
+        contour_segments_px=[contour for index, contour in enumerate(result.contour_segments_px) if keep[index]] + [component_contour_segments(component) for component in split_components],
+        components_px=[component for index, component in enumerate(result.components_px) if keep[index]] + split_components,
+        directional_cds_px=np.vstack((result.directional_cds_px[keep], directional_cds)),
+        cd_means_px=np.concatenate((result.cd_means_px[keep], np.mean(directional_cds, axis=1))),
+        triangulation_segments_px=result.triangulation_segments_px,
+        pitch_values_by_direction_px=result.pitch_values_by_direction_px,
+        boundary_segments_px=result.boundary_segments_px,
+        boundary_dot_indices=result.boundary_dot_indices,
+        lattice_spacing_px=spacing,
+        pixel_size_nm=result.pixel_size_nm,
+    )
+    return updated, len(split_components)
 
 
 def append_bcp_completion(
@@ -1269,7 +1343,9 @@ def centroid_layout_overlay_image(
         return None
     display_width, display_height = display_size
     scale_x, scale_y = display_width / width, display_height / height
-    radius = float(np.clip(diameter_px * min(scale_x, scale_y) / 2, 1.5, 9.0))
+    radius = diameter_px * min(scale_x, scale_y) / 2
+    if not np.isfinite(radius) or radius <= 0:
+        return None
     overlay = Image.new("RGBA", display_size)
     draw = ImageDraw.Draw(overlay)
     for x, y in centers_px:
@@ -1469,6 +1545,11 @@ class LERLWRApp(AppBase):
         self.bcp_completion_mode = False
         self.bcp_completion_drawing = False
         self.bcp_completion_polygon_px: list[tuple[float, float]] = []
+        self.bcp_completion_polygons_px: list[list[tuple[float, float]]] = []
+        self.bcp_split_mode = False
+        self.bcp_split_drawing = False
+        self.bcp_split_start_px: tuple[float, float] | None = None
+        self.bcp_split_end_px: tuple[float, float] | None = None
         self.bcp_dialog: tk.Toplevel | None = None
         self.lcdu_cd_samples_nm: list[float] = []
         self.lcdu_sample_listbox: tk.Listbox | None = None
@@ -1493,6 +1574,7 @@ class LERLWRApp(AppBase):
         self.measurement_color = ANNOTATION_COLORS["length"]
         self.zoom_slider_var = tk.DoubleVar(value=1.0)
         self.zoom_percent_var = tk.StringVar(value="100%")
+        self.bcp_recognition_duration_var = tk.StringVar(value="识别耗时：—")
         self.status_var = tk.StringVar(value="打开 SEM 图像后，可框选线条分析，或直接识别整图 BCP 点阵。")
         self.result_var = tk.StringVar(value="尚未分析")
         self.bcp_reference_var = tk.StringVar(value="当前没有手动样本。")
@@ -1646,6 +1728,7 @@ class LERLWRApp(AppBase):
         ).pack(side=tk.LEFT, padx=6)
         ttk.Button(zoom_controls, text="+", width=3, command=lambda: self.step_zoom(ZOOM_STEP)).pack(side=tk.LEFT)
         ttk.Label(zoom_controls, textvariable=self.zoom_percent_var, width=6).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(zoom_controls, textvariable=self.bcp_recognition_duration_var).pack(side=tk.LEFT, padx=(12, 0))
 
         ttk.Separator(zoom_controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
         ttk.Label(zoom_controls, text="旋转").pack(side=tk.LEFT, padx=(0, 6))
@@ -1780,6 +1863,7 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.bcp_result = None
+        self.bcp_recognition_duration_var.set("识别耗时：—")
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
         self.lcdu_cd_samples_nm.clear()
@@ -2071,6 +2155,7 @@ class LERLWRApp(AppBase):
         self.render_analysis_overlay()
         self.render_bcp_overlay()
         self.draw_bcp_completion_polygon()
+        self.draw_bcp_manual_split()
         self.draw_bcp_reference_circles()
         self.draw_annotations()
         if reset_view:
@@ -2382,6 +2467,9 @@ class LERLWRApp(AppBase):
         return "move" if left <= x <= right and top <= y <= bottom else None
 
     def start_canvas_action(self, event: tk.Event) -> None:
+        if self.bcp_split_mode and not self.space_held:
+            self.start_bcp_manual_split_draw(event)
+            return
         if self.bcp_completion_mode and not self.space_held:
             self.start_bcp_completion_draw(event)
             return
@@ -2419,6 +2507,9 @@ class LERLWRApp(AppBase):
         self.draw_annotations()
 
     def move_canvas_action(self, event: tk.Event) -> None:
+        if self.bcp_split_mode and self.bcp_split_drawing:
+            self.move_bcp_manual_split_draw(event)
+            return
         if self.bcp_completion_mode and self.bcp_completion_drawing:
             self.move_bcp_completion_draw(event)
             return
@@ -2437,6 +2528,9 @@ class LERLWRApp(AppBase):
         self.draw_annotations()
 
     def finish_canvas_action(self, event: tk.Event) -> None:
+        if self.bcp_split_mode and self.bcp_split_drawing:
+            self.finish_bcp_manual_split_draw(event)
+            return
         if self.bcp_completion_mode and self.bcp_completion_drawing:
             self.finish_bcp_completion_draw(event)
             return
@@ -2519,7 +2613,11 @@ class LERLWRApp(AppBase):
             self.status_var.set("已清空所有通用测量标注。")
 
     def clear_selection(self, _event: tk.Event | None = None) -> str:
-        if self.bcp_completion_mode or self.bcp_completion_polygon_px:
+        if self.bcp_split_mode or self.bcp_split_start_px is not None:
+            self.clear_bcp_manual_split()
+            self.status_var.set("已清除手动分割线。")
+            return "break"
+        if self.bcp_completion_mode or self.bcp_completion_polygon_px or self.bcp_completion_polygons_px:
             self.clear_bcp_completion_selection()
             self.status_var.set("已清除局部补漏框选。")
             return "break"
@@ -2808,7 +2906,7 @@ class LERLWRApp(AppBase):
             return
         self.bcp_dialog = tk.Toplevel(self)
         self.bcp_dialog.title("BCP 点阵识别")
-        self.bcp_dialog.geometry("470x865")
+        self.bcp_dialog.geometry("470x960")
         self.bcp_dialog.transient(self)
         self.bcp_dialog.protocol("WM_DELETE_WINDOW", self.close_bcp_recognition_dialog)
         content = ttk.Frame(self.bcp_dialog, padding=16)
@@ -2901,13 +2999,22 @@ class LERLWRApp(AppBase):
 
         completion = ttk.LabelFrame(content, text="局部补漏（保留已识别区域）", padding=10)
         completion.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(completion, text="在图上徒手框选不规则区域；局部阈值只由框内像素计算，框外绿色轮廓不会重算。", wraplength=430).pack(anchor="w")
+        ttk.Label(completion, text="可连续添加多个不规则区域；每个区域各自计算局部阈值，框外绿色轮廓不会重算。", wraplength=430).pack(anchor="w")
         completion_buttons = ttk.Frame(completion)
         completion_buttons.pack(anchor="w", pady=(8, 0))
-        ttk.Button(completion_buttons, text="框选补漏区域", command=self.start_bcp_completion_selection).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(completion_buttons, text="识别此区域", command=self.perform_bcp_completion).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(completion_buttons, text="添加补漏区域", command=self.start_bcp_completion_selection).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(completion_buttons, text="识别所选区域", command=self.perform_bcp_completion).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(completion_buttons, text="清除框选", command=self.clear_bcp_completion_selection).pack(side=tk.LEFT)
         ttk.Button(completion, text="完成补漏并计算 CD / Pitch", command=self.finalize_bcp_measurements).pack(anchor="w", pady=(8, 0))
+
+        split = ttk.LabelFrame(content, text="手动分割粘连柱", padding=10)
+        split.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(split, text="在一个粘连的绿色轮廓上画一条完整穿过粘连处的分割线；程序只重新计算该轮廓。", wraplength=430).pack(anchor="w")
+        split_buttons = ttk.Frame(split)
+        split_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(split_buttons, text="画分割线", command=self.start_bcp_manual_split).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(split_buttons, text="执行分割", command=self.perform_bcp_manual_split).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(split_buttons, text="清除分割线", command=self.clear_bcp_manual_split).pack(side=tk.LEFT)
 
     def close_bcp_recognition_dialog(self) -> None:
         if self.bcp_dialog is not None and self.bcp_dialog.winfo_exists():
@@ -2929,6 +3036,7 @@ class LERLWRApp(AppBase):
             internal_hole_fraction = self.bcp_internal_hole_fraction()
             use_local_segmentation = self.bcp_use_local_segmentation_var.get()
             local_horizontal_sections, local_vertical_sections = self.bcp_grid_sections() if use_local_segmentation else (0, 0)
+            started_at = time.perf_counter()
             self.bcp_result = analyze_bcp_dots(
                 image,
                 self.measurement_pixel_size(),
@@ -2941,6 +3049,7 @@ class LERLWRApp(AppBase):
                 self.bcp_use_dog_var.get(),
                 internal_hole_fraction,
             )
+            self.bcp_recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_metrics_finalized = False
         except ValueError as exc:
             messagebox.showwarning("无法识别 BCP 点阵", str(exc))
@@ -3012,12 +3121,17 @@ class LERLWRApp(AppBase):
             self.draw_image()
             self.update_bcp_result_text()
         self.stop_bcp_reference_marking()
+        self.clear_bcp_manual_split()
         self.bcp_completion_mode = True
         self.bcp_completion_drawing = False
-        self.bcp_completion_polygon_px.clear()
+        self.bcp_completion_polygon_px = []
         self.draw_bcp_completion_polygon()
         self.canvas.configure(cursor="pencil")
-        self.status_var.set("局部补漏框选：按住鼠标左键徒手圈出遗漏区域；松开后点击“识别此区域”。")
+        selected_count = len(self.bcp_completion_polygons_px)
+        self.status_var.set(
+            f"局部补漏框选：按住鼠标左键圈出第 {selected_count + 1} 个遗漏区域；"
+            "可继续添加，全部选好后点击“识别所选区域”。"
+        )
 
     def start_bcp_completion_draw(self, event: tk.Event) -> None:
         point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
@@ -3037,43 +3151,137 @@ class LERLWRApp(AppBase):
         self.bcp_completion_mode = False
         self.canvas.configure(cursor="")
         if len(self.bcp_completion_polygon_px) < 3:
-            self.bcp_completion_polygon_px.clear()
+            self.bcp_completion_polygon_px = []
             self.status_var.set("框选区域过小；请重新圈选。")
         else:
-            self.status_var.set("局部补漏区域已框选；点击“识别此区域”只补充该区域内遗漏的轮廓。")
+            self.bcp_completion_polygons_px.append(self.bcp_completion_polygon_px)
+            self.bcp_completion_polygon_px = []
+            selected_count = len(self.bcp_completion_polygons_px)
+            self.status_var.set(
+                f"已添加 {selected_count} 个补漏区域；可继续添加，全部选好后点击“识别所选区域”。"
+            )
         self.draw_bcp_completion_polygon()
 
     def clear_bcp_completion_selection(self, redraw: bool = True) -> None:
         self.bcp_completion_mode = False
         self.bcp_completion_drawing = False
-        self.bcp_completion_polygon_px.clear()
+        self.bcp_completion_polygon_px = []
+        self.bcp_completion_polygons_px.clear()
+        self.clear_bcp_manual_split(redraw=False)
         if self.raw_image is not None:
             self.canvas.configure(cursor="")
         if redraw and self.raw_image is not None:
             self.draw_bcp_completion_polygon()
 
+    def start_bcp_manual_split(self) -> None:
+        if self.bcp_result is None:
+            messagebox.showinfo("请先识别", "请先完成整图 BCP 识别，再手动分割粘连柱。")
+            return
+        if self.bcp_metrics_finalized:
+            self.bcp_metrics_finalized = False
+            self.draw_image()
+            self.update_bcp_result_text()
+        self.stop_bcp_reference_marking()
+        self.clear_bcp_completion_selection()
+        self.bcp_split_mode = True
+        self.bcp_split_drawing = False
+        self.bcp_split_start_px = None
+        self.bcp_split_end_px = None
+        self.canvas.configure(cursor="crosshair")
+        self.status_var.set("手动分割：在一个粘连绿色轮廓上拖出一条穿过粘连处的分割线，再点击“执行分割”。")
+
+    def start_bcp_manual_split_draw(self, event: tk.Event) -> None:
+        point = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.bcp_split_start_px = point
+        self.bcp_split_end_px = point
+        self.bcp_split_drawing = True
+        self.draw_bcp_manual_split()
+
+    def move_bcp_manual_split_draw(self, event: tk.Event) -> None:
+        self.bcp_split_end_px = self.canvas_to_image_point(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+        self.draw_bcp_manual_split()
+
+    def finish_bcp_manual_split_draw(self, event: tk.Event) -> None:
+        self.move_bcp_manual_split_draw(event)
+        self.bcp_split_drawing = False
+        self.bcp_split_mode = False
+        self.canvas.configure(cursor="")
+        if self.bcp_split_start_px is None or self.bcp_split_end_px is None or math.dist(self.bcp_split_start_px, self.bcp_split_end_px) < 4.0:
+            self.bcp_split_start_px = None
+            self.bcp_split_end_px = None
+            self.status_var.set("分割线过短；请重新画一条完整穿过粘连处的线。")
+        else:
+            self.status_var.set("分割线已画好；点击“执行分割”只处理它穿过的一个绿色轮廓。")
+        self.draw_bcp_manual_split()
+
+    def clear_bcp_manual_split(self, redraw: bool = True) -> None:
+        self.bcp_split_mode = False
+        self.bcp_split_drawing = False
+        self.bcp_split_start_px = None
+        self.bcp_split_end_px = None
+        if self.raw_image is not None:
+            self.canvas.configure(cursor="")
+        if redraw and self.raw_image is not None:
+            self.draw_bcp_manual_split()
+
+    def perform_bcp_manual_split(self) -> None:
+        if self.bcp_result is None or self.processed_image is None:
+            messagebox.showinfo("请先识别", "请先完成整图 BCP 识别，再手动分割粘连柱。")
+            return
+        if self.bcp_split_start_px is None or self.bcp_split_end_px is None:
+            messagebox.showinfo("请先画线", "请先点击“画分割线”，并在一个粘连绿色轮廓上拖出分割线。")
+            return
+        try:
+            cut_mask = line_pixel_mask(self.processed_image.shape, self.bcp_split_start_px, self.bcp_split_end_px)
+            updated_result, split_count = split_bcp_component(
+                self.bcp_result,
+                cut_mask,
+                self.bcp_min_area_fraction() * bcp_reference_area(
+                    self.bcp_reference_circles,
+                    self.expected_bcp_diameter_px() or bcp_layout_diameter_px(self.bcp_result),
+                ),
+            )
+        except ValueError as exc:
+            messagebox.showwarning("无法分割粘连柱", str(exc))
+            return
+        self.bcp_result = updated_result
+        self.bcp_metrics_finalized = False
+        self.result = None
+        self.analysis_origin = None
+        self.clear_bcp_manual_split(redraw=False)
+        self.draw_image()
+        self.update_bcp_result_text()
+        self.status_var.set(f"手动分割完成：已将 1 个粘连轮廓拆为 {split_count} 个区域；请检查绿色轮廓后再计算 CD / Pitch。")
+
     def perform_bcp_completion(self) -> None:
         if self.bcp_result is None or self.processed_image is None:
             messagebox.showinfo("请先识别", "请先完成整图 BCP 识别，再使用局部补漏。")
             return
-        if len(self.bcp_completion_polygon_px) < 3:
-            messagebox.showinfo("请先框选", "请先使用“框选补漏区域”徒手圈出不规则区域。")
+        if not self.bcp_completion_polygons_px:
+            messagebox.showinfo("请先框选", "请先使用“添加补漏区域”徒手圈出一个或多个不规则区域。")
             return
         try:
             expected_diameter_px = self.expected_bcp_diameter_px()
             if len(self.bcp_reference_circles) < 3 and expected_diameter_px is None:
                 raise ValueError("局部补漏需要输入圆柱大致直径，或保留至少 3 个样本圆柱。")
-            selection_mask = polygon_pixel_mask(self.processed_image.shape, self.bcp_completion_polygon_px)
-            candidates = local_bcp_completion_candidates(
-                self.processed_image,
-                selection_mask,
-                self.bcp_reference_circles,
-                expected_diameter_px,
-                self.bcp_min_area_fraction(),
-                self.bcp_internal_hole_fraction(),
-                self.bcp_use_dog_var.get(),
-            )
-            self.bcp_result, added = append_bcp_completion(self.bcp_result, candidates, selection_mask)
+            started_at = time.perf_counter()
+            updated_result = self.bcp_result
+            added = 0
+            for polygon_px in self.bcp_completion_polygons_px:
+                selection_mask = polygon_pixel_mask(self.processed_image.shape, polygon_px)
+                candidates = local_bcp_completion_candidates(
+                    self.processed_image,
+                    selection_mask,
+                    self.bcp_reference_circles,
+                    expected_diameter_px,
+                    self.bcp_min_area_fraction(),
+                    self.bcp_internal_hole_fraction(),
+                    self.bcp_use_dog_var.get(),
+                )
+                updated_result, added_in_region = append_bcp_completion(updated_result, candidates, selection_mask)
+                added += added_in_region
+            self.bcp_result = updated_result
+            self.bcp_recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_metrics_finalized = False
         except ValueError as exc:
             messagebox.showwarning("无法局部补漏", str(exc))
@@ -3082,8 +3290,9 @@ class LERLWRApp(AppBase):
         self.analysis_origin = None
         self.draw_image()
         self.update_bcp_result_text()
-        self.start_bcp_completion_selection()
-        self.status_var.set(f"局部补漏完成：新增 {added} 个轮廓；现在可直接框选下一处遗漏，确认后再计算 CD / Pitch。")
+        selected_region_count = len(self.bcp_completion_polygons_px)
+        self.clear_bcp_completion_selection()
+        self.status_var.set(f"局部补漏完成：从 {selected_region_count} 个区域新增 {added} 个轮廓；现在可继续添加补漏区域，确认后再计算 CD / Pitch。")
 
     def finalize_bcp_measurements(self) -> None:
         if self.bcp_result is None:
@@ -3210,13 +3419,32 @@ class LERLWRApp(AppBase):
 
     def draw_bcp_completion_polygon(self) -> None:
         self.canvas.delete("bcp_completion")
-        if len(self.bcp_completion_polygon_px) < 2:
-            return
         scale = self.display_scale
-        points = [(x * scale, y * scale) for x, y in self.bcp_completion_polygon_px]
-        if not self.bcp_completion_drawing and len(points) >= 3:
-            points.append(points[0])
-        self.canvas.create_line(*[coordinate for point in points for coordinate in point], fill="#ffd43b", width=2, dash=(5, 3), tags="bcp_completion")
+        polygons = self.bcp_completion_polygons_px + [self.bcp_completion_polygon_px]
+        for polygon_px in polygons:
+            if len(polygon_px) < 2:
+                continue
+            points = [(x * scale, y * scale) for x, y in polygon_px]
+            if polygon_px is not self.bcp_completion_polygon_px and len(points) >= 3:
+                points.append(points[0])
+            self.canvas.create_line(*[coordinate for point in points for coordinate in point], fill="#ffd43b", width=2, dash=(5, 3), tags="bcp_completion")
+
+    def draw_bcp_manual_split(self) -> None:
+        self.canvas.delete("bcp_split")
+        if self.bcp_split_start_px is None or self.bcp_split_end_px is None:
+            return
+        start_x, start_y = self.bcp_split_start_px
+        end_x, end_y = self.bcp_split_end_px
+        self.canvas.create_line(
+            start_x * self.display_scale,
+            start_y * self.display_scale,
+            end_x * self.display_scale,
+            end_y * self.display_scale,
+            fill="#ff7f50",
+            width=2,
+            dash=(4, 2),
+            tags="bcp_split",
+        )
 
     def draw_bcp_reference_circles(self) -> None:
         self.canvas.delete("bcp_reference")
