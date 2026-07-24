@@ -62,7 +62,7 @@ DEFAULT_OUTLIER_LEVEL = "标准（12 px，默认）"
 LOCK_PATH = Path(tempfile.gettempdir()) / "sem_ler_lwr_app.lock"
 INFO_BAR_SEARCH_START = 0.72
 INFO_BAR_MIN_HEIGHT_PX = 24
-GAUSSIAN_KERNEL_SIZES = (3, 4, 5, 7)
+GAUSSIAN_KERNEL_SIZES = (3, 4, 5, 7, 9, 11)
 GAUSSIAN_SIGMA_SCALE_MIN = 0.4
 GAUSSIAN_SIGMA_SCALE_MAX = 2.5
 CD_RAY_STEP_PX = 0.25
@@ -90,6 +90,47 @@ BCP_MAX_LOCAL_LINK_FACTOR = 1.45
 BCP_BLOCKING_CORRIDOR_FACTOR = 0.35
 BCP_BLOCKING_PROJECTION_MARGIN = 0.12
 MANUAL_BCP_SPLIT_LINE_WIDTH_PX = 3
+
+
+class VerticalScrollFrame(ttk.Frame):
+    """A two-axis scrollable frame for compact application windows."""
+
+    def __init__(self, parent: tk.Misc, padding: int | tuple[int, int, int, int] = 0) -> None:
+        super().__init__(parent)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        self.vertical_scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.horizontal_scrollbar = ttk.Scrollbar(self, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.content = ttk.Frame(self.canvas, padding=padding)
+        self.content_window = self.canvas.create_window((0, 0), window=self.content, anchor=tk.NW)
+        self.canvas.configure(
+            xscrollcommand=self.horizontal_scrollbar.set,
+            yscrollcommand=self.vertical_scrollbar.set,
+        )
+        self.vertical_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.horizontal_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.content.bind("<Configure>", self.update_scroll_region)
+        self.canvas.bind("<Configure>", self.resize_content)
+
+    def update_scroll_region(self, _event: tk.Event | None = None) -> None:
+        required_width = max(self.canvas.winfo_width(), self.content.winfo_reqwidth())
+        self.canvas.itemconfigure(self.content_window, width=required_width)
+        self.canvas.configure(scrollregion=(0, 0, required_width, self.content.winfo_reqheight()))
+
+    def resize_content(self, _event: tk.Event) -> None:
+        self.update_scroll_region()
+
+    def scroll_wheel(self, event: tk.Event) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            direction = -1 if delta > 0 else 1
+        else:
+            direction = -1 if getattr(event, "num", 0) == 4 else 1
+        if event.state & 0x0001:
+            self.canvas.xview_scroll(direction, "units")
+        else:
+            self.canvas.yview_scroll(direction, "units")
+        return "break"
 
 
 @dataclass
@@ -226,7 +267,7 @@ def normalize_intensity(image: np.ndarray) -> np.ndarray:
 def gaussian_kernel(size: int, sigma_scale: float = 1.0) -> np.ndarray:
     """Return a normalized Gaussian kernel, preserving binomial weights at default strength."""
     if size not in GAUSSIAN_KERNEL_SIZES:
-        raise ValueError("高斯卷积核仅支持 3×3、4×4、5×5 或 7×7。")
+        raise ValueError("高斯卷积核仅支持 3×3、4×4、5×5、7×7、9×9 或 11×11。")
     row = np.array([math.comb(size - 1, index) for index in range(size)], dtype=float)
     if math.isclose(sigma_scale, 1.0, abs_tol=1e-9):
         kernel = np.outer(row, row)
@@ -1503,7 +1544,7 @@ class LERLWRApp(AppBase):
     def __init__(self) -> None:
         super().__init__()
         self.title("SEM measure（LER/LWR + BCP 点阵 + 尺寸标注）")
-        self.minsize(1100, 780)
+        self.minsize(1100, 600)
         self.image_path: Path | None = None
         self.original_image: np.ndarray | None = None
         self.raw_image: np.ndarray | None = None
@@ -1551,6 +1592,7 @@ class LERLWRApp(AppBase):
         self.bcp_split_start_px: tuple[float, float] | None = None
         self.bcp_split_end_px: tuple[float, float] | None = None
         self.bcp_dialog: tk.Toplevel | None = None
+        self.bcp_dialog_scroll: VerticalScrollFrame | None = None
         self.lcdu_cd_samples_nm: list[float] = []
         self.lcdu_sample_listbox: tk.Listbox | None = None
         self.metadata_text = "尚未导入 TIFF 文件。"
@@ -1573,7 +1615,7 @@ class LERLWRApp(AppBase):
         self.measurement_tool_var = tk.StringVar(value="ROI（LER/LWR）")
         self.measurement_color = ANNOTATION_COLORS["length"]
         self.zoom_slider_var = tk.DoubleVar(value=1.0)
-        self.zoom_percent_var = tk.StringVar(value="100%")
+        self.zoom_percent_var = tk.StringVar(value="100")
         self.bcp_recognition_duration_var = tk.StringVar(value="识别耗时：—")
         self.status_var = tk.StringVar(value="打开 SEM 图像后，可框选线条分析，或直接识别整图 BCP 点阵。")
         self.result_var = tk.StringVar(value="尚未分析")
@@ -1593,10 +1635,20 @@ class LERLWRApp(AppBase):
         self.centroid_layout_overlay_image: ImageTk.PhotoImage | None = None
 
         self._build_ui()
+        self.bind_all("<MouseWheel>", self.scroll_active_window, add="+")
+        self.bind_all("<Button-4>", self.scroll_active_window, add="+")
+        self.bind_all("<Button-5>", self.scroll_active_window, add="+")
+        self.bind_all("<Shift-MouseWheel>", self.scroll_active_window, add="+")
+        self.bind_all("<Shift-Button-4>", self.scroll_active_window, add="+")
+        self.bind_all("<Shift-Button-5>", self.scroll_active_window, add="+")
         self.pixel_size_var.trace_add("write", self.refresh_annotation_labels)
 
     def _build_ui(self) -> None:
-        controls = ttk.Frame(self, padding=10)
+        self.main_scroll = VerticalScrollFrame(self)
+        self.main_scroll.pack(fill=tk.BOTH, expand=True)
+        body = self.main_scroll.content
+
+        controls = ttk.Frame(body, padding=10)
         controls.pack(side=tk.TOP, fill=tk.X)
         file_menu = tk.Menu(controls, tearoff=False)
         file_menu.add_command(label="打开 SEM 图像", command=self.open_image)
@@ -1651,7 +1703,7 @@ class LERLWRApp(AppBase):
         ).grid(row=0, column=0, padx=(0, 8))
         ttk.Label(multiplier, textvariable=self.sigma_multiplier_var, width=4).grid(row=0, column=1)
 
-        self.image_processing_panel = ttk.LabelFrame(self, text="图像处理", padding=(10, 6))
+        self.image_processing_panel = ttk.LabelFrame(body, text="图像处理", padding=(10, 6))
         self.image_processing_panel_visible = False
         ttk.Checkbutton(
             self.image_processing_panel,
@@ -1705,7 +1757,7 @@ class LERLWRApp(AppBase):
             font=("Menlo", 9),
         ).pack(side=tk.RIGHT, padx=(18, 0))
 
-        content = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        content = ttk.PanedWindow(body, orient=tk.HORIZONTAL)
         self.main_content = content
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
@@ -1727,7 +1779,12 @@ class LERLWRApp(AppBase):
             length=150,
         ).pack(side=tk.LEFT, padx=6)
         ttk.Button(zoom_controls, text="+", width=3, command=lambda: self.step_zoom(ZOOM_STEP)).pack(side=tk.LEFT)
-        ttk.Label(zoom_controls, textvariable=self.zoom_percent_var, width=6).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(zoom_controls, text="缩放").pack(side=tk.LEFT, padx=(8, 3))
+        zoom_entry = ttk.Entry(zoom_controls, textvariable=self.zoom_percent_var, width=5)
+        zoom_entry.pack(side=tk.LEFT)
+        zoom_entry.bind("<Return>", self.apply_zoom_percent_value)
+        zoom_entry.bind("<FocusOut>", self.apply_zoom_percent_value)
+        ttk.Label(zoom_controls, text="%").pack(side=tk.LEFT, padx=(2, 0))
         ttk.Label(zoom_controls, textvariable=self.bcp_recognition_duration_var).pack(side=tk.LEFT, padx=(12, 0))
 
         ttk.Separator(zoom_controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
@@ -1793,9 +1850,10 @@ class LERLWRApp(AppBase):
             "通用测量：在底部工具中选择长度、矩形、圆形或正六边形后拖动创建。\n"
             "点击已有图形可移动或调整；尺寸会按 nm/pixel 自动标注。\n"
             "未填写像素尺寸时，通用测量暂以 px 显示。\n\n"
-            "底部缩放条：拖动滑块或点 − / + 调整大小。\n"
+            "底部缩放：拖动滑块、点 − / +，或直接输入百分比后按回车。\n"
             "按住空格 + 鼠标滚轮：以鼠标位置缩放。\n"
             "按住空格 + 左键拖动：平移图像。\n\n"
+            "窗口内容：鼠标滚轮上下滚动；按住 Shift + 滚轮可左右滚动。\n\n"
             "框选后可拖动绿色点调整范围；拖框内或中心点可移动选区。\n"
             "选中通用标注时 Backspace 删除标注，否则删除 ROI。\n\n"
             "“图像处理”可独立切换归一化、可调高斯卷积和 BCP DoG 对比增强。\n"
@@ -1808,7 +1866,7 @@ class LERLWRApp(AppBase):
             "\n\nBCP 点阵：点击“识别 BCP 点阵”，先标示至少 3 个代表圆柱，再识别整图点位；绿色线为二值连通区域轮廓，蓝线为 Delaunay 三角网，红线为依据局部六重对称取向变化推断的晶界。"
         )
         ttk.Label(result_frame, text=hint, justify=tk.LEFT, wraplength=290).pack(anchor="nw")
-        ttk.Label(self, textvariable=self.status_var, anchor="w", padding=(12, 6)).pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(body, textvariable=self.status_var, anchor="w", padding=(12, 6)).pack(side=tk.BOTTOM, fill=tk.X)
 
     def open_image(self) -> None:
         filename = filedialog.askopenfilename(
@@ -2687,13 +2745,30 @@ class LERLWRApp(AppBase):
     def reset_zoom_control(self) -> None:
         self.zoom_factor = 1.0
         self.zoom_slider_var.set(1.0)
-        self.zoom_percent_var.set("100%")
+        self.zoom_percent_var.set("100")
 
     def step_zoom(self, change: float) -> None:
         self.apply_zoom(self.zoom_factor + change)
 
     def zoom_from_slider(self, value: str) -> None:
         self.apply_zoom(float(value))
+
+    def apply_zoom_percent_value(self, _event: tk.Event | None = None) -> str:
+        text = self.zoom_percent_var.get().strip().removesuffix("%")
+        try:
+            percent = float(text)
+        except ValueError:
+            self.zoom_percent_var.set(f"{self.zoom_factor * 100:.0f}")
+            self.status_var.set("缩放请输入 25–300 之间的百分比。")
+            return "break"
+        requested_zoom = percent / 100.0
+        if not ZOOM_MIN <= requested_zoom <= ZOOM_MAX:
+            self.zoom_percent_var.set(f"{self.zoom_factor * 100:.0f}")
+            self.status_var.set(f"缩放范围为 {ZOOM_MIN * 100:.0f}%–{ZOOM_MAX * 100:.0f}%。")
+            return "break"
+        self.apply_zoom(requested_zoom)
+        self.zoom_percent_var.set(f"{self.zoom_factor * 100:.0f}")
+        return "break"
 
     def zoom_with_space_wheel(self, event: tk.Event) -> str | None:
         if not self.space_held:
@@ -2718,7 +2793,7 @@ class LERLWRApp(AppBase):
         image_y = self.canvas.canvasy(view_y) / self.display_scale
         self.zoom_factor = new_zoom
         self.zoom_slider_var.set(new_zoom)
-        self.zoom_percent_var.set(f"{new_zoom * 100:.0f}%")
+        self.zoom_percent_var.set(f"{new_zoom * 100:.0f}")
         self.draw_image()
         self.update_idletasks()
         content_width = self.raw_image.shape[1] * self.display_scale
@@ -2732,6 +2807,14 @@ class LERLWRApp(AppBase):
             position = (image_y * self.display_scale - view_y) / (content_height - view_height)
             self.canvas.yview_moveto(float(np.clip(position, 0, 1)))
         self.status_var.set(f"图像缩放：{self.zoom_factor * 100:.0f}%")
+
+    def scroll_active_window(self, event: tk.Event) -> str | None:
+        top_level = event.widget.winfo_toplevel()
+        if self.bcp_dialog is not None and top_level == self.bcp_dialog and self.bcp_dialog_scroll is not None:
+            return self.bcp_dialog_scroll.scroll_wheel(event)
+        if top_level == self:
+            return self.main_scroll.scroll_wheel(event)
+        return None
 
     def start_pan_mode(self, _event: tk.Event) -> None:
         self.space_held = True
@@ -2906,11 +2989,14 @@ class LERLWRApp(AppBase):
             return
         self.bcp_dialog = tk.Toplevel(self)
         self.bcp_dialog.title("BCP 点阵识别")
-        self.bcp_dialog.geometry("470x960")
+        dialog_height = min(760, max(500, self.winfo_screenheight() - 160))
+        self.bcp_dialog.geometry(f"500x{dialog_height}")
+        self.bcp_dialog.minsize(420, 420)
         self.bcp_dialog.transient(self)
         self.bcp_dialog.protocol("WM_DELETE_WINDOW", self.close_bcp_recognition_dialog)
-        content = ttk.Frame(self.bcp_dialog, padding=16)
-        content.pack(fill=tk.BOTH, expand=True)
+        self.bcp_dialog_scroll = VerticalScrollFrame(self.bcp_dialog, padding=16)
+        self.bcp_dialog_scroll.pack(fill=tk.BOTH, expand=True)
+        content = self.bcp_dialog_scroll.content
         ttk.Label(content, text="BCP 点阵识别", font=("Helvetica", 15, "bold")).pack(anchor="w")
         ttk.Label(content, text="自动识别可使用 DoG 或原始亮暗强度，再经局部分割、二值连通区域和轮廓描绘完成；样本和局部分割均为可选辅助。", wraplength=430).pack(anchor="w", pady=(8, 8))
 
@@ -3020,6 +3106,7 @@ class LERLWRApp(AppBase):
         if self.bcp_dialog is not None and self.bcp_dialog.winfo_exists():
             self.bcp_dialog.destroy()
         self.bcp_dialog = None
+        self.bcp_dialog_scroll = None
 
     def perform_bcp_analysis(self) -> None:
         if self.raw_image is None:
