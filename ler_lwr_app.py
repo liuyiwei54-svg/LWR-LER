@@ -1837,8 +1837,20 @@ class LERLWRApp(AppBase):
         ttk.Button(zoom_controls, text="删除标注", command=self.delete_active_annotation).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(zoom_controls, text="清空标注", command=self.clear_annotations).pack(side=tk.LEFT)
 
-        self.canvas = tk.Canvas(image_frame, background="#202020", highlightthickness=0, width=780, height=620, takefocus=True)
-        self.canvas.pack(fill=tk.BOTH, expand=True)
+        canvas_frame = ttk.Frame(image_frame)
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(canvas_frame, background="#202020", highlightthickness=0, width=780, height=620, takefocus=True)
+        self.image_vertical_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.image_horizontal_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        self.canvas.configure(
+            xscrollcommand=self.image_horizontal_scrollbar.set,
+            yscrollcommand=self.image_vertical_scrollbar.set,
+        )
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.image_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.image_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        canvas_frame.columnconfigure(0, weight=1)
+        canvas_frame.rowconfigure(0, weight=1)
         self.canvas.bind("<ButtonPress-1>", self.start_canvas_action)
         self.canvas.bind("<B1-Motion>", self.move_canvas_action)
         self.canvas.bind("<ButtonRelease-1>", self.finish_canvas_action)
