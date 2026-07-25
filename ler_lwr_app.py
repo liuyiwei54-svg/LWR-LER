@@ -73,8 +73,8 @@ GRAIN_BOUNDARY_ORIENTATION_THRESHOLD_DEGREES = 8.0
 MIN_GRAIN_DOTS = 3
 GRAIN_OVERLAY_ALPHA = 72
 GRAIN_OVERLAY_MAX_SIDE_PX = 360
-CENTROID_LAYOUT_OUTLINE_COLOR = (198, 56, 255, 235)
-CENTROID_LAYOUT_ANCHOR_COLOR = (255, 55, 72, 255)
+CENTROID_LAYOUT_OUTLINE_COLOR = "#c638ff"
+CENTROID_LAYOUT_ANCHOR_COLOR = "#ff3748"
 GRAIN_OVERLAY_COLORS = np.asarray(
     (
         (239, 111, 108), (78, 161, 255), (255, 190, 80), (106, 203, 138),
@@ -90,6 +90,14 @@ BCP_MAX_LOCAL_LINK_FACTOR = 1.45
 BCP_BLOCKING_CORRIDOR_FACTOR = 0.35
 BCP_BLOCKING_PROJECTION_MARGIN = 0.12
 MANUAL_BCP_SPLIT_LINE_WIDTH_PX = 3
+DEFAULT_BCP_CONTOUR_COLOR = "#39ff8e"
+DEFAULT_BCP_TRIANGULATION_COLOR = "#4db8ff"
+DEFAULT_BCP_OVERLAY_LINE_WIDTH = "2"
+DEFAULT_BCP_CENTROID_COLOR = "#ffe066"
+DEFAULT_BCP_CENTROID_DIAMETER = "6"
+DEFAULT_FIT_LEFT_COLOR = "#00e5ff"
+DEFAULT_FIT_RIGHT_COLOR = "#ffb000"
+DEFAULT_FIT_LINE_WIDTH = "2"
 
 
 class VerticalScrollFrame(ttk.Frame):
@@ -1371,6 +1379,12 @@ def central_bcp_centroid(centers_px: np.ndarray, width: int, height: int) -> np.
     return centers_px[np.argmin(np.sum((centers_px - image_center) ** 2, axis=1))]
 
 
+def color_with_alpha(color: str, alpha: int = 235) -> tuple[int, int, int, int]:
+    """Convert a Tk color selected by the user into an RGBA overlay color."""
+    red, green, blue = (int(color[index : index + 2], 16) for index in (1, 3, 5))
+    return red, green, blue, alpha
+
+
 def centroid_layout_overlay_image(
     centers_px: np.ndarray,
     anchor_px: np.ndarray,
@@ -1378,6 +1392,9 @@ def centroid_layout_overlay_image(
     width: int,
     height: int,
     display_size: tuple[int, int],
+    outline_color: str = CENTROID_LAYOUT_OUTLINE_COLOR,
+    outline_width: int = 1,
+    anchor_color: str = CENTROID_LAYOUT_ANCHOR_COLOR,
 ) -> Image.Image | None:
     """Render equal-size virtual cylinders centered on the detected centroids."""
     if not len(centers_px):
@@ -1391,9 +1408,9 @@ def centroid_layout_overlay_image(
     draw = ImageDraw.Draw(overlay)
     for x, y in centers_px:
         x, y = x * scale_x, y * scale_y
-        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=CENTROID_LAYOUT_OUTLINE_COLOR, width=1)
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=color_with_alpha(outline_color), width=outline_width)
     anchor_x, anchor_y = anchor_px[0] * scale_x, anchor_px[1] * scale_y
-    draw.ellipse((anchor_x - 4, anchor_y - 4, anchor_x + 4, anchor_y + 4), fill=CENTROID_LAYOUT_ANCHOR_COLOR, outline=(255, 245, 245, 255), width=1)
+    draw.ellipse((anchor_x - 4, anchor_y - 4, anchor_x + 4, anchor_y + 4), fill=color_with_alpha(anchor_color), outline=(255, 245, 245, 255), width=1)
     return overlay
 
 
@@ -1430,11 +1447,11 @@ def mean_and_standard_error(values: np.ndarray) -> tuple[float, float]:
     return float(np.mean(values)), float(np.std(values, ddof=1) / math.sqrt(len(values)))
 
 
-def mean_and_three_sigma(values: np.ndarray) -> tuple[float, float]:
-    """Return a sample mean and its three-sigma spread."""
+def mean_and_sigma_spread(values: np.ndarray, sigma_multiplier: float) -> tuple[float, float]:
+    """Return a sample mean and a user-selected multiple of sample sigma."""
     if not len(values):
         return float("nan"), float("nan")
-    return float(np.mean(values)), float(np.std(values, ddof=1) * 3) if len(values) > 1 else 0.0
+    return float(np.mean(values)), float(np.std(values, ddof=1) * sigma_multiplier) if len(values) > 1 else 0.0
 
 
 def bcp_calibration_scale(dot_array: np.ndarray, references: list[tuple[float, float, float]]) -> float:
@@ -1593,6 +1610,7 @@ class LERLWRApp(AppBase):
         self.bcp_split_end_px: tuple[float, float] | None = None
         self.bcp_dialog: tk.Toplevel | None = None
         self.bcp_dialog_scroll: VerticalScrollFrame | None = None
+        self.fit_style_dialog: tk.Toplevel | None = None
         self.lcdu_cd_samples_nm: list[float] = []
         self.lcdu_sample_listbox: tk.Listbox | None = None
         self.metadata_text = "尚未导入 TIFF 文件。"
@@ -1631,6 +1649,20 @@ class LERLWRApp(AppBase):
         self.bcp_triangulation_overlay_var = tk.BooleanVar(value=True)
         self.bcp_grain_overlay_var = tk.BooleanVar(value=True)
         self.bcp_centroid_layout_overlay_var = tk.BooleanVar(value=False)
+        self.bcp_pitch_sigma_multiplier_var = tk.StringVar(value="1")
+        self.fit_line_width_var = tk.StringVar(value=DEFAULT_FIT_LINE_WIDTH)
+        self.bcp_reference_display_var = tk.BooleanVar(value=False)
+        self.bcp_contour_width_var = tk.StringVar(value=DEFAULT_BCP_OVERLAY_LINE_WIDTH)
+        self.bcp_triangulation_width_var = tk.StringVar(value=DEFAULT_BCP_OVERLAY_LINE_WIDTH)
+        self.bcp_centroid_diameter_var = tk.StringVar(value=DEFAULT_BCP_CENTROID_DIAMETER)
+        self.bcp_centroid_layout_width_var = tk.StringVar(value=DEFAULT_BCP_OVERLAY_LINE_WIDTH)
+        self.bcp_contour_color = DEFAULT_BCP_CONTOUR_COLOR
+        self.bcp_triangulation_color = DEFAULT_BCP_TRIANGULATION_COLOR
+        self.bcp_centroid_color = DEFAULT_BCP_CENTROID_COLOR
+        self.bcp_centroid_layout_color = CENTROID_LAYOUT_OUTLINE_COLOR
+        self.bcp_centroid_anchor_color = CENTROID_LAYOUT_ANCHOR_COLOR
+        self.fit_left_color = DEFAULT_FIT_LEFT_COLOR
+        self.fit_right_color = DEFAULT_FIT_RIGHT_COLOR
         self.grain_overlay_image: ImageTk.PhotoImage | None = None
         self.centroid_layout_overlay_image: ImageTk.PhotoImage | None = None
 
@@ -1664,6 +1696,7 @@ class LERLWRApp(AppBase):
             )
         file_menu.add_cascade(label="异常点剔除", menu=outlier_menu)
         file_menu.add_separator()
+        file_menu.add_command(label="拟合线条样式", command=self.open_fit_line_style_dialog)
         file_menu.add_command(label="导出 CSV", command=self.export_csv)
         file_menu.add_command(label="导出标注/拟合图片", command=self.export_annotated_image)
         ttk.Menubutton(controls, text="菜单 ▾", menu=file_menu).grid(row=0, column=0, padx=(0, 8))
@@ -2343,6 +2376,62 @@ class LERLWRApp(AppBase):
                 self.status_var.set("已更新选中长度测量线的颜色。")
                 return
         self.status_var.set("已选择长度测量线颜色；新建长度线会使用此颜色。")
+
+    def open_fit_line_style_dialog(self) -> None:
+        if self.fit_style_dialog is not None and self.fit_style_dialog.winfo_exists():
+            self.fit_style_dialog.focus_set()
+            return
+        self.fit_style_dialog = tk.Toplevel(self)
+        self.fit_style_dialog.title("拟合线条样式")
+        self.fit_style_dialog.geometry("360x180")
+        self.fit_style_dialog.transient(self)
+        self.fit_style_dialog.protocol("WM_DELETE_WINDOW", self.close_fit_line_style_dialog)
+        content = ttk.Frame(self.fit_style_dialog, padding=14)
+        content.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(content, text="LER/LWR 拟合边缘（画面/导出）", font=("Helvetica", 13, "bold")).pack(anchor="w")
+        ttk.Label(content, text="只改变显示与导出，不改变边缘定位或测量结果。", foreground="#666666").pack(anchor="w", pady=(5, 9))
+        left = ttk.Frame(content)
+        left.pack(anchor="w")
+        ttk.Label(left, text="左拟合边缘：").pack(side=tk.LEFT)
+        self.fit_left_color_button = tk.Button(left, text="选择颜色", background=self.fit_left_color, activebackground=self.fit_left_color, command=lambda: self.choose_fit_line_color("left"))
+        self.fit_left_color_button.pack(side=tk.LEFT)
+        right = ttk.Frame(content)
+        right.pack(anchor="w", pady=(6, 0))
+        ttk.Label(right, text="右拟合边缘：").pack(side=tk.LEFT)
+        self.fit_right_color_button = tk.Button(right, text="选择颜色", background=self.fit_right_color, activebackground=self.fit_right_color, command=lambda: self.choose_fit_line_color("right"))
+        self.fit_right_color_button.pack(side=tk.LEFT)
+        width_controls = ttk.Frame(content)
+        width_controls.pack(anchor="w", pady=(9, 0))
+        ttk.Label(width_controls, text="两条线粗细：").pack(side=tk.LEFT)
+        width_selector = ttk.Combobox(width_controls, textvariable=self.fit_line_width_var, state="readonly", values=("1", "2", "3", "4", "5", "6"), width=3)
+        width_selector.pack(side=tk.LEFT, padx=(2, 3))
+        width_selector.bind("<<ComboboxSelected>>", self.refresh_fit_line_style)
+        ttk.Label(width_controls, text="px").pack(side=tk.LEFT)
+
+    def close_fit_line_style_dialog(self) -> None:
+        if self.fit_style_dialog is not None and self.fit_style_dialog.winfo_exists():
+            self.fit_style_dialog.destroy()
+        self.fit_style_dialog = None
+
+    def fit_line_width(self) -> int:
+        try:
+            return int(np.clip(int(self.fit_line_width_var.get()), 1, 6))
+        except ValueError:
+            return int(DEFAULT_FIT_LINE_WIDTH)
+
+    def choose_fit_line_color(self, side: str) -> None:
+        color_attribute = "fit_left_color" if side == "left" else "fit_right_color"
+        button_attribute = "fit_left_color_button" if side == "left" else "fit_right_color_button"
+        label = "左" if side == "left" else "右"
+        color = colorchooser.askcolor(color=getattr(self, color_attribute), parent=self.fit_style_dialog or self, title=f"选择{label}拟合边缘颜色")[1]
+        if color is None:
+            return
+        setattr(self, color_attribute, color)
+        getattr(self, button_attribute).configure(background=color, activebackground=color)
+        self.refresh_fit_line_style()
+
+    def refresh_fit_line_style(self, _event: tk.Event | None = None) -> None:
+        self.draw_image()
 
     def selected_annotation_kind(self) -> str | None:
         return {
@@ -3037,6 +3126,12 @@ class LERLWRApp(AppBase):
         ttk.Button(buttons, text="标示/编辑样本", command=self.start_bcp_reference_marking).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(buttons, text="结束编辑", command=self.stop_bcp_reference_marking).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(buttons, text="清除样本", command=self.clear_bcp_reference_circles).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            assistance,
+            text="显示标准样本圈（画面/导出）",
+            variable=self.bcp_reference_display_var,
+            command=self.refresh_bcp_reference_display,
+        ).pack(anchor="w", pady=(6, 0))
 
         recognition = ttk.LabelFrame(content, text="识别", padding=10)
         recognition.pack(fill=tk.X)
@@ -3050,6 +3145,25 @@ class LERLWRApp(AppBase):
         recognition_buttons.pack(anchor="w", pady=(10, 0))
         ttk.Button(recognition_buttons, text="开始识别", command=self.perform_bcp_analysis).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(recognition_buttons, text="清除当前结果", command=self.clear_bcp_analysis).pack(side=tk.LEFT)
+
+        completion = ttk.LabelFrame(content, text="局部补漏（保留已识别区域）", padding=10)
+        completion.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(completion, text="可连续添加多个不规则区域；每个区域各自计算局部阈值，框外绿色轮廓不会重算。", wraplength=430).pack(anchor="w")
+        completion_buttons = ttk.Frame(completion)
+        completion_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(completion_buttons, text="添加补漏区域", command=self.start_bcp_completion_selection).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(completion_buttons, text="识别所选区域", command=self.perform_bcp_completion).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(completion_buttons, text="清除框选", command=self.clear_bcp_completion_selection).pack(side=tk.LEFT)
+        ttk.Button(completion, text="完成补漏并计算 CD / Pitch", command=self.finalize_bcp_measurements).pack(anchor="w", pady=(8, 0))
+
+        split = ttk.LabelFrame(content, text="手动分割粘连柱", padding=10)
+        split.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(split, text="在一个粘连的绿色轮廓上画一条完整穿过粘连处的分割线；程序只重新计算该轮廓。", wraplength=430).pack(anchor="w")
+        split_buttons = ttk.Frame(split)
+        split_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(split_buttons, text="画分割线", command=self.start_bcp_manual_split).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(split_buttons, text="执行分割", command=self.perform_bcp_manual_split).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(split_buttons, text="清除分割线", command=self.clear_bcp_manual_split).pack(side=tk.LEFT)
 
         line_display = ttk.LabelFrame(content, text="三角网与晶粒显示（完成计算后）", padding=8)
         line_display.pack(fill=tk.X, pady=(10, 0))
@@ -3078,29 +3192,123 @@ class LERLWRApp(AppBase):
         ).pack(anchor="w", pady=(5, 0))
         ttk.Checkbutton(
             line_display,
-            text="显示质心虚拟圆柱布局（紫色，红点为锚点）",
+            text="显示质心虚拟圆柱布局（显示锚点）",
             variable=self.bcp_centroid_layout_overlay_var,
             command=self.refresh_bcp_line_display,
         ).pack(anchor="w", pady=(5, 0))
+        pitch_sigma_controls = ttk.Frame(line_display)
+        pitch_sigma_controls.pack(anchor="w", pady=(6, 0))
+        ttk.Label(pitch_sigma_controls, text="Pitch 波动显示：").pack(side=tk.LEFT)
+        pitch_sigma_selector = ttk.Combobox(
+            pitch_sigma_controls,
+            textvariable=self.bcp_pitch_sigma_multiplier_var,
+            state="readonly",
+            values=("0.5", "1", "2", "3", "4", "5", "6"),
+            width=4,
+        )
+        pitch_sigma_selector.pack(side=tk.LEFT, padx=(2, 3))
+        pitch_sigma_selector.bind("<<ComboboxSelected>>", self.refresh_bcp_pitch_sigma_display)
+        ttk.Label(pitch_sigma_controls, text="σ（默认 1）").pack(side=tk.LEFT)
 
-        completion = ttk.LabelFrame(content, text="局部补漏（保留已识别区域）", padding=10)
-        completion.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(completion, text="可连续添加多个不规则区域；每个区域各自计算局部阈值，框外绿色轮廓不会重算。", wraplength=430).pack(anchor="w")
-        completion_buttons = ttk.Frame(completion)
-        completion_buttons.pack(anchor="w", pady=(8, 0))
-        ttk.Button(completion_buttons, text="添加补漏区域", command=self.start_bcp_completion_selection).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(completion_buttons, text="识别所选区域", command=self.perform_bcp_completion).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(completion_buttons, text="清除框选", command=self.clear_bcp_completion_selection).pack(side=tk.LEFT)
-        ttk.Button(completion, text="完成补漏并计算 CD / Pitch", command=self.finalize_bcp_measurements).pack(anchor="w", pady=(8, 0))
-
-        split = ttk.LabelFrame(content, text="手动分割粘连柱", padding=10)
-        split.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(split, text="在一个粘连的绿色轮廓上画一条完整穿过粘连处的分割线；程序只重新计算该轮廓。", wraplength=430).pack(anchor="w")
-        split_buttons = ttk.Frame(split)
-        split_buttons.pack(anchor="w", pady=(8, 0))
-        ttk.Button(split_buttons, text="画分割线", command=self.start_bcp_manual_split).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(split_buttons, text="执行分割", command=self.perform_bcp_manual_split).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(split_buttons, text="清除分割线", command=self.clear_bcp_manual_split).pack(side=tk.LEFT)
+        overlay_style = ttk.LabelFrame(content, text="BCP 线条样式（画面/导出）", padding=8)
+        overlay_style.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(overlay_style, text="仅改变显示和导出，不改变识别、CD 或 Pitch。", foreground="#666666").pack(anchor="w")
+        contour_style = ttk.Frame(overlay_style)
+        contour_style.pack(anchor="w", pady=(6, 0))
+        ttk.Label(contour_style, text="绿色轮廓：").pack(side=tk.LEFT)
+        self.bcp_contour_color_button = tk.Button(
+            contour_style,
+            text="选择颜色",
+            background=self.bcp_contour_color,
+            activebackground=self.bcp_contour_color,
+            command=self.choose_bcp_contour_color,
+        )
+        self.bcp_contour_color_button.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(contour_style, text="粗细：").pack(side=tk.LEFT)
+        contour_width = ttk.Combobox(
+            contour_style,
+            textvariable=self.bcp_contour_width_var,
+            state="readonly",
+            values=("1", "2", "3", "4", "5", "6"),
+            width=3,
+        )
+        contour_width.pack(side=tk.LEFT)
+        contour_width.bind("<<ComboboxSelected>>", self.refresh_bcp_overlay_style)
+        triangulation_style = ttk.Frame(overlay_style)
+        triangulation_style.pack(anchor="w", pady=(5, 0))
+        ttk.Label(triangulation_style, text="蓝色三角网：").pack(side=tk.LEFT)
+        self.bcp_triangulation_color_button = tk.Button(
+            triangulation_style,
+            text="选择颜色",
+            background=self.bcp_triangulation_color,
+            activebackground=self.bcp_triangulation_color,
+            command=self.choose_bcp_triangulation_color,
+        )
+        self.bcp_triangulation_color_button.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(triangulation_style, text="粗细：").pack(side=tk.LEFT)
+        triangulation_width = ttk.Combobox(
+            triangulation_style,
+            textvariable=self.bcp_triangulation_width_var,
+            state="readonly",
+            values=("1", "2", "3", "4", "5", "6"),
+            width=3,
+        )
+        triangulation_width.pack(side=tk.LEFT)
+        triangulation_width.bind("<<ComboboxSelected>>", self.refresh_bcp_overlay_style)
+        centroid_style = ttk.Frame(overlay_style)
+        centroid_style.pack(anchor="w", pady=(5, 0))
+        ttk.Label(centroid_style, text="黄色质心点：").pack(side=tk.LEFT)
+        self.bcp_centroid_color_button = tk.Button(
+            centroid_style,
+            text="选择颜色",
+            background=self.bcp_centroid_color,
+            activebackground=self.bcp_centroid_color,
+            command=self.choose_bcp_centroid_color,
+        )
+        self.bcp_centroid_color_button.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(centroid_style, text="直径：").pack(side=tk.LEFT)
+        centroid_diameter = ttk.Combobox(
+            centroid_style,
+            textvariable=self.bcp_centroid_diameter_var,
+            state="readonly",
+            values=("3", "4", "5", "6", "8", "10", "12"),
+            width=3,
+        )
+        centroid_diameter.pack(side=tk.LEFT)
+        ttk.Label(centroid_style, text="px").pack(side=tk.LEFT, padx=(3, 0))
+        centroid_diameter.bind("<<ComboboxSelected>>", self.refresh_bcp_overlay_style)
+        layout_style = ttk.Frame(overlay_style)
+        layout_style.pack(anchor="w", pady=(5, 0))
+        ttk.Label(layout_style, text="虚拟圆柱轮廓：").pack(side=tk.LEFT)
+        self.bcp_centroid_layout_color_button = tk.Button(
+            layout_style,
+            text="选择颜色",
+            background=self.bcp_centroid_layout_color,
+            activebackground=self.bcp_centroid_layout_color,
+            command=self.choose_bcp_centroid_layout_color,
+        )
+        self.bcp_centroid_layout_color_button.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(layout_style, text="粗细：").pack(side=tk.LEFT)
+        layout_width = ttk.Combobox(
+            layout_style,
+            textvariable=self.bcp_centroid_layout_width_var,
+            state="readonly",
+            values=("1", "2", "3", "4", "5", "6"),
+            width=3,
+        )
+        layout_width.pack(side=tk.LEFT)
+        layout_width.bind("<<ComboboxSelected>>", self.refresh_bcp_overlay_style)
+        anchor_style = ttk.Frame(overlay_style)
+        anchor_style.pack(anchor="w", pady=(5, 0))
+        ttk.Label(anchor_style, text="中心锚点：").pack(side=tk.LEFT)
+        self.bcp_centroid_anchor_color_button = tk.Button(
+            anchor_style,
+            text="选择颜色",
+            background=self.bcp_centroid_anchor_color,
+            activebackground=self.bcp_centroid_anchor_color,
+            command=self.choose_bcp_centroid_anchor_color,
+        )
+        self.bcp_centroid_anchor_color_button.pack(side=tk.LEFT)
 
     def close_bcp_recognition_dialog(self) -> None:
         if self.bcp_dialog is not None and self.bcp_dialog.winfo_exists():
@@ -3138,6 +3346,7 @@ class LERLWRApp(AppBase):
             )
             self.bcp_recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_metrics_finalized = False
+            self.bcp_reference_display_var.set(False)
         except ValueError as exc:
             messagebox.showwarning("无法识别 BCP 点阵", str(exc))
             return
@@ -3153,7 +3362,7 @@ class LERLWRApp(AppBase):
             f"BCP 点阵识别完成（{response_mode}；{segmentation}；"
             f"最小连通面积 {min_area_fraction:.2f} × 参考面积；"
             f"柱内空洞忽略上限 {internal_hole_fraction:.2f} × 参考面积）："
-            "请先检查绿色轮廓并完成局部补漏，再计算 CD / Pitch。"
+            "标准样本圈已隐藏但校准仍保留；请检查绿色轮廓并完成局部补漏，再计算 CD / Pitch。"
         )
 
     def expected_bcp_diameter_px(self) -> float | None:
@@ -3419,7 +3628,17 @@ class LERLWRApp(AppBase):
         display_size = (max(1, round(width * self.display_scale)), max(1, round(height * self.display_scale)))
         result = self.bcp_result
         anchor = central_bcp_centroid(result.centers_px, width, height)
-        return centroid_layout_overlay_image(result.centers_px, anchor, bcp_layout_diameter_px(result), width, height, display_size)
+        return centroid_layout_overlay_image(
+            result.centers_px,
+            anchor,
+            bcp_layout_diameter_px(result),
+            width,
+            height,
+            display_size,
+            self.bcp_centroid_layout_color,
+            self.bcp_overlay_line_width(self.bcp_centroid_layout_width_var),
+            self.bcp_centroid_anchor_color,
+        )
 
     def bcp_centroid_layout_anchor(self) -> np.ndarray | None:
         """Return the original detected centroid used as the layout anchor."""
@@ -3435,6 +3654,82 @@ class LERLWRApp(AppBase):
         if self.bcp_metrics_finalized:
             self.draw_image()
             self.update_bcp_result_text()
+
+    def bcp_pitch_sigma_multiplier(self) -> float:
+        try:
+            return float(np.clip(float(self.bcp_pitch_sigma_multiplier_var.get()), 0.5, 6.0))
+        except ValueError:
+            return 1.0
+
+    def refresh_bcp_pitch_sigma_display(self, _event: tk.Event | None = None) -> None:
+        if self.bcp_metrics_finalized:
+            self.update_bcp_result_text()
+
+    def bcp_overlay_line_width(self, value: tk.StringVar) -> int:
+        try:
+            return int(np.clip(int(value.get()), 1, 6))
+        except ValueError:
+            return int(DEFAULT_BCP_OVERLAY_LINE_WIDTH)
+
+    def bcp_centroid_diameter(self) -> int:
+        try:
+            return int(np.clip(int(self.bcp_centroid_diameter_var.get()), 3, 12))
+        except ValueError:
+            return int(DEFAULT_BCP_CENTROID_DIAMETER)
+
+    def refresh_bcp_overlay_style(self, _event: tk.Event | None = None) -> None:
+        self.draw_image()
+
+    def choose_bcp_contour_color(self) -> None:
+        color = colorchooser.askcolor(color=self.bcp_contour_color, parent=self.bcp_dialog or self, title="选择 BCP 轮廓颜色")[1]
+        if color is None:
+            return
+        self.bcp_contour_color = color
+        self.bcp_contour_color_button.configure(background=color, activebackground=color)
+        self.refresh_bcp_overlay_style()
+
+    def choose_bcp_triangulation_color(self) -> None:
+        color = colorchooser.askcolor(color=self.bcp_triangulation_color, parent=self.bcp_dialog or self, title="选择 BCP 三角网颜色")[1]
+        if color is None:
+            return
+        self.bcp_triangulation_color = color
+        self.bcp_triangulation_color_button.configure(background=color, activebackground=color)
+        self.refresh_bcp_overlay_style()
+
+    def choose_bcp_centroid_color(self) -> None:
+        color = colorchooser.askcolor(color=self.bcp_centroid_color, parent=self.bcp_dialog or self, title="选择 BCP 质心点颜色")[1]
+        if color is None:
+            return
+        self.bcp_centroid_color = color
+        self.bcp_centroid_color_button.configure(background=color, activebackground=color)
+        self.refresh_bcp_overlay_style()
+
+    def choose_bcp_centroid_layout_color(self) -> None:
+        color = colorchooser.askcolor(
+            color=self.bcp_centroid_layout_color,
+            parent=self.bcp_dialog or self,
+            title="选择虚拟圆柱轮廓颜色",
+        )[1]
+        if color is None:
+            return
+        self.bcp_centroid_layout_color = color
+        self.bcp_centroid_layout_color_button.configure(background=color, activebackground=color)
+        self.refresh_bcp_overlay_style()
+
+    def choose_bcp_centroid_anchor_color(self) -> None:
+        color = colorchooser.askcolor(
+            color=self.bcp_centroid_anchor_color,
+            parent=self.bcp_dialog or self,
+            title="选择中心锚点颜色",
+        )[1]
+        if color is None:
+            return
+        self.bcp_centroid_anchor_color = color
+        self.bcp_centroid_anchor_color_button.configure(background=color, activebackground=color)
+        self.refresh_bcp_overlay_style()
+
+    def refresh_bcp_reference_display(self) -> None:
+        self.draw_bcp_reference_circles()
 
     def outlier_threshold_px(self) -> float:
         return OUTLIER_LEVELS.get(self.outlier_level_var.get(), OUTLIER_LEVELS[DEFAULT_OUTLIER_LEVEL])
@@ -3452,9 +3747,9 @@ class LERLWRApp(AppBase):
             points_left.extend([(left + left_offset) * scale, (row + top_offset) * scale])
             points_right.extend([(right + left_offset) * scale, (row + top_offset) * scale])
         if len(points_left) >= 4:
-            self.canvas.create_line(*points_left, fill="#00e5ff", width=1, tags="edge")
+            self.canvas.create_line(*points_left, fill=self.fit_left_color, width=self.fit_line_width(), tags="edge")
         if len(points_right) >= 4:
-            self.canvas.create_line(*points_right, fill="#ffb000", width=1, tags="edge")
+            self.canvas.create_line(*points_right, fill=self.fit_right_color, width=self.fit_line_width(), tags="edge")
 
     def render_bcp_overlay(self) -> None:
         self.canvas.delete("bcp")
@@ -3474,18 +3769,35 @@ class LERLWRApp(AppBase):
                 self.centroid_layout_overlay_image = ImageTk.PhotoImage(centroid_layout)
                 self.canvas.create_image(0, 0, image=self.centroid_layout_overlay_image, anchor=tk.NW, tags="bcp")
             for x0, y0, x1, y1 in self.displayed_bcp_line_segments(result.triangulation_segments_px):
-                self.canvas.create_line(x0 * scale, y0 * scale, x1 * scale, y1 * scale, fill="#4db8ff", width=1, tags="bcp")
+                self.canvas.create_line(
+                    x0 * scale,
+                    y0 * scale,
+                    x1 * scale,
+                    y1 * scale,
+                    fill=self.bcp_triangulation_color,
+                    width=self.bcp_overlay_line_width(self.bcp_triangulation_width_var),
+                    tags="bcp",
+                )
         for contour in result.contour_segments_px:
             for x0, y0, x1, y1 in contour:
-                self.canvas.create_line(x0 * scale, y0 * scale, x1 * scale, y1 * scale, fill="#39ff8e", width=1, tags="bcp")
+                self.canvas.create_line(
+                    x0 * scale,
+                    y0 * scale,
+                    x1 * scale,
+                    y1 * scale,
+                    fill=self.bcp_contour_color,
+                    width=self.bcp_overlay_line_width(self.bcp_contour_width_var),
+                    tags="bcp",
+                )
+        centroid_radius = self.bcp_centroid_diameter() / 2
         for center_x, center_y in result.centers_px:
             display_x, display_y = center_x * scale, center_y * scale
             self.canvas.create_oval(
-                display_x - 2,
-                display_y - 2,
-                display_x + 2,
-                display_y + 2,
-                fill="#ffe066",
+                display_x - centroid_radius,
+                display_y - centroid_radius,
+                display_x + centroid_radius,
+                display_y + centroid_radius,
+                fill=self.bcp_centroid_color,
                 outline="#4a3b00",
                 width=1,
                 tags="bcp",
@@ -3498,7 +3810,7 @@ class LERLWRApp(AppBase):
                 anchor_y - 5,
                 anchor_x + 5,
                 anchor_y + 5,
-                fill="#ff3748",
+                fill=self.bcp_centroid_anchor_color,
                 outline="#fff5f5",
                 width=1,
                 tags="bcp",
@@ -3535,6 +3847,8 @@ class LERLWRApp(AppBase):
 
     def draw_bcp_reference_circles(self) -> None:
         self.canvas.delete("bcp_reference")
+        if not self.bcp_reference_mode and not self.bcp_reference_display_var.get():
+            return
         scale = self.display_scale
         for index, (center_x, center_y, radius) in enumerate(self.bcp_reference_circles, start=1):
             is_active = index - 1 == self.bcp_reference_active_index
@@ -3656,6 +3970,8 @@ class LERLWRApp(AppBase):
             return
         self.clear_bcp_completion_selection()
         self.bcp_reference_mode = True
+        self.bcp_reference_display_var.set(True)
+        self.draw_bcp_reference_circles()
         self.status_var.set("样本编辑模式：拖蓝圈内部移动；拖外缘或白色控制点改大小；空白处拖动可添加更多互不重叠的样本。")
         self.canvas.configure(cursor="crosshair")
 
@@ -3664,9 +3980,10 @@ class LERLWRApp(AppBase):
         self.bcp_reference_active_index = None
         self.bcp_reference_drag_mode = None
         self.bcp_reference_start = None
+        self.bcp_reference_display_var.set(False)
         self.canvas.configure(cursor="")
         self.draw_bcp_reference_circles()
-        self.status_var.set("已结束样本编辑；蓝色样本仍可用于识别。")
+        self.status_var.set("已结束样本编辑；样本圈已隐藏，校准数据仍可用于识别。")
 
     def clear_bcp_reference_circles(self) -> None:
         self.bcp_reference_mode = False
@@ -3676,6 +3993,7 @@ class LERLWRApp(AppBase):
         self.bcp_reference_drag_mode = None
         self.bcp_reference_drag_anchor = None
         self.bcp_reference_start_circle = None
+        self.bcp_reference_display_var.set(False)
         self.bcp_reference_circles.clear()
         self.canvas.configure(cursor="")
         self.update_bcp_reference_text()
@@ -3691,6 +4009,7 @@ class LERLWRApp(AppBase):
         self.bcp_reference_drag_mode = None
         self.bcp_reference_drag_anchor = None
         self.bcp_reference_start_circle = None
+        self.bcp_reference_display_var.set(False)
         self.bcp_reference_circles.clear()
         self.update_bcp_reference_text()
 
@@ -3740,10 +4059,11 @@ class LERLWRApp(AppBase):
         cd_mean, cd_standard_error = mean_and_standard_error(result.cd_means_px * scale)
         grain_labels = bcp_grain_labels(result.centers_px)
         grain_count = len(np.unique(grain_labels[grain_labels >= 0]))
+        pitch_sigma_multiplier = self.bcp_pitch_sigma_multiplier()
         pitch_lines = []
         for label in PITCH_DIRECTION_LABELS:
-            pitch_mean, pitch_three_sigma = mean_and_three_sigma(result.pitch_values_by_direction_px[label] * scale)
-            value = "无有效边" if not np.isfinite(pitch_mean) else f"{pitch_mean:.3f} ± {pitch_three_sigma:.3f} {unit}（3σ）"
+            pitch_mean, pitch_sigma_spread = mean_and_sigma_spread(result.pitch_values_by_direction_px[label] * scale, pitch_sigma_multiplier)
+            value = "无有效边" if not np.isfinite(pitch_mean) else f"{pitch_mean:.3f} ± {pitch_sigma_spread:.3f} {unit}（{pitch_sigma_multiplier:g}σ）"
             pitch_lines.append(f"Pitch {label:<7} {value}")
         self.result_var.set(
             "BCP 垂直点阵识别\n\n"
@@ -3764,7 +4084,7 @@ class LERLWRApp(AppBase):
             "黄色：区域几何质心\n"
             f"蓝色：Delaunay 三角网（{'显示：' + self.bcp_line_display_var.get() if self.bcp_triangulation_overlay_var.get() else '隐藏'}）\n"
             f"彩色：晶粒取向分区（{grain_count} 个晶粒，{'显示' if self.bcp_grain_overlay_var.get() else '隐藏'}）\n"
-            f"紫色：质心虚拟圆柱布局（{'显示' if self.bcp_centroid_layout_overlay_var.get() else '隐藏'}，红点为锚点）"
+            f"质心虚拟圆柱布局（{'显示' if self.bcp_centroid_layout_overlay_var.get() else '隐藏'}，锚点已标示）"
         )
 
     def update_displayed_results(self) -> None:
@@ -3824,9 +4144,9 @@ class LERLWRApp(AppBase):
             left_points = rotate_points_about_center(left_points_rotated, -self.rotation_degrees, width, height)
             right_points = rotate_points_about_center(right_points_rotated, -self.rotation_degrees, width, height)
             if len(left_points) >= 2:
-                draw.line(left_points, fill=(0, 229, 255), width=2)
+                draw.line(left_points, fill=self.fit_left_color, width=self.fit_line_width())
             if len(right_points) >= 2:
-                draw.line(right_points, fill=(255, 176, 0), width=2)
+                draw.line(right_points, fill=self.fit_right_color, width=self.fit_line_width())
         self.draw_exported_bcp(draw, width, height)
 
         try:
@@ -3859,7 +4179,17 @@ class LERLWRApp(AppBase):
             return
         result = self.bcp_result
         anchor = central_bcp_centroid(result.centers_px, width, height)
-        overlay = centroid_layout_overlay_image(result.centers_px, anchor, bcp_layout_diameter_px(result), width, height, (width, height))
+        overlay = centroid_layout_overlay_image(
+            result.centers_px,
+            anchor,
+            bcp_layout_diameter_px(result),
+            width,
+            height,
+            (width, height),
+            self.bcp_centroid_layout_color,
+            self.bcp_overlay_line_width(self.bcp_centroid_layout_width_var),
+            self.bcp_centroid_anchor_color,
+        )
         if overlay is None:
             return
         if self.rotation_degrees:
@@ -3873,24 +4203,30 @@ class LERLWRApp(AppBase):
         if self.bcp_metrics_finalized:
             for x0, y0, x1, y1 in self.displayed_bcp_line_segments(result.triangulation_segments_px):
                 points = rotate_points_about_center([(x0, y0), (x1, y1)], -self.rotation_degrees, width, height)
-                draw.line(points, fill=(77, 184, 255), width=1)
+                draw.line(points, fill=self.bcp_triangulation_color, width=self.bcp_overlay_line_width(self.bcp_triangulation_width_var))
         for contour in result.contour_segments_px:
             for x0, y0, x1, y1 in contour:
                 points = rotate_points_about_center([(x0, y0), (x1, y1)], -self.rotation_degrees, width, height)
-                draw.line(points, fill=(57, 255, 142), width=1)
+                draw.line(points, fill=self.bcp_contour_color, width=self.bcp_overlay_line_width(self.bcp_contour_width_var))
+        centroid_radius = self.bcp_centroid_diameter() / 2
         for center_x, center_y in result.centers_px:
             output_x, output_y = rotate_points_about_center([(center_x, center_y)], -self.rotation_degrees, width, height)[0]
-            draw.ellipse((output_x - 2, output_y - 2, output_x + 2, output_y + 2), fill=(255, 224, 102), outline=(74, 59, 0))
-        for center_x, center_y, radius in self.bcp_reference_circles:
-            circle = [
-                (center_x + radius * math.cos(phase), center_y + radius * math.sin(phase))
-                for phase in np.linspace(0, 2 * math.pi, 25)
-            ]
-            draw.line(rotate_points_about_center(circle, -self.rotation_degrees, width, height), fill=(78, 161, 255), width=2)
+            draw.ellipse(
+                (output_x - centroid_radius, output_y - centroid_radius, output_x + centroid_radius, output_y + centroid_radius),
+                fill=self.bcp_centroid_color,
+                outline=(74, 59, 0),
+            )
+        if self.bcp_reference_display_var.get():
+            for center_x, center_y, radius in self.bcp_reference_circles:
+                circle = [
+                    (center_x + radius * math.cos(phase), center_y + radius * math.sin(phase))
+                    for phase in np.linspace(0, 2 * math.pi, 25)
+                ]
+                draw.line(rotate_points_about_center(circle, -self.rotation_degrees, width, height), fill=(78, 161, 255), width=2)
         if self.bcp_centroid_layout_overlay_var.get() and self.bcp_metrics_finalized:
             anchor = central_bcp_centroid(result.centers_px, width, height)
             anchor_x, anchor_y = rotate_points_about_center([tuple(anchor)], -self.rotation_degrees, width, height)[0]
-            draw.ellipse((anchor_x - 5, anchor_y - 5, anchor_x + 5, anchor_y + 5), fill=CENTROID_LAYOUT_ANCHOR_COLOR, outline=(255, 245, 245), width=1)
+            draw.ellipse((anchor_x - 5, anchor_y - 5, anchor_x + 5, anchor_y + 5), fill=self.bcp_centroid_anchor_color, outline=(255, 245, 245), width=1)
 
     def annotation_image_points(self, annotation: MeasurementAnnotation) -> list[tuple[float, float]]:
         if annotation.kind != "circle":
@@ -3975,10 +4311,15 @@ class LERLWRApp(AppBase):
                     writer.writerow(["bcp_cd_standard_error", cd_standard_error])
                     writer.writerow(["bcp_lattice_spacing", bcp.lattice_spacing_px * bcp_scale])
                     writer.writerow(["bcp_delaunay_edge_count", len(bcp.triangulation_segments_px)])
+                    pitch_sigma_multiplier = self.bcp_pitch_sigma_multiplier()
+                    writer.writerow(["bcp_pitch_sigma_multiplier", pitch_sigma_multiplier])
                     for label in PITCH_DIRECTION_LABELS:
-                        pitch_mean, pitch_three_sigma = mean_and_three_sigma(bcp.pitch_values_by_direction_px[label] * bcp_scale)
+                        pitch_values = bcp.pitch_values_by_direction_px[label] * bcp_scale
+                        pitch_mean, pitch_one_sigma = mean_and_sigma_spread(pitch_values, 1.0)
+                        _, pitch_display_spread = mean_and_sigma_spread(pitch_values, pitch_sigma_multiplier)
                         writer.writerow([f"bcp_pitch_{label}_mean", pitch_mean])
-                        writer.writerow([f"bcp_pitch_{label}_3sigma", pitch_three_sigma])
+                        writer.writerow([f"bcp_pitch_{label}_1sigma", pitch_one_sigma])
+                        writer.writerow([f"bcp_pitch_{label}_display_spread", pitch_display_spread])
                     writer.writerow(["bcp_grain_boundary_segment_count", len(bcp.boundary_segments_px)])
                     writer.writerow(["bcp_reference_sample_count", len(self.bcp_reference_circles)])
                 lcdu_sigma = self.lcdu_sigma_nm()
