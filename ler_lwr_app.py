@@ -43,6 +43,8 @@ ZOOM_MAX = 3.0
 ZOOM_STEP = 0.10
 MIN_ROI_WIDTH = 24
 MIN_ROI_HEIGHT = 80
+MIN_ERA_ROI_WIDTH = 12
+MIN_ERA_ROI_HEIGHT = 80
 ROI_HANDLE_SIZE = 5
 ROI_HANDLE_HIT = 10
 ANNOTATION_HANDLE_HIT = 10
@@ -63,8 +65,23 @@ LOCK_PATH = Path(tempfile.gettempdir()) / "sem_ler_lwr_app.lock"
 INFO_BAR_SEARCH_START = 0.72
 INFO_BAR_MIN_HEIGHT_PX = 24
 GAUSSIAN_KERNEL_SIZES = (3, 4, 5, 7, 9, 11)
+FIRST_ORDER_KERNEL_SIZES = (3, 5, 7, 9, 11)
 GAUSSIAN_SIGMA_SCALE_MIN = 0.4
 GAUSSIAN_SIGMA_SCALE_MAX = 2.5
+BLUR_METHOD_GAUSSIAN = "高斯模糊（默认）"
+BLUR_METHOD_MEAN = "均值模糊"
+EDGE_DETECTOR_SCHARR = "Scharr（默认）"
+EDGE_DETECTOR_CANNY = "Canny（Sobel）"
+EDGE_DETECTOR_LAPLACIAN = "拉普拉斯"
+EDGE_DETECTOR_ERA = "单边测量（ERA）"
+ERA_POLARITY_AUTO = "自动"
+ERA_POLARITY_RISING = "上升沿（暗→亮）"
+ERA_POLARITY_FALLING = "下降沿（亮→暗）"
+ERA_POLARITIES = (ERA_POLARITY_AUTO, ERA_POLARITY_RISING, ERA_POLARITY_FALLING)
+ERA_DEFAULT_POLYNOMIAL_DEGREE = 3
+ERA_DIFFERENCE_POWER = 4
+VERTICAL_EDGE_SUPPORT_WINDOW_PX = 41
+VERTICAL_EDGE_SUPPORT_MIN_POINTS = 24
 CD_RAY_STEP_PX = 0.25
 PITCH_DIRECTION_LABELS = ("水平（0°）", "+60°", "−60°")
 PITCH_DIRECTION_ANGLES = (0.0, 60.0, 120.0)
@@ -158,6 +175,53 @@ class AnalysisResult:
     edge_correlation: float
     pixel_size_nm: float
     rejected_rows: int
+    edge_detector: str
+    edge_kernel_size: int
+    edge_diagonal_weight: float
+    edge_axial_weight: float
+    canny_high_threshold: float
+    canny_threshold_ratio: float
+    canny_low_threshold: float
+    canny_normalization_scale: float
+
+
+@dataclass
+class SingleEdgeResult:
+    """One independently fitted edge, expressed in working-image coordinates."""
+
+    rows_px: np.ndarray
+    edge_px: np.ndarray
+    residual_nm: np.ndarray
+    ler_sigma_nm: float
+    rejected_rows: int
+    roi_bounds_px: tuple[int, int, int, int]
+    polarity: str
+    polynomial_degree: int
+
+
+@dataclass
+class EraLineSample:
+    """User-defined left/right single-edge ROIs for one physical line."""
+
+    left_roi_bounds_px: tuple[int, int, int, int] | None = None
+    right_roi_bounds_px: tuple[int, int, int, int] | None = None
+    left_edge: SingleEdgeResult | None = None
+    right_edge: SingleEdgeResult | None = None
+    paired_result: AnalysisResult | None = None
+
+
+@dataclass
+class EraAggregateResult:
+    """Pooled roughness statistics after independently measuring several lines."""
+
+    line_count: int
+    point_count: int
+    mean_width_nm: float
+    ler_left_sigma_nm: float
+    ler_right_sigma_nm: float
+    lwr_sigma_nm: float
+    total_ler_sigma_nm: float
+    edge_correlation: float
 
 
 @dataclass
@@ -201,6 +265,7 @@ class EditorState:
     gaussian_denoise_enabled: bool
     gaussian_kernel_size: str
     gaussian_sigma_scale: float
+    blur_method: str
     bcp_dog_enabled: bool
     result: AnalysisResult | None
     analysis_origin: tuple[int, int] | None
@@ -300,6 +365,13 @@ def gaussian_kernel_preview(size: int, sigma_scale: float = 1.0) -> str:
     return f"{size}×{size} 核（σ×{sigma_scale:.2f}）\n" + "\n".join(lines)
 
 
+def mean_kernel_preview(size: int) -> str:
+    """Format an equal-weight mean-blur kernel for the compact UI preview."""
+    value = 1.0 / (size * size)
+    lines = ["  ".join(f"{value:.3f}" for _column in range(size)) for _row in range(size)]
+    return f"{size}×{size} 均值核（每项 ÷{size * size}）\n" + "\n".join(lines)
+
+
 def gaussian_convolve(image: np.ndarray, size: int, sigma_scale: float = 1.0) -> np.ndarray:
     """Apply an edge-preserving-size two-dimensional Gaussian convolution."""
     top_pad, bottom_pad = size // 2, size - 1 - size // 2
@@ -311,16 +383,30 @@ def gaussian_convolve(image: np.ndarray, size: int, sigma_scale: float = 1.0) ->
     return np.clip(convolved, 0, 255).astype(np.uint8)
 
 
+def mean_convolve(image: np.ndarray, size: int) -> np.ndarray:
+    """Apply an equal-weight mean blur with the selected square kernel size."""
+    top_pad, bottom_pad = size // 2, size - 1 - size // 2
+    padded = np.pad(image.astype(float), ((top_pad, bottom_pad), (top_pad, bottom_pad)), mode="edge")
+    integral = np.pad(padded, ((1, 0), (1, 0))).cumsum(axis=0).cumsum(axis=1)
+    summed = integral[size:, size:] - integral[:-size, size:] - integral[size:, :-size] + integral[:-size, :-size]
+    return np.clip(summed / (size * size), 0, 255).astype(np.uint8)
+
+
 def preprocess_image(
     image: np.ndarray,
     normalize: bool = True,
     gaussian_denoise: bool = True,
     gaussian_size: int = 3,
     gaussian_sigma_scale: float = 1.0,
+    blur_method: str = BLUR_METHOD_GAUSSIAN,
 ) -> np.ndarray:
     """Build the selected display and measurement image from raw grayscale data."""
     processed = normalize_intensity(image) if normalize else image.copy()
-    return gaussian_convolve(processed, gaussian_size, gaussian_sigma_scale) if gaussian_denoise else processed
+    if not gaussian_denoise:
+        return processed
+    if blur_method == BLUR_METHOD_MEAN:
+        return mean_convolve(processed, gaussian_size)
+    return gaussian_convolve(processed, gaussian_size, gaussian_sigma_scale)
 
 
 def normalize_and_denoise(image: np.ndarray) -> np.ndarray:
@@ -449,16 +535,6 @@ def parabola_peak(values: np.ndarray, index: int) -> float:
     return float(index) + float(np.clip(offset, -0.5, 0.5))
 
 
-def smooth_profiles(image: np.ndarray, sigma_px: float = 1.0) -> np.ndarray:
-    """Apply a small Gaussian filter along each horizontal profile."""
-    radius = max(1, math.ceil(3 * sigma_px))
-    positions = np.arange(-radius, radius + 1)
-    kernel = np.exp(-(positions**2) / (2 * sigma_px**2))
-    kernel /= kernel.sum()
-    padded = np.pad(image.astype(float), ((0, 0), (radius, radius)), mode="edge")
-    return np.apply_along_axis(lambda row: np.convolve(row, kernel, mode="valid"), 1, padded)
-
-
 def rolling_median(trace: np.ndarray, window: int = 9) -> np.ndarray:
     """Return a short local-median baseline without an extra SciPy dependency."""
     radius = window // 2
@@ -468,14 +544,202 @@ def rolling_median(trace: np.ndarray, window: int = 9) -> np.ndarray:
 
 def replace_outliers(trace: np.ndarray, max_jump_px: float = 12.0) -> tuple[np.ndarray, np.ndarray]:
     """Replace isolated trace failures without smoothing genuine roughness."""
-    baseline = rolling_median(trace, window=9)
-    valid = np.abs(trace - baseline) <= max_jump_px
-    repaired = trace.copy()
+    observed = np.isfinite(trace)
+    if not observed.any():
+        return np.zeros_like(trace), np.zeros(trace.shape, dtype=bool)
+    indices = np.arange(len(trace))
+    filled = np.interp(indices, indices[observed], trace[observed])
+    baseline = rolling_median(filled, window=9)
+    valid = observed & (np.abs(filled - baseline) <= max_jump_px)
+    repaired = filled.copy()
     repaired[~valid] = baseline[~valid]
     return repaired, valid
 
 
-def locate_edges(image: np.ndarray, max_jump_px: float = 12.0) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def convolve_kernel(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Apply a small odd square kernel without adding a SciPy dependency."""
+    radius = kernel.shape[0] // 2
+    padded = np.pad(image.astype(float), radius, mode="edge")
+    output = np.zeros(image.shape, dtype=float)
+    for row in range(kernel.shape[0]):
+        for column in range(kernel.shape[1]):
+            output += kernel[row, column] * padded[row : row + image.shape[0], column : column + image.shape[1]]
+    return output
+
+
+def first_order_kernels(
+    detector: str,
+    diagonal_weight: float,
+    axial_weight: float,
+    kernel_size: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return an adjustable 3×3 or extended separable first-order kernel."""
+    if kernel_size not in FIRST_ORDER_KERNEL_SIZES:
+        raise ValueError("一阶边缘卷积核仅支持 3×3、5×5、7×7、9×9 或 11×11。")
+    if detector == EDGE_DETECTOR_CANNY:
+        diagonal_weight, axial_weight = max(diagonal_weight, 0.01), max(axial_weight, 0.01)
+    if kernel_size == 3:
+        kernel_x = np.array(
+            ((diagonal_weight, 0.0, -diagonal_weight), (axial_weight, 0.0, -axial_weight), (diagonal_weight, 0.0, -diagonal_weight)),
+            dtype=float,
+        )
+        return kernel_x, kernel_x.T
+
+    smoothing = np.array([math.comb(kernel_size - 1, index) for index in range(kernel_size)], dtype=float)
+    center_index = kernel_size // 2
+    smoothing *= diagonal_weight
+    smoothing[center_index] *= axial_weight / (2.0 * diagonal_weight) if diagonal_weight > 0 else axial_weight
+    derivative_base = np.array([math.comb(kernel_size - 3, index) for index in range(kernel_size - 2)], dtype=float)
+    derivative = np.convolve(np.array((1.0, 0.0, -1.0)), derivative_base)
+    kernel_x = np.outer(smoothing, derivative)
+    return kernel_x, kernel_x.T
+
+
+def non_maximum_suppression(magnitude: np.ndarray, gradient_x: np.ndarray, gradient_y: np.ndarray) -> np.ndarray:
+    """Keep only local gradient maxima along the quantized gradient direction."""
+    angle = (np.degrees(np.arctan2(gradient_y, gradient_x)) + 180.0) % 180.0
+    padded = np.pad(magnitude, 1, mode="constant")
+    output = np.zeros_like(magnitude)
+    for row in range(magnitude.shape[0]):
+        for column in range(magnitude.shape[1]):
+            value = magnitude[row, column]
+            direction = angle[row, column]
+            if direction < 22.5 or direction >= 157.5:
+                before, after = padded[row + 1, column], padded[row + 1, column + 2]
+            elif direction < 67.5:
+                before, after = padded[row, column + 2], padded[row + 2, column]
+            elif direction < 112.5:
+                before, after = padded[row, column + 1], padded[row + 2, column + 1]
+            else:
+                before, after = padded[row, column], padded[row + 2, column + 2]
+            if value >= before and value >= after:
+                output[row, column] = value
+    return output
+
+
+def vertically_supported_edge_mask(
+    edge_mask: np.ndarray,
+    window_px: int = VERTICAL_EDGE_SUPPORT_WINDOW_PX,
+    min_points: int = VERTICAL_EDGE_SUPPORT_MIN_POINTS,
+) -> np.ndarray:
+    """Keep existing edge pixels with sustained support along a near-vertical path."""
+    if window_px < 1 or window_px % 2 == 0:
+        raise ValueError("竖向边缘支持窗口必须是正奇数。")
+    if min_points < 1:
+        raise ValueError("竖向边缘支持点数必须为正数。")
+    horizontal_radius = 1
+    padded_columns = np.pad(edge_mask.astype(np.int16), ((0, 0), (horizontal_radius, horizontal_radius)))
+    local_columns = sum(
+        padded_columns[:, offset : offset + edge_mask.shape[1]]
+        for offset in range(horizontal_radius * 2 + 1)
+    )
+    vertical_radius = window_px // 2
+    padded_rows = np.pad(local_columns, ((vertical_radius, vertical_radius), (0, 0)))
+    cumulative = np.vstack((np.zeros((1, edge_mask.shape[1]), dtype=np.int32), np.cumsum(padded_rows, axis=0)))
+    support = cumulative[window_px:] - cumulative[:-window_px]
+    return edge_mask & (support >= min_points)
+
+
+def robust_normalize_response(response: np.ndarray) -> tuple[np.ndarray, float]:
+    """Scale edge responses by their positive 99th percentile, limiting outlier influence."""
+    positive = response[response > 0]
+    if not len(positive):
+        return np.zeros(response.shape, dtype=float), 0.0
+    scale = float(np.percentile(positive, 99))
+    return np.clip(response / max(scale, 1e-12), 0.0, 1.0), scale
+
+
+def hysteresis_edges(response: np.ndarray, high_threshold: float, threshold_ratio: float) -> tuple[np.ndarray, float, float]:
+    """Keep weak edges connected to strong edges after robust response normalization."""
+    normalized, scale = robust_normalize_response(response)
+    low_threshold = high_threshold / threshold_ratio
+    strong = normalized >= high_threshold
+    weak = normalized >= low_threshold
+    accepted = strong.copy()
+    stack = list(zip(*np.nonzero(strong)))
+    while stack:
+        row, column = stack.pop()
+        for next_row in range(max(0, row - 1), min(response.shape[0], row + 2)):
+            for next_column in range(max(0, column - 1), min(response.shape[1], column + 2)):
+                if weak[next_row, next_column] and not accepted[next_row, next_column]:
+                    accepted[next_row, next_column] = True
+                    stack.append((next_row, next_column))
+    return accepted, low_threshold, scale
+
+
+def edge_response(
+    image: np.ndarray,
+    detector: str,
+    diagonal_weight: float,
+    axial_weight: float,
+    kernel_size: int,
+    canny_high_threshold: float,
+    canny_threshold_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Build candidate and subpixel-refinement responses for a selected edge detector."""
+    if detector == EDGE_DETECTOR_LAPLACIAN:
+        center = -4.0 * axial_weight - 4.0 * diagonal_weight
+        kernel = np.array(((diagonal_weight, axial_weight, diagonal_weight), (axial_weight, center, axial_weight), (diagonal_weight, axial_weight, diagonal_weight)))
+        response = np.abs(convolve_kernel(image, kernel))
+        return response, response, response > 0, float("nan"), float("nan")
+    gradient_x, gradient_y = (
+        convolve_kernel(image, kernel)
+        for kernel in first_order_kernels(detector, diagonal_weight, axial_weight, kernel_size)
+    )
+    magnitude = np.hypot(gradient_x, gradient_y)
+    suppressed = non_maximum_suppression(magnitude, gradient_x, gradient_y)
+    if detector == EDGE_DETECTOR_CANNY:
+        connected, low_threshold, normalization_scale = hysteresis_edges(suppressed, canny_high_threshold, canny_threshold_ratio)
+        return suppressed * connected, magnitude, connected, normalization_scale, low_threshold
+    return suppressed, magnitude, suppressed > 0, float("nan"), float("nan")
+
+
+def detect_full_image_edges(
+    image: np.ndarray,
+    detector: str,
+    diagonal_weight: float,
+    axial_weight: float,
+    canny_high_threshold: float = 0.125,
+    canny_threshold_ratio: float = 2.5,
+    require_vertical_continuity: bool = False,
+    kernel_size: int = 3,
+) -> np.ndarray:
+    """Return edges for the supplied image region, with optional short-noise removal."""
+    if detector == EDGE_DETECTOR_LAPLACIAN:
+        raise ValueError("拉普拉斯使用单线 LER/LWR 分析，不提供单独的边缘叠加。")
+    response, _refinement, candidate_mask, _scale, _low = edge_response(
+        image,
+        detector,
+        diagonal_weight,
+        axial_weight,
+        kernel_size,
+        canny_high_threshold,
+        canny_threshold_ratio,
+    )
+    if detector == EDGE_DETECTOR_CANNY:
+        edge_mask = candidate_mask & (response > 0)
+    else:
+        positive = response[response > 0]
+        if not len(positive):
+            return np.zeros(image.shape, dtype=bool)
+        percentile = max(55, 75 - 5 * ((kernel_size - 3) // 2))
+        threshold = max(float(np.percentile(positive, percentile)), float(np.max(positive)) * 0.12)
+        edge_mask = response >= threshold
+    if require_vertical_continuity:
+        return vertically_supported_edge_mask(edge_mask)
+    return edge_mask.astype(bool)
+
+
+def locate_edges(
+    image: np.ndarray,
+    max_jump_px: float = 12.0,
+    detector: str = EDGE_DETECTOR_SCHARR,
+    diagonal_weight: float = 3.0,
+    axial_weight: float = 10.0,
+    canny_high_threshold: float = 0.125,
+    canny_threshold_ratio: float = 2.5,
+    kernel_size: int = 3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
     """Locate the two edges of one vertical line in a grayscale ROI.
 
     The input ROI must contain one line and some background on both sides.
@@ -488,35 +752,55 @@ def locate_edges(image: np.ndarray, max_jump_px: float = 12.0) -> tuple[np.ndarr
     if midpoint - margin < 3 or width - midpoint - margin < 3:
         raise ValueError("分析区域太窄；请框选一条线及其两侧背景。")
 
-    # SEM noise can make a one-pixel derivative stronger than a physical edge.
-    # A 3-pixel Gaussian is only used for locating the edge; output coordinates
-    # remain subpixel positions rather than a smoothed edge trace.
-    smoothed = smooth_profiles(image, sigma_px=3.0)
-    gradient = np.abs(np.gradient(smoothed, axis=1))
-    reference_profile = np.median(gradient, axis=0)
+    candidates, refinement, candidate_mask, normalization_scale, low_threshold = edge_response(
+        image,
+        detector,
+        diagonal_weight,
+        axial_weight,
+        kernel_size,
+        canny_high_threshold,
+        canny_threshold_ratio,
+    )
+    reference_profile = np.median(candidates, axis=0)
     left_reference = margin + int(np.argmax(reference_profile[margin:midpoint]))
     right_reference = midpoint + int(np.argmax(reference_profile[midpoint : width - margin]))
     search_radius = max(12, min(30, int(width * 0.05)))
-    left = np.empty(height, dtype=float)
-    right = np.empty(height, dtype=float)
+    left = np.full(height, np.nan, dtype=float)
+    right = np.full(height, np.nan, dtype=float)
 
     for row in range(height):
         left_start = max(1, left_reference - search_radius)
         left_end = min(width - 1, left_reference + search_radius + 1)
         right_start = max(1, right_reference - search_radius)
         right_end = min(width - 1, right_reference + search_radius + 1)
-        left_index = left_start + int(np.argmax(gradient[row, left_start:left_end]))
-        right_index = right_start + int(np.argmax(gradient[row, right_start:right_end]))
-        left[row] = parabola_peak(gradient[row], left_index)
-        right[row] = parabola_peak(gradient[row], right_index)
+        left_mask = candidate_mask[row, left_start:left_end]
+        right_mask = candidate_mask[row, right_start:right_end]
+        if left_mask.any():
+            left_values = np.where(left_mask, candidates[row, left_start:left_end], -np.inf)
+            left_index = left_start + int(np.argmax(left_values))
+            left[row] = parabola_peak(refinement[row], left_index)
+        if right_mask.any():
+            right_values = np.where(right_mask, candidates[row, right_start:right_end], -np.inf)
+            right_index = right_start + int(np.argmax(right_values))
+            right[row] = parabola_peak(refinement[row], right_index)
 
     left, left_valid = replace_outliers(left, max_jump_px)
     right, right_valid = replace_outliers(right, max_jump_px)
     valid = left_valid & right_valid & (right > left)
-    return left, right, valid
+    return left, right, valid, normalization_scale, low_threshold
 
 
-def analyze_roi(image: np.ndarray, pixel_size_nm: float, max_jump_px: float = 12.0) -> AnalysisResult:
+def analyze_roi(
+    image: np.ndarray,
+    pixel_size_nm: float,
+    max_jump_px: float = 12.0,
+    detector: str = EDGE_DETECTOR_SCHARR,
+    diagonal_weight: float = 3.0,
+    axial_weight: float = 10.0,
+    canny_high_threshold: float = 0.125,
+    canny_threshold_ratio: float = 2.5,
+    kernel_size: int = 3,
+) -> AnalysisResult:
     """Calculate standard RMS LER and LWR for one vertical SEM line ROI.
 
     A linear baseline is removed from each edge (LER), while only the average
@@ -529,7 +813,16 @@ def analyze_roi(image: np.ndarray, pixel_size_nm: float, max_jump_px: float = 12
     if width < MIN_ROI_WIDTH or height < MIN_ROI_HEIGHT:
         raise ValueError("分析区域过小；请至少包含 80 个沿线方向的像素。")
 
-    left, right, valid = locate_edges(image, max_jump_px)
+    left, right, valid, canny_normalization_scale, canny_low_threshold = locate_edges(
+        image,
+        max_jump_px,
+        detector,
+        diagonal_weight,
+        axial_weight,
+        canny_high_threshold,
+        canny_threshold_ratio,
+        kernel_size,
+    )
     rows = np.arange(height, dtype=float)
     if valid.sum() < max(30, height * 0.6):
         raise ValueError("有效边缘点太少；请检查 ROI 是否只包含一条线。")
@@ -569,6 +862,197 @@ def analyze_roi(image: np.ndarray, pixel_size_nm: float, max_jump_px: float = 12
         edge_correlation=edge_correlation,
         pixel_size_nm=pixel_size_nm,
         rejected_rows=int((~valid).sum()),
+        edge_detector=detector,
+        edge_kernel_size=kernel_size,
+        edge_diagonal_weight=diagonal_weight,
+        edge_axial_weight=axial_weight,
+        canny_high_threshold=canny_high_threshold,
+        canny_threshold_ratio=canny_threshold_ratio,
+        canny_low_threshold=canny_low_threshold,
+        canny_normalization_scale=canny_normalization_scale,
+    )
+
+
+def era_polarity_sign(image: np.ndarray, polarity: str) -> tuple[int, str]:
+    """Resolve the expected intensity transition of one manually selected edge ROI."""
+    if polarity == ERA_POLARITY_RISING:
+        return 1, polarity
+    if polarity == ERA_POLARITY_FALLING:
+        return -1, polarity
+    profile_difference = np.diff(np.median(image.astype(float), axis=0))
+    if not len(profile_difference) or np.max(np.abs(profile_difference)) <= 1e-12:
+        raise ValueError("单边 ROI 的灰度变化不足，无法判断边缘方向。")
+    sign = 1 if abs(float(np.max(profile_difference))) >= abs(float(np.min(profile_difference))) else -1
+    return sign, ERA_POLARITY_RISING if sign > 0 else ERA_POLARITY_FALLING
+
+
+def era_edge_position(
+    profile: np.ndarray,
+    reference_x: float,
+    polarity_sign: int,
+    polynomial_degree: int,
+) -> float:
+    """Fit one scanline transition and return its normalized 0.5 crossing in pixels."""
+    width = len(profile)
+    difference = polarity_sign * np.diff(profile.astype(float))
+    half_search = max(5, min(30, width // 3))
+    start = max(0, int(math.floor(reference_x - half_search)))
+    end = min(width - 1, int(math.ceil(reference_x + half_search)))
+    local_difference = np.maximum(difference[start:end], 0.0)
+    if not len(local_difference) or float(np.max(local_difference)) <= 1e-12:
+        return float("nan")
+    normalized_difference = local_difference / float(np.max(local_difference))
+    weights = normalized_difference**ERA_DIFFERENCE_POWER
+    x_centers = np.arange(start, end, dtype=float) + 0.5
+    weighted_center = float(np.dot(weights, x_centers) / np.sum(weights))
+    peak_center = float(start + int(np.argmax(local_difference)) + 0.5)
+    half_fit = max(3, min(15, int(math.ceil(abs(peak_center - weighted_center))) + 3))
+    fit_start = max(0, int(math.floor(weighted_center - half_fit)))
+    fit_end = min(width, int(math.ceil(weighted_center + half_fit)) + 1)
+    x_values = np.arange(fit_start, fit_end, dtype=float)
+    values = profile[fit_start:fit_end].astype(float)
+    if len(x_values) <= polynomial_degree or float(np.ptp(values)) <= 1e-12:
+        return float("nan")
+    normalized_values = (values - float(np.min(values))) / float(np.ptp(values))
+    coefficients = np.polyfit(x_values, normalized_values, polynomial_degree)
+    roots = np.roots(np.array([*coefficients[:-1], coefficients[-1] - 0.5], dtype=float))
+    candidates = []
+    derivative = np.polyder(coefficients)
+    for root in roots:
+        if abs(float(root.imag)) > 1e-7:
+            continue
+        position = float(root.real)
+        slope = float(np.polyval(derivative, position))
+        if fit_start <= position <= fit_end - 1 and slope * polarity_sign > 0:
+            candidates.append(position)
+    if not candidates:
+        return float("nan")
+    return min(candidates, key=lambda position: abs(position - weighted_center))
+
+
+def analyze_single_edge_era(
+    image: np.ndarray,
+    roi_bounds_px: tuple[int, int, int, int],
+    pixel_size_nm: float,
+    polynomial_degree: int = ERA_DEFAULT_POLYNOMIAL_DEGREE,
+    polarity: str = ERA_POLARITY_AUTO,
+    max_jump_px: float = 12.0,
+) -> SingleEdgeResult:
+    """Independently locate one SEM edge with an ERA-style profile fit.
+
+    The input image is already the application's selected preprocessed image.  This
+    method deliberately applies no additional spatial filter or image smoothing.
+    """
+    if pixel_size_nm <= 0:
+        raise ValueError("像素尺寸必须大于 0 nm/pixel。")
+    if polynomial_degree not in (2, 3, 4):
+        raise ValueError("单边拟合仅支持 2、3 或 4 次多项式。")
+    left, top, right, bottom = roi_bounds_px
+    roi = image[top:bottom, left:right]
+    height, width = roi.shape
+    if width < MIN_ERA_ROI_WIDTH or height < MIN_ERA_ROI_HEIGHT:
+        raise ValueError("单边 ROI 过小；请至少包含 80 个沿线方向像素和约 12 px 横向灰度过渡区域。")
+    polarity_sign, resolved_polarity = era_polarity_sign(roi, polarity)
+    reference_difference = polarity_sign * np.diff(np.median(roi.astype(float), axis=0))
+    reference_x = float(np.argmax(reference_difference) + 0.5)
+    trace = np.array(
+        [era_edge_position(roi[row], reference_x, polarity_sign, polynomial_degree) for row in range(height)],
+        dtype=float,
+    )
+    repaired_trace, valid = replace_outliers(trace, max_jump_px)
+    if int(valid.sum()) < max(30, int(height * 0.6)):
+        raise ValueError("单边有效拟合点太少；请让 ROI 只覆盖一条边，并包含边缘两侧的灰度过渡。")
+    valid_rows_local = np.arange(height, dtype=float)[valid]
+    valid_trace_local = repaired_trace[valid]
+    baseline = np.polyval(np.polyfit(valid_rows_local, valid_trace_local, 1), valid_rows_local)
+    residual_nm = (valid_trace_local - baseline) * pixel_size_nm
+    ler_sigma_nm = math.sqrt(float(np.dot(residual_nm, residual_nm)) / (len(valid_rows_local) - 2))
+    return SingleEdgeResult(
+        rows_px=valid_rows_local + top,
+        edge_px=valid_trace_local + left,
+        residual_nm=residual_nm,
+        ler_sigma_nm=ler_sigma_nm,
+        rejected_rows=int((~valid).sum()),
+        roi_bounds_px=roi_bounds_px,
+        polarity=resolved_polarity,
+        polynomial_degree=polynomial_degree,
+    )
+
+
+def pair_single_edges(left_edge: SingleEdgeResult, right_edge: SingleEdgeResult, pixel_size_nm: float) -> AnalysisResult:
+    """Pair only user-supplied left/right traces on their common global scanlines."""
+    left_values = {int(row): value for row, value in zip(left_edge.rows_px, left_edge.edge_px)}
+    right_values = {int(row): value for row, value in zip(right_edge.rows_px, right_edge.edge_px)}
+    rows = np.array(sorted(set(left_values).intersection(right_values)), dtype=float)
+    left = np.array([left_values[int(row)] for row in rows], dtype=float)
+    right = np.array([right_values[int(row)] for row in rows], dtype=float)
+    valid = right > left
+    rows, left, right = rows[valid], left[valid], right[valid]
+    if len(rows) < 30:
+        raise ValueError("左右单边 ROI 的共同有效行不足；请检查两边是否属于同一根线。")
+    left_fit = np.polyval(np.polyfit(rows, left, 1), rows)
+    right_fit = np.polyval(np.polyfit(rows, right, 1), rows)
+    left_residual_nm = (left - left_fit) * pixel_size_nm
+    right_residual_nm = (right - right_fit) * pixel_size_nm
+    width_nm = (right - left) * pixel_size_nm
+    width_residual_nm = width_nm - np.mean(width_nm)
+    count = len(rows)
+    left_sigma = math.sqrt(float(np.dot(left_residual_nm, left_residual_nm)) / (count - 2))
+    right_sigma = math.sqrt(float(np.dot(right_residual_nm, right_residual_nm)) / (count - 2))
+    lwr_sigma = math.sqrt(float(np.dot(width_residual_nm, width_residual_nm)) / (count - 1))
+    correlation = float(np.corrcoef(left_residual_nm, right_residual_nm)[0, 1]) if left_sigma > 0 and right_sigma > 0 else float("nan")
+    return AnalysisResult(
+        rows_px=rows,
+        left_px=left,
+        right_px=right,
+        left_residual_nm=left_residual_nm,
+        right_residual_nm=right_residual_nm,
+        width_nm=width_nm,
+        width_residual_nm=width_residual_nm,
+        mean_width_nm=float(np.mean(width_nm)),
+        ler_left_sigma_nm=left_sigma,
+        ler_right_sigma_nm=right_sigma,
+        lwr_sigma_nm=lwr_sigma,
+        total_ler_sigma_nm=math.hypot(left_sigma, right_sigma),
+        edge_correlation=correlation,
+        pixel_size_nm=pixel_size_nm,
+        rejected_rows=left_edge.rejected_rows + right_edge.rejected_rows + int((~valid).sum()),
+        edge_detector=EDGE_DETECTOR_ERA,
+        edge_kernel_size=0,
+        edge_diagonal_weight=float("nan"),
+        edge_axial_weight=float("nan"),
+        canny_high_threshold=float("nan"),
+        canny_threshold_ratio=float("nan"),
+        canny_low_threshold=float("nan"),
+        canny_normalization_scale=float("nan"),
+    )
+
+
+def aggregate_era_line_results(results: list[AnalysisResult]) -> EraAggregateResult:
+    """Pool independently detrended line residuals without averaging sigmas."""
+    if not results:
+        raise ValueError("请至少完成一根线的左右单边 ROI。")
+    left_rss = sum(float(np.dot(result.left_residual_nm, result.left_residual_nm)) for result in results)
+    right_rss = sum(float(np.dot(result.right_residual_nm, result.right_residual_nm)) for result in results)
+    width_rss = sum(float(np.dot(result.width_residual_nm, result.width_residual_nm)) for result in results)
+    left_dof = sum(len(result.rows_px) - 2 for result in results)
+    right_dof = sum(len(result.rows_px) - 2 for result in results)
+    width_dof = sum(len(result.rows_px) - 1 for result in results)
+    left_sigma = math.sqrt(left_rss / left_dof)
+    right_sigma = math.sqrt(right_rss / right_dof)
+    lwr_sigma = math.sqrt(width_rss / width_dof)
+    left_residuals = np.concatenate([result.left_residual_nm for result in results])
+    right_residuals = np.concatenate([result.right_residual_nm for result in results])
+    correlation = float(np.corrcoef(left_residuals, right_residuals)[0, 1]) if left_sigma > 0 and right_sigma > 0 else float("nan")
+    return EraAggregateResult(
+        line_count=len(results),
+        point_count=sum(len(result.rows_px) for result in results),
+        mean_width_nm=float(np.mean([result.mean_width_nm for result in results])),
+        ler_left_sigma_nm=left_sigma,
+        ler_right_sigma_nm=right_sigma,
+        lwr_sigma_nm=lwr_sigma,
+        total_ler_sigma_nm=math.hypot(left_sigma, right_sigma),
+        edge_correlation=correlation,
     )
 
 
@@ -1454,6 +1938,11 @@ def mean_and_sigma_spread(values: np.ndarray, sigma_multiplier: float) -> tuple[
     return float(np.mean(values)), float(np.std(values, ddof=1) * sigma_multiplier) if len(values) > 1 else 0.0
 
 
+def all_directional_pitch_values(pitch_values_by_direction_px: dict[str, np.ndarray]) -> np.ndarray:
+    """Combine retained Pitch edges from all three lattice directions."""
+    return np.concatenate([pitch_values_by_direction_px[label] for label in PITCH_DIRECTION_LABELS])
+
+
 def bcp_calibration_scale(dot_array: np.ndarray, references: list[tuple[float, float, float]]) -> float:
     """Infer the manual-reference dimensional scale without changing point positions."""
     ratios = []
@@ -1578,18 +2067,29 @@ class LERLWRApp(AppBase):
         self.roi_drag_anchor: tuple[float, float] | None = None
         self.roi_start_bounds: tuple[float, float, float, float] | None = None
         self.roi_was_changed = False
+        self.detected_edge_mask: np.ndarray | None = None
+        self.detected_edge_origin: tuple[int, int] = (0, 0)
+        self.detected_edge_overlay: ImageTk.PhotoImage | None = None
         self.annotations: list[MeasurementAnnotation] = []
         self.active_annotation_index: int | None = None
         self.annotation_drag_mode: str | None = None
         self.annotation_drag_anchor: tuple[float, float] | None = None
         self.annotation_start_bounds: tuple[float, float, float, float] | None = None
         self.annotation_was_changed = False
+        self.annotation_selection_start: tuple[float, float] | None = None
+        self.annotation_selection_bounds: tuple[float, float, float, float] | None = None
+        self.annotation_selection_rectangle: int | None = None
         self.undo_history: list[EditorState] = []
         self.pending_undo_state: EditorState | None = None
         self.space_held = False
         self.panning = False
         self.result: AnalysisResult | None = None
         self.analysis_origin: tuple[int, int] | None = None
+        self.era_line_samples: list[EraLineSample] = []
+        self.era_aggregate_result: EraAggregateResult | None = None
+        self.era_active_sample_index: int | None = None
+        self.era_pending_roi_target: tuple[int, str] | None = None
+        self.era_sample_listbox: tk.Listbox | None = None
         self.bcp_result: BCPAnalysisResult | None = None
         self.bcp_metrics_finalized = False
         self.bcp_reference_circles: list[tuple[float, float, float]] = []
@@ -1611,7 +2111,11 @@ class LERLWRApp(AppBase):
         self.bcp_dialog: tk.Toplevel | None = None
         self.bcp_dialog_scroll: VerticalScrollFrame | None = None
         self.fit_style_dialog: tk.Toplevel | None = None
+        self.ler_lwr_dialog: tk.Toplevel | None = None
+        self.ler_lwr_dialog_scroll: VerticalScrollFrame | None = None
+        self.ler_lwr_roi_mode = False
         self.lcdu_cd_samples_nm: list[float] = []
+        self.era_lcdu_cd_samples_nm: list[float] = []
         self.lcdu_sample_listbox: tk.Listbox | None = None
         self.metadata_text = "尚未导入 TIFF 文件。"
         self.rotation_degrees = 0.0
@@ -1621,20 +2125,34 @@ class LERLWRApp(AppBase):
         self.metadata_var = tk.StringVar(value="尚未读取 TIFF 元数据")
         self.normalize_var = tk.BooleanVar(value=True)
         self.gaussian_denoise_var = tk.BooleanVar(value=True)
+        self.blur_method_var = tk.StringVar(value=BLUR_METHOD_GAUSSIAN)
         self.gaussian_kernel_size_var = tk.StringVar(value="3 × 3")
         self.gaussian_sigma_scale_var = tk.DoubleVar(value=1.0)
         self.gaussian_sigma_text_var = tk.StringVar(value="1.00（标准）")
         self.gaussian_kernel_preview_var = tk.StringVar(value=gaussian_kernel_preview(3, 1.0))
+        self.edge_detector_var = tk.StringVar(value=EDGE_DETECTOR_SCHARR)
+        self.era_polarity_var = tk.StringVar(value=ERA_POLARITY_AUTO)
+        self.era_polynomial_degree_var = tk.StringVar(value=str(ERA_DEFAULT_POLYNOMIAL_DEGREE))
+        self.edge_kernel_size_var = tk.StringVar(value="3 × 3")
+        self.edge_diagonal_weight_var = tk.StringVar(value="3")
+        self.edge_axial_weight_var = tk.StringVar(value="10")
+        self.canny_high_threshold_var = tk.DoubleVar(value=0.125)
+        self.canny_threshold_ratio_var = tk.DoubleVar(value=2.5)
+        self.edge_use_vertical_continuity_filter_var = tk.BooleanVar(value=False)
+        self.canny_high_threshold_text_var = tk.StringVar(value="0.125")
+        self.canny_threshold_ratio_text_var = tk.StringVar(value="2.50")
+        self.canny_low_threshold_text_var = tk.StringVar(value="0.050")
+        self.edge_kernel_preview_var = tk.StringVar(value="")
         self.bcp_use_dog_var = tk.BooleanVar(value=True)
         self.sigma_multiplier_var = tk.DoubleVar(value=1.0)
         self.outlier_level_var = tk.StringVar(value=DEFAULT_OUTLIER_LEVEL)
         self.lcdu_summary_var = tk.StringVar(value="LCDU 样本：0 条线")
         self.rotation_var = tk.StringVar(value="0.00")
-        self.measurement_tool_var = tk.StringVar(value="ROI（LER/LWR）")
+        self.measurement_tool_var = tk.StringVar(value="框选标注")
         self.measurement_color = ANNOTATION_COLORS["length"]
         self.zoom_slider_var = tk.DoubleVar(value=1.0)
         self.zoom_percent_var = tk.StringVar(value="100")
-        self.bcp_recognition_duration_var = tk.StringVar(value="识别耗时：—")
+        self.recognition_duration_var = tk.StringVar(value="识别耗时：—")
         self.status_var = tk.StringVar(value="打开 SEM 图像后，可框选线条分析，或直接识别整图 BCP 点阵。")
         self.result_var = tk.StringVar(value="尚未分析")
         self.bcp_reference_var = tk.StringVar(value="当前没有手动样本。")
@@ -1649,7 +2167,6 @@ class LERLWRApp(AppBase):
         self.bcp_triangulation_overlay_var = tk.BooleanVar(value=True)
         self.bcp_grain_overlay_var = tk.BooleanVar(value=True)
         self.bcp_centroid_layout_overlay_var = tk.BooleanVar(value=False)
-        self.bcp_pitch_sigma_multiplier_var = tk.StringVar(value="1")
         self.fit_line_width_var = tk.StringVar(value=DEFAULT_FIT_LINE_WIDTH)
         self.bcp_reference_display_var = tk.BooleanVar(value=False)
         self.bcp_contour_width_var = tk.StringVar(value=DEFAULT_BCP_OVERLAY_LINE_WIDTH)
@@ -1667,6 +2184,7 @@ class LERLWRApp(AppBase):
         self.centroid_layout_overlay_image: ImageTk.PhotoImage | None = None
 
         self._build_ui()
+        self.bind("<FocusIn>", self.keep_ler_lwr_dialog_above_main, add="+")
         self.bind_all("<MouseWheel>", self.scroll_active_window, add="+")
         self.bind_all("<Button-4>", self.scroll_active_window, add="+")
         self.bind_all("<Button-5>", self.scroll_active_window, add="+")
@@ -1705,26 +2223,11 @@ class LERLWRApp(AppBase):
         ttk.Label(controls, textvariable=self.metadata_var, foreground="#426b2d").grid(row=0, column=3, padx=(0, 12), sticky="w")
         self.image_processing_button = ttk.Button(controls, text="图像处理 ▸", command=self.toggle_image_processing_panel)
         self.image_processing_button.grid(row=0, column=4, padx=(0, 12))
-        ttk.Button(controls, text="自动校正 ROI 倾角", command=self.auto_align_roi).grid(row=0, column=5, padx=(0, 8))
-        ttk.Button(controls, text="重置角度", command=self.reset_rotation).grid(row=0, column=6, padx=(0, 12))
-        ttk.Button(controls, text="分析选区", command=self.run_analysis).grid(row=0, column=7, padx=(0, 8))
-        ttk.Button(controls, text="识别 BCP 点阵", command=self.open_bcp_recognition_dialog).grid(row=0, column=8, padx=(0, 12))
-        ttk.Label(controls, text="测量工具").grid(row=0, column=9, sticky="e")
-        measurement_tool = ttk.Combobox(
-            controls,
-            textvariable=self.measurement_tool_var,
-            state="readonly",
-            values=("ROI（LER/LWR）", "长度", "矩形", "圆形", "正六边形"),
-            width=13,
-        )
-        measurement_tool.grid(row=0, column=10, padx=(4, 8))
-        measurement_tool.bind("<<ComboboxSelected>>", self.change_measurement_tool)
-        self.color_button = tk.Button(controls, text="线条颜色", command=self.choose_measurement_color, relief=tk.GROOVE)
-        self.color_button.grid(row=0, column=11, padx=(0, 8))
-        self.update_measurement_color_button()
+        self.analysis_tools_button = ttk.Button(controls, text="分析功能 ▸", command=self.toggle_analysis_tools_panel)
+        self.analysis_tools_button.grid(row=0, column=5, padx=(0, 12))
 
         multiplier = ttk.LabelFrame(controls, text="显示/导出倍数", padding=(8, 2))
-        multiplier.grid(row=0, column=12, padx=(8, 0), sticky="ew")
+        multiplier.grid(row=0, column=6, padx=(8, 0), sticky="ew")
         ttk.Scale(
             multiplier,
             from_=0.5,
@@ -1746,10 +2249,19 @@ class LERLWRApp(AppBase):
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
             self.image_processing_panel,
-            text="高斯卷积去噪",
+            text="启用平滑",
             variable=self.gaussian_denoise_var,
             command=self.refresh_image_preprocessing,
         ).pack(side=tk.LEFT, padx=(0, 5))
+        blur_selector = ttk.Combobox(
+            self.image_processing_panel,
+            textvariable=self.blur_method_var,
+            state="readonly",
+            values=(BLUR_METHOD_GAUSSIAN, BLUR_METHOD_MEAN),
+            width=15,
+        )
+        blur_selector.pack(side=tk.LEFT, padx=(0, 5))
+        blur_selector.bind("<<ComboboxSelected>>", self.refresh_image_preprocessing)
         kernel_selector = ttk.Combobox(
             self.image_processing_panel,
             textvariable=self.gaussian_kernel_size_var,
@@ -1790,14 +2302,20 @@ class LERLWRApp(AppBase):
             font=("Menlo", 9),
         ).pack(side=tk.RIGHT, padx=(18, 0))
 
+        self.analysis_tools_panel = ttk.LabelFrame(body, text="分析功能", padding=(10, 6))
+        self.analysis_tools_panel_visible = False
+        ttk.Button(self.analysis_tools_panel, text="测量 LER / LWR", command=self.open_ler_lwr_dialog).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(self.analysis_tools_panel, text="识别 BCP 点阵", command=self.open_bcp_recognition_dialog).pack(side=tk.LEFT)
+        ttk.Label(self.analysis_tools_panel, text="两项分析各自在独立窗口中设置与操作。", foreground="#666666").pack(side=tk.LEFT, padx=(12, 0))
+
         content = ttk.PanedWindow(body, orient=tk.HORIZONTAL)
         self.main_content = content
         content.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        image_frame = ttk.LabelFrame(content, text="图像：线条可先校正 ROI 倾角；BCP 点阵直接识别整图", padding=5)
-        result_frame = ttk.LabelFrame(content, text="测量结果", padding=12)
-        content.add(image_frame, weight=4)
-        content.add(result_frame, weight=2)
+        image_frame = ttk.LabelFrame(content, text="图像工作区", padding=5)
+        result_frame = ttk.LabelFrame(content, text="分析结果 / 操作提示", padding=8)
+        content.add(image_frame, weight=5)
+        content.add(result_frame, weight=1)
 
         zoom_controls = ttk.Frame(image_frame, padding=(4, 6))
         zoom_controls.pack(side=tk.BOTTOM, fill=tk.X)
@@ -1818,7 +2336,7 @@ class LERLWRApp(AppBase):
         zoom_entry.bind("<Return>", self.apply_zoom_percent_value)
         zoom_entry.bind("<FocusOut>", self.apply_zoom_percent_value)
         ttk.Label(zoom_controls, text="%").pack(side=tk.LEFT, padx=(2, 0))
-        ttk.Label(zoom_controls, textvariable=self.bcp_recognition_duration_var).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(zoom_controls, textvariable=self.recognition_duration_var).pack(side=tk.LEFT, padx=(12, 0))
 
         ttk.Separator(zoom_controls, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=12)
         ttk.Label(zoom_controls, text="旋转").pack(side=tk.LEFT, padx=(0, 6))
@@ -1837,8 +2355,35 @@ class LERLWRApp(AppBase):
         ttk.Button(zoom_controls, text="删除标注", command=self.delete_active_annotation).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(zoom_controls, text="清空标注", command=self.clear_annotations).pack(side=tk.LEFT)
 
-        canvas_frame = ttk.Frame(image_frame)
-        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        image_workspace = ttk.Frame(image_frame)
+        image_workspace.pack(fill=tk.BOTH, expand=True)
+        left_toolbar = ttk.Frame(image_workspace)
+        left_toolbar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        selection_toolbar = ttk.LabelFrame(left_toolbar, text="标注选择", padding=(6, 8))
+        selection_toolbar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Radiobutton(
+            selection_toolbar,
+            text="框选标注",
+            value="框选标注",
+            variable=self.measurement_tool_var,
+            command=self.change_measurement_tool,
+        ).pack(anchor="w", pady=3)
+        annotation_toolbar = ttk.LabelFrame(left_toolbar, text="通用标注", padding=(6, 8))
+        annotation_toolbar.pack(fill=tk.X)
+        for label in ("长度", "矩形", "圆形", "正六边形"):
+            ttk.Radiobutton(
+                annotation_toolbar,
+                text=label,
+                value=label,
+                variable=self.measurement_tool_var,
+                command=self.change_measurement_tool,
+            ).pack(anchor="w", pady=3)
+        self.color_button = tk.Button(annotation_toolbar, text="长度线颜色", command=self.choose_measurement_color, relief=tk.GROOVE)
+        self.color_button.pack(fill=tk.X, pady=(9, 0))
+        self.update_measurement_color_button()
+
+        canvas_frame = ttk.Frame(image_workspace)
+        canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.canvas = tk.Canvas(canvas_frame, background="#202020", highlightthickness=0, width=780, height=620, takefocus=True)
         self.image_vertical_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
         self.image_horizontal_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
@@ -1871,46 +2416,37 @@ class LERLWRApp(AppBase):
             self.canvas.drop_target_register(DND_FILES)
             self.canvas.dnd_bind("<<Drop>>", self.drop_file)
 
-        ttk.Label(result_frame, textvariable=self.result_var, justify=tk.LEFT, font=("Menlo", 13)).pack(anchor="nw", fill=tk.X)
-        ttk.Separator(result_frame).pack(fill=tk.X, pady=14)
+        ttk.Label(
+            result_frame,
+            textvariable=self.result_var,
+            justify=tk.LEFT,
+            wraplength=260,
+            font=("Menlo", 10),
+        ).pack(anchor="nw", fill=tk.X, pady=(0, 12))
         lcdu_controls = ttk.LabelFrame(result_frame, text="多线 LCDU", padding=(8, 6))
-        lcdu_controls.pack(anchor="nw", fill=tk.X, pady=(0, 12))
-        ttk.Label(lcdu_controls, textvariable=self.lcdu_summary_var, justify=tk.LEFT).pack(anchor="w", fill=tk.X)
-        lcdu_buttons = ttk.Frame(lcdu_controls)
-        lcdu_buttons.pack(anchor="w", pady=(6, 0))
-        ttk.Button(lcdu_buttons, text="加入当前线 CD", command=self.add_lcdu_sample).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(lcdu_buttons, text="删除选中样本", command=self.delete_selected_lcdu_sample).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(lcdu_buttons, text="清空 LCDU 样本", command=self.clear_lcdu_samples).pack(side=tk.LEFT)
-        self.lcdu_sample_listbox = tk.Listbox(lcdu_controls, height=5, exportselection=False)
-        self.lcdu_sample_listbox.pack(fill=tk.X, pady=(8, 0))
-        self.lcdu_sample_listbox.bind("<Delete>", self.delete_selected_lcdu_sample)
-        self.lcdu_sample_listbox.bind("<BackSpace>", self.delete_selected_lcdu_sample)
+        lcdu_controls.pack(fill=tk.X, pady=(0, 12))
+        self.build_lcdu_controls(lcdu_controls)
         hint = (
-            "使用说明\n"
+            "操作提示\n"
             "1. 点击导入，或从 Finder 直接拖入 TIFF。\n"
             "2. TIFF 会自动读取 SEM 像素尺寸。\n"
-            "3. 倾斜图案：先框选，再点“自动校正 ROI 倾角”。\n"
-            "4. 可用底部手动旋转微调角度，再重新框选分析。\n"
-            "5. 默认输出 1σ；拖动滑块可改为 kσ。\n\n"
-            "通用测量：在底部工具中选择长度、矩形、圆形或正六边形后拖动创建。\n"
+            "3. 展开“分析功能”后，可进入 LER/LWR 或 BCP 的设置窗口。\n"
+            "4. 测量结果会同步显示在这里；默认输出 1σ，顶部滑块可改为 kσ。\n\n"
+            "通用测量：在左侧工具列选择长度、矩形、圆形或正六边形后拖动创建。\n"
             "点击已有图形可移动或调整；尺寸会按 nm/pixel 自动标注。\n"
             "未填写像素尺寸时，通用测量暂以 px 显示。\n\n"
             "底部缩放：拖动滑块、点 − / +，或直接输入百分比后按回车。\n"
             "按住空格 + 鼠标滚轮：以鼠标位置缩放。\n"
             "按住空格 + 左键拖动：平移图像。\n\n"
             "窗口内容：鼠标滚轮上下滚动；按住 Shift + 滚轮可左右滚动。\n\n"
-            "框选后可拖动绿色点调整范围；拖框内或中心点可移动选区。\n"
-            "选中通用标注时 Backspace 删除标注，否则删除 ROI。\n\n"
+            "“框选标注”会临时框住并选中已有标注，松开鼠标后选择框自动消失。\n"
+            "选中通用标注时 Backspace 删除标注。\n\n"
             "“图像处理”可独立切换归一化、可调高斯卷积和 BCP DoG 对比增强。\n"
             "取消 DoG 后，BCP 将以原始亮暗强度进行分割。\n\n"
-            "本版假设线条沿竖直方向。\n"
-            "LER 对左右边分别线性去趋势；LWR 只减去平均线宽。\n"
-            "LCDU 由多条线的平均 CD 样本计算。\n"
-            "LCDU 样本列表可选中单条删除。\n"
-            "ER 的行业标准记号是 LER；总边缘 RMS 不等于 LWR。"
+            "LER/LWR 假设线条沿竖直方向；ROI 在测量窗口中选择，结果会保留在主窗口。"
             "\n\nBCP 点阵：点击“识别 BCP 点阵”，先标示至少 3 个代表圆柱，再识别整图点位；绿色线为二值连通区域轮廓，蓝线为 Delaunay 三角网，红线为依据局部六重对称取向变化推断的晶界。"
         )
-        ttk.Label(result_frame, text=hint, justify=tk.LEFT, wraplength=290).pack(anchor="nw")
+        ttk.Label(result_frame, text=hint, justify=tk.LEFT, wraplength=210).pack(anchor="nw")
         ttk.Label(body, textvariable=self.status_var, anchor="w", padding=(12, 6)).pack(side=tk.BOTTOM, fill=tk.X)
 
     def open_image(self) -> None:
@@ -1966,12 +2502,14 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.bcp_result = None
-        self.bcp_recognition_duration_var.set("识别耗时：—")
+        self.recognition_duration_var.set("识别耗时：—")
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
         self.lcdu_cd_samples_nm.clear()
         self.update_lcdu_summary_text()
         self.roi_canvas = None
+        self.clear_era_line_samples(redraw=False)
+        self.clear_auto_line_candidates(redraw=False)
         self.annotations.clear()
         self.active_annotation_index = None
         self.draw_image(reset_view=True)
@@ -1993,6 +2531,7 @@ class LERLWRApp(AppBase):
             self.gaussian_denoise_var.get(),
             self.gaussian_kernel_size_var.get(),
             self.gaussian_sigma_scale_var.get(),
+            self.blur_method_var.get(),
             self.bcp_use_dog_var.get(),
             self.result,
             self.analysis_origin,
@@ -2029,6 +2568,7 @@ class LERLWRApp(AppBase):
         self.gaussian_denoise_var.set(state.gaussian_denoise_enabled)
         self.gaussian_kernel_size_var.set(state.gaussian_kernel_size)
         self.gaussian_sigma_scale_var.set(state.gaussian_sigma_scale)
+        self.blur_method_var.set(state.blur_method)
         self.bcp_use_dog_var.set(state.bcp_dog_enabled)
         self.update_gaussian_kernel_preview()
         self.result = state.result
@@ -2056,6 +2596,7 @@ class LERLWRApp(AppBase):
             self.gaussian_denoise_var.get(),
             self.gaussian_kernel_size(),
             self.gaussian_sigma_scale(),
+            self.blur_method_var.get(),
         )
         self.rebuild_bcp_preview()
 
@@ -2086,6 +2627,9 @@ class LERLWRApp(AppBase):
         self.bcp_preview_image = normalize_intensity(response)
 
     def auto_align_roi(self) -> None:
+        if self.edge_detector_var.get() != EDGE_DETECTOR_LAPLACIAN:
+            self.status_var.set("自动校正 ROI 只用于拉普拉斯；Scharr/Canny 请用底部手动旋转后重新开始边缘识别。")
+            return
         try:
             roi, _, _ = self.selected_roi()
             correction = find_rotation_to_vertical(roi)
@@ -2103,6 +2647,8 @@ class LERLWRApp(AppBase):
             self.clear_bcp_completion_selection(redraw=False)
             self.discard_bcp_reference_circles()
             self.roi_canvas = None
+            self.clear_era_line_samples(redraw=False)
+            self.clear_auto_line_candidates(redraw=False)
             self.clear_annotations(redraw=False, record_history=False)
             self.draw_image()
             self.restore_view_center(view_center)
@@ -2125,9 +2671,11 @@ class LERLWRApp(AppBase):
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
         self.roi_canvas = None
+        self.clear_era_line_samples(redraw=False)
+        self.clear_auto_line_candidates(redraw=False)
         self.clear_annotations(redraw=False, record_history=False)
         self.draw_image(reset_view=True)
-        self.result_var.set("已恢复原始图像方向；请重新框选 ROI。")
+        self.result_var.set("已恢复原始图像方向；请重新框选 ROI，或直接使用整图重新识别 / 分析。")
         self.status_var.set("已重置倾角校正。")
 
     def rotate_manually(self, delta_degrees: float) -> None:
@@ -2160,10 +2708,12 @@ class LERLWRApp(AppBase):
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
         self.roi_canvas = None
+        self.clear_era_line_samples(redraw=False)
+        self.clear_auto_line_candidates(redraw=False)
         self.clear_annotations(redraw=False, record_history=False)
         self.draw_image()
         self.restore_view_center(view_center)
-        self.result_var.set("图像角度已手动调整；请重新框选 ROI 并分析。")
+        self.result_var.set("图像角度已手动调整；请重新框选 ROI，或直接使用整图重新识别 / 分析。")
         self.status_var.set(f"当前累计旋转角度：{self.rotation_degrees:+.2f}°。")
 
     def show_metadata(self) -> None:
@@ -2184,6 +2734,15 @@ class LERLWRApp(AppBase):
             self.image_processing_button.configure(text="图像处理 ▾")
         self.image_processing_panel_visible = not self.image_processing_panel_visible
 
+    def toggle_analysis_tools_panel(self) -> None:
+        if self.analysis_tools_panel_visible:
+            self.analysis_tools_panel.pack_forget()
+            self.analysis_tools_button.configure(text="分析功能 ▸")
+        else:
+            self.analysis_tools_panel.pack(side=tk.TOP, fill=tk.X, padx=10, pady=(0, 6), before=self.main_content)
+            self.analysis_tools_button.configure(text="分析功能 ▾")
+        self.analysis_tools_panel_visible = not self.analysis_tools_panel_visible
+
     def gaussian_kernel_size(self) -> int:
         return int(self.gaussian_kernel_size_var.get().split()[0])
 
@@ -2194,14 +2753,18 @@ class LERLWRApp(AppBase):
         sigma_scale = self.gaussian_sigma_scale()
         sigma_text = "1.00（标准）" if math.isclose(sigma_scale, 1.0, abs_tol=0.005) else f"{sigma_scale:.2f}"
         self.gaussian_sigma_text_var.set(sigma_text)
-        self.gaussian_kernel_preview_var.set(gaussian_kernel_preview(self.gaussian_kernel_size(), sigma_scale))
+        preview = mean_kernel_preview(self.gaussian_kernel_size()) if self.blur_method_var.get() == BLUR_METHOD_MEAN else gaussian_kernel_preview(self.gaussian_kernel_size(), sigma_scale)
+        self.gaussian_kernel_preview_var.set(preview)
 
     def preprocessing_description(self) -> str:
         parts = []
         if self.normalize_var.get():
             parts.append("归一化")
         if self.gaussian_denoise_var.get():
-            parts.append(f"{self.gaussian_kernel_size_var.get()} 高斯卷积（σ×{self.gaussian_sigma_scale():.2f}）")
+            if self.blur_method_var.get() == BLUR_METHOD_MEAN:
+                parts.append(f"{self.gaussian_kernel_size_var.get()} 均值模糊")
+            else:
+                parts.append(f"{self.gaussian_kernel_size_var.get()} 高斯模糊（σ×{self.gaussian_sigma_scale():.2f}）")
         if self.bcp_use_dog_var.get():
             parts.append("BCP DoG 预览")
         return " + ".join(parts) if parts else "原始灰度图"
@@ -2213,11 +2776,13 @@ class LERLWRApp(AppBase):
         self.update_gaussian_kernel_preview()
         self.result = None
         self.analysis_origin = None
+        self.clear_era_line_samples(redraw=False)
         self.bcp_result = None
         self.clear_bcp_completion_selection(redraw=False)
+        self.clear_auto_line_candidates(redraw=False)
         self.rebuild_working_images()
         self.draw_image()
-        self.result_var.set("处理方式已切换；请重新点击“分析选区”。")
+        self.result_var.set("处理方式已切换；请重新开始分析。")
         self.status_var.set(f"当前使用：{self.preprocessing_description()}")
 
     def refresh_bcp_contrast(self) -> None:
@@ -2283,6 +2848,7 @@ class LERLWRApp(AppBase):
         self.canvas.delete("roi")
         self.roi_rectangle = None
         if self.roi_canvas is None:
+            self.draw_era_rois()
             return
         self.roi_canvas = self.normalized_roi(self.roi_canvas)
         x0, y0, x1, y1 = self.roi_canvas
@@ -2299,6 +2865,38 @@ class LERLWRApp(AppBase):
                 outline="white",
                 tags=("roi", f"roi_handle_{name}"),
             )
+        self.draw_era_rois()
+
+    def draw_era_rois(self) -> None:
+        """Show the stored manual single-edge ROIs without making them editable on canvas."""
+        self.canvas.delete("era_roi")
+        for index, sample in enumerate(self.era_line_samples, start=1):
+            for side, bounds, color in (
+                ("L", sample.left_roi_bounds_px, self.fit_left_color),
+                ("R", sample.right_roi_bounds_px, self.fit_right_color),
+            ):
+                if bounds is None:
+                    continue
+                left, top, right, bottom = bounds
+                scale = self.display_scale
+                self.canvas.create_rectangle(
+                    left * scale,
+                    top * scale,
+                    right * scale,
+                    bottom * scale,
+                    outline=color,
+                    width=2,
+                    dash=(5, 3),
+                    tags="era_roi",
+                )
+                self.canvas.create_text(
+                    left * scale + 4,
+                    top * scale + 10,
+                    text=f"{index}{side}",
+                    anchor=tk.W,
+                    fill=color,
+                    tags="era_roi",
+                )
 
     def roi_handle_positions(self) -> dict[str, tuple[float, float]]:
         if self.roi_canvas is None:
@@ -2339,6 +2937,13 @@ class LERLWRApp(AppBase):
         if self.space_held:
             self.canvas.configure(cursor="fleur")
             return
+        if self.ler_lwr_roi_mode:
+            hit = self.roi_hit_test(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y))
+            self.canvas.configure(cursor="fleur" if hit == "move" else "crosshair")
+            return
+        if self.measurement_tool_var.get() == "框选标注":
+            self.canvas.configure(cursor="crosshair")
+            return
         if self.annotation_at(self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)) is not None:
             self.canvas.configure(cursor="fleur")
             return
@@ -2358,7 +2963,11 @@ class LERLWRApp(AppBase):
 
     def change_measurement_tool(self, _event: tk.Event | None = None) -> None:
         tool = self.measurement_tool_var.get()
-        self.status_var.set(f"当前工具：{tool}。拖动可创建；点击已有标注可移动或调整。")
+        self.ler_lwr_roi_mode = False
+        if tool == "框选标注":
+            self.status_var.set("当前工具：框选标注。拖动可临时框选已有标注，松开鼠标后选择框自动消失。")
+        else:
+            self.status_var.set(f"当前工具：{tool}。拖动可创建；点击已有标注可移动或调整。")
 
     def change_outlier_level(self, _event: tk.Event | None = None) -> None:
         if self.result is None:
@@ -2366,6 +2975,7 @@ class LERLWRApp(AppBase):
             return
         self.result = None
         self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
         self.draw_image()
         self.result_var.set("剔除档位已更改；请重新点击“分析选区”。")
         self.status_var.set("已更改异常点剔除设置，旧分析结果已清除。")
@@ -2556,7 +3166,8 @@ class LERLWRApp(AppBase):
                 self.canvas.create_oval(x0, y0, x1, y1, outline=color, width=2, tags="annotation")
             else:
                 points = self.annotation_polygon(annotation)
-                self.canvas.create_line(*[value for point in points for value in point], fill=color, width=2, tags="annotation")
+                if len(points) >= 2:
+                    self.canvas.create_line(*[value for point in points for value in point], fill=color, width=2, tags="annotation")
                 if annotation.kind == "length":
                     for cap in self.length_end_caps(annotation, self.display_scale, 6):
                         self.canvas.create_line(*cap, fill=color, width=2, tags="annotation")
@@ -2625,6 +3236,7 @@ class LERLWRApp(AppBase):
             return "move" if ((x - (left + right) / 2) / radius_x) ** 2 + ((y - (top + bottom) / 2) / radius_y) ** 2 <= 1 else None
         return "move" if left <= x <= right and top <= y <= bottom else None
 
+
     def start_canvas_action(self, event: tk.Event) -> None:
         if self.bcp_split_mode and not self.space_held:
             self.start_bcp_manual_split_draw(event)
@@ -2638,6 +3250,14 @@ class LERLWRApp(AppBase):
         if self.raw_image is None or self.space_held:
             self.start_roi(event)
             return
+        if self.ler_lwr_roi_mode:
+            self.active_annotation_index = None
+            self.begin_undoable_edit()
+            self.start_roi(event)
+            return
+        if self.measurement_tool_var.get() == "框选标注":
+            self.start_annotation_selection(event)
+            return
         canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
         existing = self.annotation_at(canvas_x, canvas_y)
         if existing is not None:
@@ -2650,9 +3270,10 @@ class LERLWRApp(AppBase):
             return
         kind = self.selected_annotation_kind()
         if kind is None:
-            self.active_annotation_index = None
-            self.begin_undoable_edit()
-            self.start_roi(event)
+            if self.ler_lwr_roi_mode:
+                self.active_annotation_index = None
+                self.begin_undoable_edit()
+                self.start_roi(event)
             return
         point = self.canvas_to_image_point(canvas_x, canvas_y)
         self.begin_undoable_edit()
@@ -2665,7 +3286,22 @@ class LERLWRApp(AppBase):
         self.annotation_start_bounds = self.annotations[-1].bounds_px
         self.draw_annotations()
 
+    def clear_detected_edges(self, redraw: bool = True) -> None:
+        """Clear the unpaired edge-recognition overlay and its image origin."""
+        self.detected_edge_mask = None
+        self.detected_edge_origin = (0, 0)
+        self.detected_edge_overlay = None
+        if redraw and self.raw_image is not None:
+            self.render_analysis_overlay()
+
+    def clear_auto_line_candidates(self, redraw: bool = True) -> None:
+        """Compatibility wrapper for invalidation paths predating edge-only mode."""
+        self.clear_detected_edges(redraw)
+
     def move_canvas_action(self, event: tk.Event) -> None:
+        if self.annotation_selection_start is not None:
+            self.move_annotation_selection(event)
+            return
         if self.bcp_split_mode and self.bcp_split_drawing:
             self.move_bcp_manual_split_draw(event)
             return
@@ -2687,6 +3323,9 @@ class LERLWRApp(AppBase):
         self.draw_annotations()
 
     def finish_canvas_action(self, event: tk.Event) -> None:
+        if self.annotation_selection_start is not None:
+            self.finish_annotation_selection(event)
+            return
         if self.bcp_split_mode and self.bcp_split_drawing:
             self.finish_bcp_manual_split_draw(event)
             return
@@ -2747,6 +3386,61 @@ class LERLWRApp(AppBase):
             bounds = self.regularize_circle_bounds(bounds)
         annotation.bounds_px = self.normalized_annotation_bounds(bounds)
 
+    def start_annotation_selection(self, event: tk.Event) -> None:
+        if self.raw_image is None:
+            return
+        x = self.canvas.canvasx(event.x)
+        y = self.canvas.canvasy(event.y)
+        self.annotation_selection_start = (x, y)
+        self.annotation_selection_bounds = (x, y, x, y)
+        self.canvas.delete("annotation_selection")
+        self.annotation_selection_rectangle = self.canvas.create_rectangle(
+            x,
+            y,
+            x,
+            y,
+            outline="#ffffff",
+            dash=(4, 3),
+            width=1,
+            tags="annotation_selection",
+        )
+
+    def move_annotation_selection(self, event: tk.Event) -> None:
+        if self.annotation_selection_start is None:
+            return
+        start_x, start_y = self.annotation_selection_start
+        end_x = self.canvas.canvasx(event.x)
+        end_y = self.canvas.canvasy(event.y)
+        self.annotation_selection_bounds = self.normalized_roi((start_x, start_y, end_x, end_y))
+        if self.annotation_selection_rectangle is not None:
+            self.canvas.coords(self.annotation_selection_rectangle, *self.annotation_selection_bounds)
+
+    def finish_annotation_selection(self, event: tk.Event) -> None:
+        self.move_annotation_selection(event)
+        selection = self.annotation_selection_bounds
+        self.annotation_selection_start = None
+        self.annotation_selection_bounds = None
+        self.annotation_selection_rectangle = None
+        self.canvas.delete("annotation_selection")
+        if selection is None:
+            return
+        left, top, right, bottom = selection
+        matched = []
+        for index, annotation in enumerate(self.annotations):
+            x0, y0, x1, y1 = self.annotation_display_bounds(annotation)
+            annotation_left, annotation_right = sorted((x0, x1))
+            annotation_top, annotation_bottom = sorted((y0, y1))
+            if annotation_right >= left and annotation_left <= right and annotation_bottom >= top and annotation_top <= bottom:
+                matched.append(index)
+        self.active_annotation_index = matched[-1] if matched else None
+        self.draw_annotations()
+        if not matched:
+            self.status_var.set("框选范围内没有标注。")
+        elif len(matched) == 1:
+            self.status_var.set("已选中框内标注；可直接拖动调整或删除。")
+        else:
+            self.status_var.set(f"框选到 {len(matched)} 个标注，已选中最上层标注；可直接拖动调整或删除。")
+
     def delete_active_annotation(self, _event: tk.Event | None = None) -> str:
         if self.active_annotation_index is None:
             self.status_var.set("请先点击一个通用测量标注。")
@@ -2782,7 +3476,7 @@ class LERLWRApp(AppBase):
             return "break"
         if self.active_annotation_index is not None:
             return self.delete_active_annotation()
-        return self.clear_roi()
+        return self.clear_roi() if self.ler_lwr_roi_mode else "break"
 
     def update_roi_from_drag(self, x: float, y: float) -> None:
         if self.roi_drag_mode is None or self.roi_drag_anchor is None:
@@ -2968,12 +3662,17 @@ class LERLWRApp(AppBase):
         self.roi_drag_anchor = None
         self.roi_start_bounds = None
         self.draw_roi()
+        if self.era_pending_roi_target is not None:
+            self.store_pending_era_roi()
+            self.roi_was_changed = False
+            return
         if self.roi_was_changed:
             self.result = None
             self.analysis_origin = None
+            self.clear_auto_line_candidates(redraw=False)
             self.canvas.delete("edge")
-            self.result_var.set("选区已更新；请重新点击“分析选区”。")
-        self.status_var.set("选区已确定。输入像素尺寸后点击“分析选区”。")
+            self.result_var.set("ROI 已更新；请重新点击“开始识别 / 分析”。")
+        self.status_var.set("ROI 已确定；下一次识别 / 分析将只使用框内图像。")
         self.roi_was_changed = False
 
     def clear_roi(self, _event: tk.Event | None = None) -> str:
@@ -2986,10 +3685,11 @@ class LERLWRApp(AppBase):
         self.roi_drag_mode = None
         self.result = None
         self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
         self.canvas.delete("roi")
         self.canvas.delete("edge")
-        self.result_var.set("选区已删除；请重新框选 ROI。")
-        self.status_var.set("已删除选区。")
+        self.result_var.set("ROI 已清除；下一次识别 / 分析将使用整张图像。")
+        self.status_var.set("已清除 ROI；将使用整图。")
         return "break"
 
     def selected_roi(self) -> tuple[np.ndarray, int, int]:
@@ -3007,41 +3707,265 @@ class LERLWRApp(AppBase):
             raise ValueError("图像未准备完成。")
         return analysis_image[top:bottom, left:right], left, top
 
+    def selected_ler_lwr_region(self) -> tuple[np.ndarray, int, int, bool]:
+        """Return the selected LER/LWR image region, or the full image without an ROI."""
+        if self.processed_image is None:
+            raise ValueError("图像未准备完成。")
+        if self.roi_canvas is None:
+            return self.processed_image, 0, 0, False
+        roi, left, top = self.selected_roi()
+        return roi, left, top, True
+
+    def era_polynomial_degree(self) -> int:
+        try:
+            degree = int(self.era_polynomial_degree_var.get())
+        except ValueError as exc:
+            raise ValueError("单边拟合次数必须为 2、3 或 4。") from exc
+        if degree not in (2, 3, 4):
+            raise ValueError("单边拟合次数必须为 2、3 或 4。")
+        return degree
+
+    def era_roi_bounds_from_canvas(self) -> tuple[int, int, int, int]:
+        if self.raw_image is None or self.roi_canvas is None:
+            raise ValueError("请在主图上拖动框选单条边的 ROI。")
+        x0, y0, x1, y1 = self.roi_canvas
+        left = max(0, math.floor(x0 / self.display_scale))
+        top = max(0, math.floor(y0 / self.display_scale))
+        right = min(self.raw_image.shape[1], math.ceil(x1 / self.display_scale))
+        bottom = min(self.raw_image.shape[0], math.ceil(y1 / self.display_scale))
+        if right - left < MIN_ERA_ROI_WIDTH or bottom - top < MIN_ERA_ROI_HEIGHT:
+            raise ValueError("单边 ROI 过小；请至少框选约 12 px 宽和 80 px 高。")
+        return left, top, right, bottom
+
+    def clear_era_line_samples(self, redraw: bool = True) -> None:
+        self.era_line_samples.clear()
+        self.era_aggregate_result = None
+        self.era_lcdu_cd_samples_nm.clear()
+        self.era_active_sample_index = None
+        self.era_pending_roi_target = None
+        if redraw and self.raw_image is not None:
+            self.draw_era_rois()
+        self.refresh_era_sample_list()
+        self.update_lcdu_summary_text()
+
+    def invalidate_era_results(self) -> None:
+        """Hide stale ERA traces whenever its user-defined sample set changes."""
+        self.era_aggregate_result = None
+        self.era_lcdu_cd_samples_nm.clear()
+        self.result = None
+        self.analysis_origin = None
+        self.canvas.delete("edge")
+        self.update_lcdu_summary_text()
+
+    def new_era_line_sample(self) -> None:
+        self.era_line_samples.append(EraLineSample())
+        self.era_active_sample_index = len(self.era_line_samples) - 1
+        self.invalidate_era_results()
+        self.refresh_era_sample_list()
+        self.status_var.set(f"已新建线样本 {len(self.era_line_samples)}；请分别框选左、右两条单边 ROI。")
+
+    def selected_era_line_sample(self) -> EraLineSample:
+        if self.era_active_sample_index is None or not (0 <= self.era_active_sample_index < len(self.era_line_samples)):
+            self.new_era_line_sample()
+        return self.era_line_samples[self.era_active_sample_index]
+
+    def select_era_line_sample(self, _event: tk.Event | None = None) -> None:
+        if self.era_sample_listbox is None:
+            return
+        selected = self.era_sample_listbox.curselection()
+        if selected:
+            self.era_active_sample_index = selected[0]
+
+    def refresh_era_sample_list(self) -> None:
+        if self.era_sample_listbox is None:
+            return
+        selected_index = self.era_active_sample_index
+        self.era_sample_listbox.delete(0, tk.END)
+        for index, sample in enumerate(self.era_line_samples, start=1):
+            left = "左边已选" if sample.left_roi_bounds_px is not None else "左边未选"
+            right = "右边已选" if sample.right_roi_bounds_px is not None else "右边未选"
+            measured = "已计算" if sample.paired_result is not None else "待计算"
+            self.era_sample_listbox.insert(tk.END, f"线 {index}: {left}，{right}，{measured}")
+        if selected_index is not None and self.era_line_samples:
+            self.era_sample_listbox.selection_set(selected_index)
+            self.era_sample_listbox.activate(selected_index)
+
+    def delete_selected_era_line_sample(self) -> None:
+        if self.era_active_sample_index is None or not self.era_line_samples:
+            self.status_var.set("请先选择一个单边线样本。")
+            return
+        removed_index = self.era_active_sample_index
+        self.era_line_samples.pop(removed_index)
+        self.era_active_sample_index = min(removed_index, len(self.era_line_samples) - 1) if self.era_line_samples else None
+        self.invalidate_era_results()
+        self.refresh_era_sample_list()
+        self.draw_era_rois()
+        self.status_var.set("已删除所选单边线样本。")
+
+    def start_era_roi_selection(self, side: str) -> None:
+        if self.raw_image is None:
+            return
+        self.selected_era_line_sample()
+        if side not in ("left", "right"):
+            raise ValueError("单边 ROI 只能指定为左边或右边。")
+        self.era_pending_roi_target = (self.era_active_sample_index, side)
+        self.roi_canvas = None
+        self.ler_lwr_roi_mode = True
+        self.active_annotation_index = None
+        self.draw_roi()
+        self.canvas.configure(cursor="crosshair")
+        side_name = "左边" if side == "left" else "右边"
+        self.status_var.set(f"请在主图拖动框选线样本 {self.era_active_sample_index + 1} 的{side_name}单边 ROI。")
+
+    def store_pending_era_roi(self) -> bool:
+        if self.era_pending_roi_target is None:
+            return False
+        sample_index, side = self.era_pending_roi_target
+        try:
+            bounds = self.era_roi_bounds_from_canvas()
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return False
+        sample = self.era_line_samples[sample_index]
+        if side == "left":
+            sample.left_roi_bounds_px = bounds
+            sample.left_edge = None
+        else:
+            sample.right_roi_bounds_px = bounds
+            sample.right_edge = None
+        sample.paired_result = None
+        self.invalidate_era_results()
+        self.era_pending_roi_target = None
+        self.roi_canvas = None
+        self.roi_rectangle = None
+        self.refresh_era_sample_list()
+        self.draw_roi()
+        side_name = "左边" if side == "left" else "右边"
+        self.status_var.set(f"线样本 {sample_index + 1} 的{side_name}单边 ROI 已保存。")
+        return True
+
+    def run_era_analysis(self) -> None:
+        if self.processed_image is None:
+            raise ValueError("图像未准备完成。")
+        pixel_size = float(self.pixel_size_var.get())
+        degree = self.era_polynomial_degree()
+        complete_results = []
+        for index, sample in enumerate(self.era_line_samples, start=1):
+            if sample.left_roi_bounds_px is not None:
+                sample.left_edge = analyze_single_edge_era(
+                    self.processed_image,
+                    sample.left_roi_bounds_px,
+                    pixel_size,
+                    degree,
+                    self.era_polarity_var.get(),
+                    self.outlier_threshold_px(),
+                )
+            if sample.right_roi_bounds_px is not None:
+                sample.right_edge = analyze_single_edge_era(
+                    self.processed_image,
+                    sample.right_roi_bounds_px,
+                    pixel_size,
+                    degree,
+                    self.era_polarity_var.get(),
+                    self.outlier_threshold_px(),
+                )
+            sample.paired_result = None
+            if sample.left_edge is not None and sample.right_edge is not None:
+                sample.paired_result = pair_single_edges(sample.left_edge, sample.right_edge, pixel_size)
+                complete_results.append(sample.paired_result)
+            elif sample.left_roi_bounds_px is not None or sample.right_roi_bounds_px is not None:
+                self.status_var.set(f"线样本 {index} 只有一条边；已输出其 LER，但未参与 CD/LWR 汇总。")
+        if not complete_results:
+            raise ValueError("至少需要一个线样本的左、右单边 ROI 都已框选，才能计算 CD/LWR。")
+        self.era_aggregate_result = aggregate_era_line_results(complete_results)
+        self.era_lcdu_cd_samples_nm = [result.mean_width_nm for result in complete_results]
+        self.result = complete_results[-1]
+        self.analysis_origin = (0, 0)
+        self.clear_auto_line_candidates(redraw=False)
+        self.refresh_era_sample_list()
+        self.update_lcdu_summary_text()
+        self.update_era_result_text()
+
+    def update_era_result_text(self) -> None:
+        if self.era_aggregate_result is None:
+            return
+        summary = self.era_aggregate_result
+        multiplier = self.sigma_multiplier_var.get()
+        lines = [
+            f"单边测量（ERA，{self.era_polynomial_degree()} 次拟合）",
+            f"输出：{multiplier:.1f}σ（主窗口“显示/导出倍数”）",
+            f"已完成线样本  {summary.line_count} 根；共同有效点 {summary.point_count}",
+            f"平均 CD        {summary.mean_width_nm:.3f} nm",
+            f"左 ER（LER_L）  {multiplier * summary.ler_left_sigma_nm:.3f} nm",
+            f"右 ER（LER_R）  {multiplier * summary.ler_right_sigma_nm:.3f} nm",
+            f"宽度 LWR        {multiplier * summary.lwr_sigma_nm:.3f} nm",
+            f"原始 σ（L/R/W） {summary.ler_left_sigma_nm:.3f} / {summary.ler_right_sigma_nm:.3f} / {summary.lwr_sigma_nm:.3f} nm",
+        ]
+        lcdu_sigma = self.lcdu_sigma_nm()
+        if lcdu_sigma is not None:
+            lines.append(f"LCDU（{len(self.era_lcdu_cd_samples_nm)} 根） {multiplier * lcdu_sigma:.3f} nm")
+        else:
+            lines.append("LCDU             还需至少 2 根完整线样本")
+        lines.extend(("", "逐线结果："))
+        for index, sample in enumerate(self.era_line_samples, start=1):
+            if sample.paired_result is not None:
+                result = sample.paired_result
+                lines.append(
+                    f"线 {index}: CD {result.mean_width_nm:.3f} nm，"
+                    f"LER_L/R {multiplier * result.ler_left_sigma_nm:.3f}/{multiplier * result.ler_right_sigma_nm:.3f} nm，"
+                    f"LWR {multiplier * result.lwr_sigma_nm:.3f} nm"
+                )
+            elif sample.left_edge is not None or sample.right_edge is not None:
+                edge = sample.left_edge or sample.right_edge
+                lines.append(f"线 {index}: 单边 LER {multiplier * edge.ler_sigma_nm:.3f} nm（未配对）")
+        self.result_var.set("\n".join(lines))
+
+    def active_lcdu_samples(self) -> tuple[list[float], str]:
+        if self.era_aggregate_result is not None:
+            return self.era_lcdu_cd_samples_nm, "ERA 自动样本"
+        return self.lcdu_cd_samples_nm, "手动样本"
+
     def lcdu_sigma_nm(self) -> float | None:
-        sample_count = len(self.lcdu_cd_samples_nm)
+        samples_nm, _source = self.active_lcdu_samples()
+        sample_count = len(samples_nm)
         if sample_count < 2:
             return None
-        samples = np.array(self.lcdu_cd_samples_nm, dtype=float)
+        samples = np.array(samples_nm, dtype=float)
         residual = samples - np.mean(samples)
         return math.sqrt(float(np.dot(residual, residual)) / (sample_count - 1))
 
     def update_lcdu_summary_text(self) -> None:
         self.refresh_lcdu_sample_list()
-        sample_count = len(self.lcdu_cd_samples_nm)
+        samples_nm, source = self.active_lcdu_samples()
+        sample_count = len(samples_nm)
         sigma = self.lcdu_sigma_nm()
         if sigma is None:
-            self.lcdu_summary_var.set(f"LCDU 样本：{sample_count} 条线；至少加入 2 条线后计算。")
+            self.lcdu_summary_var.set(f"LCDU（{source}）：{sample_count} 条线；至少需要 2 条线。")
             return
         multiplier = self.sigma_multiplier_var.get()
         self.lcdu_summary_var.set(
-            f"LCDU 样本：{sample_count} 条线\n"
+            f"LCDU（{source}）：{sample_count} 条线\n"
             f"LCDU：{multiplier * sigma:.3f} nm  ({multiplier:.1f}σ)，原始 σ={sigma:.3f} nm"
         )
 
     def refresh_lcdu_sample_list(self) -> None:
         if self.lcdu_sample_listbox is None:
             return
+        samples_nm, _source = self.active_lcdu_samples()
         selected = self.lcdu_sample_listbox.curselection()
         selected_index = selected[0] if selected else None
         self.lcdu_sample_listbox.delete(0, tk.END)
-        for index, mean_cd_nm in enumerate(self.lcdu_cd_samples_nm, start=1):
+        for index, mean_cd_nm in enumerate(samples_nm, start=1):
             self.lcdu_sample_listbox.insert(tk.END, f"{index:02d}. CD = {mean_cd_nm:.3f} nm")
-        if selected_index is not None and self.lcdu_cd_samples_nm:
-            next_index = min(selected_index, len(self.lcdu_cd_samples_nm) - 1)
+        if selected_index is not None and samples_nm:
+            next_index = min(selected_index, len(samples_nm) - 1)
             self.lcdu_sample_listbox.selection_set(next_index)
             self.lcdu_sample_listbox.activate(next_index)
 
     def add_lcdu_sample(self) -> None:
+        if self.era_aggregate_result is not None:
+            self.status_var.set("当前 ERA 的完整线样本已自动用于 LCDU，无需手动加入。")
+            return
         if self.result is None:
             messagebox.showinfo("暂无 CD", "请先分析一条线，再加入 LCDU 样本。")
             return
@@ -3050,11 +3974,17 @@ class LERLWRApp(AppBase):
         self.status_var.set(f"已加入当前线 CD={self.result.mean_width_nm:.3f} nm；LCDU 样本数 {len(self.lcdu_cd_samples_nm)}。")
 
     def clear_lcdu_samples(self) -> None:
+        if self.era_aggregate_result is not None:
+            self.status_var.set("当前显示的是 ERA 自动 LCDU；修改 ROI 或删除线样本后会自动更新。")
+            return
         self.lcdu_cd_samples_nm.clear()
         self.update_lcdu_summary_text()
         self.status_var.set("已清空 LCDU 样本。")
 
     def delete_selected_lcdu_sample(self, _event: tk.Event | None = None) -> str:
+        if self.era_aggregate_result is not None:
+            self.status_var.set("当前显示的是 ERA 自动 LCDU；请修改对应的线样本或 ROI。")
+            return "break"
         if self.lcdu_sample_listbox is None:
             return "break"
         selected = self.lcdu_sample_listbox.curselection()
@@ -3069,17 +3999,326 @@ class LERLWRApp(AppBase):
 
     def run_analysis(self) -> None:
         try:
-            pixel_size = float(self.pixel_size_var.get())
-            roi, left_offset, top_offset = self.selected_roi()
-            self.result = analyze_roi(roi, pixel_size, self.outlier_threshold_px())
-            self.analysis_origin = (left_offset, top_offset)
+            detector, diagonal, axial, kernel_size, high_threshold, threshold_ratio = self.edge_detector_parameters()
+            started_at = time.perf_counter()
+            if detector == EDGE_DETECTOR_ERA:
+                self.run_era_analysis()
+                self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
+                self.bcp_result = None
+                self.clear_bcp_completion_selection(redraw=False)
+                self.draw_image()
+                self.status_var.set("单边 ERA 分析完成；左右边仅按你保存到同一线样本的 ROI 配对。")
+                return
+            analysis_image, left_offset, top_offset, uses_roi = self.selected_ler_lwr_region()
+            region_name = "ROI 内" if uses_roi else "整图"
+            if detector == EDGE_DETECTOR_LAPLACIAN:
+                pixel_size = float(self.pixel_size_var.get())
+                self.clear_auto_line_candidates(redraw=False)
+                self.result = analyze_roi(
+                    analysis_image,
+                    pixel_size,
+                    self.outlier_threshold_px(),
+                    detector,
+                    diagonal,
+                    axial,
+                    high_threshold,
+                    threshold_ratio,
+                    kernel_size=kernel_size,
+                )
+                self.analysis_origin = (left_offset, top_offset)
+            else:
+                self.result = None
+                self.analysis_origin = None
+                self.clear_detected_edges(redraw=False)
+                self.detected_edge_mask = detect_full_image_edges(
+                    analysis_image,
+                    detector,
+                    diagonal,
+                    axial,
+                    high_threshold,
+                    threshold_ratio,
+                    self.edge_use_vertical_continuity_filter_var.get(),
+                    kernel_size=kernel_size,
+                )
+                self.detected_edge_origin = (left_offset, top_offset)
+                edge_count = int(np.count_nonzero(self.detected_edge_mask))
+                if edge_count == 0:
+                    raise ValueError("未识别到边缘；可调整检测器参数或图像处理设置。")
+                continuity_note = "已启用局部连续性筛除。" if self.edge_use_vertical_continuity_filter_var.get() else "未启用局部连续性筛除。"
+                self.result_var.set(
+                    f"{region_name}边缘识别：{edge_count} 个边缘像素\n"
+                    f"{continuity_note}\n\n"
+                    "当前只显示检测到的边缘，未配对为线条，\n"
+                    "因此尚未计算 CD、LER 或 LWR。"
+                )
+                self.status_var.set(f"{region_name}边缘识别完成：已显示 {edge_count} 个边缘像素；{continuity_note}")
+            self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_result = None
             self.clear_bcp_completion_selection(redraw=False)
             self.draw_image()
-            self.update_result_text()
-            self.status_var.set("分析完成。可调整 σ 倍数，或导出轨迹和结果。")
+            if detector == EDGE_DETECTOR_LAPLACIAN:
+                self.update_result_text()
+                self.status_var.set(f"拉普拉斯{region_name}分析完成。可调整 σ 倍数，或导出轨迹和结果。")
         except ValueError as exc:
             messagebox.showwarning("无法分析", str(exc))
+
+    def open_ler_lwr_dialog(self) -> None:
+        if self.raw_image is None:
+            messagebox.showinfo("暂无图像", "请先打开一张线条 SEM 图像。")
+            return
+        if self.ler_lwr_dialog is not None and self.ler_lwr_dialog.winfo_exists():
+            self.close_ler_lwr_dialog()
+            return
+        self.ler_lwr_dialog = tk.Toplevel(self)
+        self.ler_lwr_dialog.title("LER / LWR 测量")
+        dialog_height = min(700, max(460, self.winfo_screenheight() - 180))
+        self.ler_lwr_dialog.geometry(f"480x{dialog_height}")
+        self.ler_lwr_dialog.minsize(400, 420)
+        self.ler_lwr_dialog.transient(self)
+        self.ler_lwr_dialog.attributes("-topmost", True)
+        self.ler_lwr_dialog.lift(self)
+        self.ler_lwr_dialog.protocol("WM_DELETE_WINDOW", self.close_ler_lwr_dialog)
+        self.ler_lwr_dialog_scroll = VerticalScrollFrame(self.ler_lwr_dialog, padding=16)
+        self.ler_lwr_dialog_scroll.pack(fill=tk.BOTH, expand=True)
+        content = self.ler_lwr_dialog_scroll.content
+        ttk.Label(content, text="LER / LWR 测量", font=("Helvetica", 15, "bold")).pack(anchor="w")
+        ttk.Label(content, text="Scharr/Canny 只显示未配对边缘；拉普拉斯使用一个线 ROI。单边测量（ERA）则由你分别框选左右单边 ROI，绝不自动找边或配对。", wraplength=410).pack(anchor="w", pady=(7, 10))
+
+        roi_controls = ttk.LabelFrame(content, text="识别区域（可选 ROI）", padding=10)
+        roi_controls.pack(fill=tk.X)
+        ttk.Label(roi_controls, text="点击框选后回到主图拖动绿色框。保留框时，三种检测器都只处理框内；清除框后，三种检测器都处理整图。", wraplength=390).pack(anchor="w")
+        roi_buttons = ttk.Frame(roi_controls)
+        roi_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(roi_buttons, text="框选 / 调整 ROI", command=self.start_ler_lwr_roi_selection).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(roi_buttons, text="清除 ROI", command=self.clear_roi).pack(side=tk.LEFT)
+
+        detector_controls = ttk.LabelFrame(content, text="边缘检测", padding=10)
+        detector_controls.pack(fill=tk.X, pady=(10, 0))
+        detector_row = ttk.Frame(detector_controls)
+        detector_row.pack(anchor="w")
+        ttk.Label(detector_row, text="检测器：").pack(side=tk.LEFT)
+        detector_selector = ttk.Combobox(
+            detector_row,
+            textvariable=self.edge_detector_var,
+            state="readonly",
+            values=(EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY, EDGE_DETECTOR_LAPLACIAN, EDGE_DETECTOR_ERA),
+            width=16,
+        )
+        detector_selector.pack(side=tk.LEFT)
+        detector_selector.bind("<<ComboboxSelected>>", self.change_edge_detector)
+        era_controls = ttk.LabelFrame(content, text="单边测量（ERA）", padding=10)
+        era_controls.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(era_controls, text="输入为当前图像处理后的图像；此算法不额外做 5×7 或任何内部空间滤波。每个 ROI 仅覆盖一条边，只有同一线样本的左右两边才计算 CD/LWR。", wraplength=390).pack(anchor="w")
+        era_options = ttk.Frame(era_controls)
+        era_options.pack(anchor="w", pady=(8, 0))
+        ttk.Label(era_options, text="边缘方向：").pack(side=tk.LEFT)
+        ttk.Combobox(era_options, textvariable=self.era_polarity_var, state="readonly", values=ERA_POLARITIES, width=15).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Label(era_options, text="拟合次数：").pack(side=tk.LEFT)
+        ttk.Combobox(era_options, textvariable=self.era_polynomial_degree_var, state="readonly", values=("2", "3", "4"), width=3).pack(side=tk.LEFT, padx=(2, 0))
+        ttk.Label(era_controls, text="默认三次。四次是可选扩展：仅从拟合区内、方向正确且最接近导数重心的 0.5 交点中取一个。", foreground="#666666", wraplength=390).pack(anchor="w", pady=(5, 0))
+        era_buttons = ttk.Frame(era_controls)
+        era_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(era_buttons, text="新建线样本", command=self.new_era_line_sample).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(era_buttons, text="框选左边 ROI", command=lambda: self.start_era_roi_selection("left")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(era_buttons, text="框选右边 ROI", command=lambda: self.start_era_roi_selection("right")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(era_buttons, text="删除线样本", command=self.delete_selected_era_line_sample).pack(side=tk.LEFT)
+        self.era_sample_listbox = tk.Listbox(era_controls, height=4, exportselection=False)
+        self.era_sample_listbox.pack(fill=tk.X, pady=(8, 0))
+        self.era_sample_listbox.bind("<<ListboxSelect>>", self.select_era_line_sample)
+        self.refresh_era_sample_list()
+        kernel_size_row = ttk.Frame(detector_controls)
+        kernel_size_row.pack(anchor="w", pady=(7, 0))
+        ttk.Label(kernel_size_row, text="一阶核尺寸：").pack(side=tk.LEFT)
+        kernel_size_selector = ttk.Combobox(
+            kernel_size_row,
+            textvariable=self.edge_kernel_size_var,
+            state="readonly",
+            values=tuple(f"{size} × {size}" for size in FIRST_ORDER_KERNEL_SIZES),
+            width=8,
+        )
+        kernel_size_selector.pack(side=tk.LEFT)
+        kernel_size_selector.bind("<<ComboboxSelected>>", self.change_edge_kernel_size)
+        weight_row = ttk.Frame(detector_controls)
+        weight_row.pack(anchor="w", pady=(7, 0))
+        ttk.Label(weight_row, text="斜向权重：").pack(side=tk.LEFT)
+        diagonal_entry = ttk.Entry(weight_row, textvariable=self.edge_diagonal_weight_var, width=6)
+        diagonal_entry.pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(weight_row, text="轴向权重：").pack(side=tk.LEFT)
+        axial_entry = ttk.Entry(weight_row, textvariable=self.edge_axial_weight_var, width=6)
+        axial_entry.pack(side=tk.LEFT, padx=(2, 0))
+        canny_row = ttk.Frame(detector_controls)
+        canny_row.pack(fill=tk.X, pady=(7, 0))
+        ttk.Label(canny_row, text="Canny highTh：").grid(row=0, column=0, sticky="w")
+        ttk.Scale(
+            canny_row,
+            from_=0.01,
+            to=0.30,
+            orient=tk.HORIZONTAL,
+            variable=self.canny_high_threshold_var,
+            command=lambda _value: self.update_canny_thresholds(),
+            length=150,
+        ).grid(row=0, column=1, padx=(5, 6))
+        ttk.Label(canny_row, textvariable=self.canny_high_threshold_text_var, width=5).grid(row=0, column=2, sticky="w")
+        ttk.Label(canny_row, text="Canny Rio：").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Scale(
+            canny_row,
+            from_=2.0,
+            to=3.0,
+            orient=tk.HORIZONTAL,
+            variable=self.canny_threshold_ratio_var,
+            command=lambda _value: self.update_canny_thresholds(),
+            length=150,
+        ).grid(row=1, column=1, padx=(5, 6), pady=(4, 0))
+        ttk.Label(canny_row, textvariable=self.canny_threshold_ratio_text_var, width=5).grid(row=1, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(canny_row, text="lowTh（自动）：").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(canny_row, textvariable=self.canny_low_threshold_text_var, width=5).grid(row=2, column=1, sticky="w", padx=(5, 0), pady=(4, 0))
+        ttk.Checkbutton(
+            detector_controls,
+            text="去除孤立短噪声（可选）",
+            variable=self.edge_use_vertical_continuity_filter_var,
+        ).pack(anchor="w", pady=(8, 0))
+        ttk.Label(
+            detector_controls,
+            text="关闭：直接显示 Scharr/Canny 边缘。开启：仅保留在 41 px 高 × 3 px 宽区域内有至少 24 个边缘点的像素。",
+            foreground="#666666",
+            wraplength=390,
+        ).pack(anchor="w", pady=(2, 0))
+        for entry in (diagonal_entry, axial_entry):
+            entry.bind("<FocusOut>", self.update_edge_kernel_preview)
+            entry.bind("<Return>", self.update_edge_kernel_preview)
+        ttk.Label(detector_controls, textvariable=self.edge_kernel_preview_var, justify=tk.LEFT, font=("Menlo", 9)).pack(anchor="w", pady=(8, 0))
+        ttk.Label(detector_controls, text="3×3 保持原 Scharr/Sobel 核；5×5 以上在求梯度时扩大双项式平滑支撑，定位与 NMS 流程不变。Canny 的 lowTh 自动等于 highTh ÷ Rio，并对 NMS 响应进行 P99 鲁棒归一化后执行双阈值连接。", foreground="#666666", wraplength=390).pack(anchor="w", pady=(5, 0))
+
+        alignment = ttk.LabelFrame(content, text="倾角校正", padding=10)
+        alignment.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(alignment, text="自动校正仅针对拉普拉斯 ROI。Scharr/Canny 的边缘识别保留方向性；若图像整体倾斜，可使用主界面底部的手动旋转后重新识别。", wraplength=390).pack(anchor="w")
+        alignment_buttons = ttk.Frame(alignment)
+        alignment_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(alignment_buttons, text="自动校正 ROI 倾角", command=self.auto_align_roi).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(alignment_buttons, text="重置角度", command=self.reset_rotation).pack(side=tk.LEFT)
+
+        analysis = ttk.LabelFrame(content, text="执行分析", padding=10)
+        analysis.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(analysis, text="开始识别 / 分析", command=self.run_analysis).pack(anchor="w")
+        ttk.Label(analysis, text="结果会显示在主窗口右侧；ERA 有至少 2 根完整线样本时会自动计算 LCDU。", foreground="#666666", wraplength=390).pack(anchor="w", pady=(6, 0))
+
+        self.update_edge_kernel_preview()
+        if self.result is not None:
+            self.update_result_text()
+        else:
+            self.result_var.set("可选框选 ROI：有框识别框内，无框识别整图。Scharr/Canny 仅显示边缘；拉普拉斯计算 LER/LWR。")
+
+    def keep_ler_lwr_dialog_above_main(self, _event: tk.Event | None = None) -> None:
+        """Keep the non-modal measurement controls visible while the main canvas has focus."""
+        dialog = self.ler_lwr_dialog
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift(self)
+
+    def close_ler_lwr_dialog(self) -> None:
+        self.ler_lwr_roi_mode = False
+        if self.ler_lwr_dialog is not None and self.ler_lwr_dialog.winfo_exists():
+            self.ler_lwr_dialog.destroy()
+        self.ler_lwr_dialog = None
+        self.ler_lwr_dialog_scroll = None
+        self.era_sample_listbox = None
+
+    def start_ler_lwr_roi_selection(self) -> None:
+        self.ler_lwr_roi_mode = True
+        self.active_annotation_index = None
+        self.status_var.set("LER/LWR ROI 框选已启用：请在主图像上拖动选择识别区域。")
+        self.canvas.configure(cursor="crosshair")
+
+    def change_edge_detector(self, _event: tk.Event | None = None) -> None:
+        defaults = {
+            EDGE_DETECTOR_SCHARR: ("3", "10"),
+            EDGE_DETECTOR_CANNY: ("1", "2"),
+            EDGE_DETECTOR_LAPLACIAN: ("0", "1"),
+            EDGE_DETECTOR_ERA: ("0", "1"),
+        }
+        diagonal, axial = defaults[self.edge_detector_var.get()]
+        self.edge_diagonal_weight_var.set(diagonal)
+        self.edge_axial_weight_var.set(axial)
+        self.update_edge_kernel_preview()
+        self.result = None
+        self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
+        self.draw_image()
+
+    def edge_kernel_size(self) -> int:
+        return int(self.edge_kernel_size_var.get().split()[0])
+
+    def change_edge_kernel_size(self, _event: tk.Event | None = None) -> None:
+        self.update_edge_kernel_preview()
+        self.result = None
+        self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
+        self.draw_image()
+
+    def update_canny_thresholds(self) -> None:
+        high = self.canny_high_threshold_var.get()
+        ratio = self.canny_threshold_ratio_var.get()
+        low = high / ratio
+        self.canny_high_threshold_text_var.set(f"{high:.3f}")
+        self.canny_threshold_ratio_text_var.set(f"{ratio:.2f}")
+        self.canny_low_threshold_text_var.set(f"{low:.3f}")
+        self.update_edge_kernel_preview()
+
+    def edge_detector_parameters(self) -> tuple[str, float, float, int, float, float]:
+        try:
+            diagonal = float(self.edge_diagonal_weight_var.get())
+            axial = float(self.edge_axial_weight_var.get())
+            high = float(self.canny_high_threshold_var.get())
+            ratio = float(self.canny_threshold_ratio_var.get())
+        except ValueError as exc:
+            raise ValueError("边缘检测权重、Canny highTh 和 Rio 必须为数字。") from exc
+        if diagonal < 0 or axial <= 0:
+            raise ValueError("卷积核权重必须满足：斜向权重 ≥ 0，轴向权重 > 0。")
+        kernel_size = self.edge_kernel_size()
+        if kernel_size not in FIRST_ORDER_KERNEL_SIZES:
+            raise ValueError("一阶卷积核尺寸无效。")
+        if not 0 < high <= 1 or ratio <= 1:
+            raise ValueError("Canny 参数必须满足：0 < highTh ≤ 1，Rio > 1。")
+        return self.edge_detector_var.get(), diagonal, axial, kernel_size, high, ratio
+
+    def update_edge_kernel_preview(self, _event: tk.Event | None = None) -> None:
+        try:
+            detector, diagonal, axial, kernel_size, high, ratio = self.edge_detector_parameters()
+        except ValueError:
+            self.edge_kernel_preview_var.set("请输入有效的卷积核权重与 Canny 阈值。")
+            return
+        if detector == EDGE_DETECTOR_LAPLACIAN:
+            center = -4 * axial - 4 * diagonal
+            rows = ((diagonal, axial, diagonal), (axial, center, axial), (diagonal, axial, diagonal))
+            self.edge_kernel_preview_var.set("拉普拉斯核\n" + "\n".join("  ".join(f"{value:g}" for value in row) for row in rows))
+            return
+        if detector == EDGE_DETECTOR_ERA:
+            self.edge_kernel_preview_var.set(
+                "ERA 单边拟合\n"
+                "不使用 Scharr/Sobel/Laplacian 卷积核，也不执行额外空间滤波。\n"
+                "每行在用户框选的单边 ROI 内：导数重心 → 多项式拟合 → 0.5 交点。"
+            )
+            return
+        kernel_x, kernel_y = first_order_kernels(detector, diagonal, axial, kernel_size)
+        label = "Scharr" if detector == EDGE_DETECTOR_SCHARR else "Canny 的 Sobel"
+        format_kernel = lambda kernel: "\n".join("  ".join(f"{value:g}" for value in row) for row in kernel)
+        threshold_note = f"\nhighTh / Rio / lowTh：{high:.3f} / {ratio:.2f} / {high / ratio:.3f}" if detector == EDGE_DETECTOR_CANNY else ""
+        self.edge_kernel_preview_var.set(
+            f"{label} {kernel_size}×{kernel_size} Gx\n{format_kernel(kernel_x)}\nGy\n{format_kernel(kernel_y)}"
+            f"{threshold_note}\nROI / 整图识别：无角度限制；短噪声筛除可选"
+        )
+
+    def build_lcdu_controls(self, parent: tk.Misc) -> None:
+        ttk.Label(parent, textvariable=self.lcdu_summary_var, justify=tk.LEFT).pack(anchor="w", fill=tk.X)
+        buttons = ttk.Frame(parent)
+        buttons.pack(anchor="w", pady=(6, 0))
+        ttk.Button(buttons, text="加入当前线 CD", command=self.add_lcdu_sample).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="删除选中样本", command=self.delete_selected_lcdu_sample).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(buttons, text="清空 LCDU 样本", command=self.clear_lcdu_samples).pack(side=tk.LEFT)
+        self.lcdu_sample_listbox = tk.Listbox(parent, height=5, exportselection=False)
+        self.lcdu_sample_listbox.pack(fill=tk.X, pady=(8, 0))
+        self.lcdu_sample_listbox.bind("<Delete>", self.delete_selected_lcdu_sample)
+        self.lcdu_sample_listbox.bind("<BackSpace>", self.delete_selected_lcdu_sample)
+        self.update_lcdu_summary_text()
 
     def open_bcp_recognition_dialog(self) -> None:
         if self.raw_image is None:
@@ -3093,11 +4332,14 @@ class LERLWRApp(AppBase):
         dialog_height = min(760, max(500, self.winfo_screenheight() - 160))
         self.bcp_dialog.geometry(f"500x{dialog_height}")
         self.bcp_dialog.minsize(420, 420)
-        self.bcp_dialog.transient(self)
         self.bcp_dialog.protocol("WM_DELETE_WINDOW", self.close_bcp_recognition_dialog)
         self.bcp_dialog_scroll = VerticalScrollFrame(self.bcp_dialog, padding=16)
         self.bcp_dialog_scroll.pack(fill=tk.BOTH, expand=True)
         content = self.bcp_dialog_scroll.content
+        if self.bcp_result is not None:
+            self.update_bcp_result_text()
+        else:
+            self.result_var.set("请设置样本或圆柱大致直径，然后点击“开始识别”。")
         ttk.Label(content, text="BCP 点阵识别", font=("Helvetica", 15, "bold")).pack(anchor="w")
         ttk.Label(content, text="自动识别可使用 DoG 或原始亮暗强度，再经局部分割、二值连通区域和轮廓描绘完成；样本和局部分割均为可选辅助。", wraplength=430).pack(anchor="w", pady=(8, 8))
 
@@ -3157,6 +4399,7 @@ class LERLWRApp(AppBase):
         recognition_buttons.pack(anchor="w", pady=(10, 0))
         ttk.Button(recognition_buttons, text="开始识别", command=self.perform_bcp_analysis).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(recognition_buttons, text="清除当前结果", command=self.clear_bcp_analysis).pack(side=tk.LEFT)
+        ttk.Label(recognition, textvariable=self.result_var, justify=tk.LEFT, wraplength=410).pack(anchor="w", fill=tk.X, pady=(10, 0))
 
         completion = ttk.LabelFrame(content, text="局部补漏（保留已识别区域）", padding=10)
         completion.pack(fill=tk.X, pady=(10, 0))
@@ -3208,20 +4451,6 @@ class LERLWRApp(AppBase):
             variable=self.bcp_centroid_layout_overlay_var,
             command=self.refresh_bcp_line_display,
         ).pack(anchor="w", pady=(5, 0))
-        pitch_sigma_controls = ttk.Frame(line_display)
-        pitch_sigma_controls.pack(anchor="w", pady=(6, 0))
-        ttk.Label(pitch_sigma_controls, text="Pitch 波动显示：").pack(side=tk.LEFT)
-        pitch_sigma_selector = ttk.Combobox(
-            pitch_sigma_controls,
-            textvariable=self.bcp_pitch_sigma_multiplier_var,
-            state="readonly",
-            values=("0.5", "1", "2", "3", "4", "5", "6"),
-            width=4,
-        )
-        pitch_sigma_selector.pack(side=tk.LEFT, padx=(2, 3))
-        pitch_sigma_selector.bind("<<ComboboxSelected>>", self.refresh_bcp_pitch_sigma_display)
-        ttk.Label(pitch_sigma_controls, text="σ（默认 1）").pack(side=tk.LEFT)
-
         overlay_style = ttk.LabelFrame(content, text="BCP 线条样式（画面/导出）", padding=8)
         overlay_style.pack(fill=tk.X, pady=(10, 0))
         ttk.Label(overlay_style, text="仅改变显示和导出，不改变识别、CD 或 Pitch。", foreground="#666666").pack(anchor="w")
@@ -3356,7 +4585,7 @@ class LERLWRApp(AppBase):
                 self.bcp_use_dog_var.get(),
                 internal_hole_fraction,
             )
-            self.bcp_recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
+            self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_metrics_finalized = False
             self.bcp_reference_display_var.set(False)
         except ValueError as exc:
@@ -3364,6 +4593,7 @@ class LERLWRApp(AppBase):
             return
         self.result = None
         self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
         self.clear_bcp_completion_selection(redraw=False)
         self.rebuild_bcp_preview()
         self.draw_image()
@@ -3556,6 +4786,7 @@ class LERLWRApp(AppBase):
         self.bcp_metrics_finalized = False
         self.result = None
         self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
         self.clear_bcp_manual_split(redraw=False)
         self.draw_image()
         self.update_bcp_result_text()
@@ -3589,13 +4820,14 @@ class LERLWRApp(AppBase):
                 updated_result, added_in_region = append_bcp_completion(updated_result, candidates, selection_mask)
                 added += added_in_region
             self.bcp_result = updated_result
-            self.bcp_recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
+            self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_metrics_finalized = False
         except ValueError as exc:
             messagebox.showwarning("无法局部补漏", str(exc))
             return
         self.result = None
         self.analysis_origin = None
+        self.clear_auto_line_candidates(redraw=False)
         self.draw_image()
         self.update_bcp_result_text()
         selected_region_count = len(self.bcp_completion_polygons_px)
@@ -3665,16 +4897,6 @@ class LERLWRApp(AppBase):
     def refresh_bcp_line_display(self) -> None:
         if self.bcp_metrics_finalized:
             self.draw_image()
-            self.update_bcp_result_text()
-
-    def bcp_pitch_sigma_multiplier(self) -> float:
-        try:
-            return float(np.clip(float(self.bcp_pitch_sigma_multiplier_var.get()), 0.5, 6.0))
-        except ValueError:
-            return 1.0
-
-    def refresh_bcp_pitch_sigma_display(self, _event: tk.Event | None = None) -> None:
-        if self.bcp_metrics_finalized:
             self.update_bcp_result_text()
 
     def bcp_overlay_line_width(self, value: tk.StringVar) -> int:
@@ -3748,20 +4970,47 @@ class LERLWRApp(AppBase):
 
     def render_analysis_overlay(self) -> None:
         self.canvas.delete("edge")
+        if self.detected_edge_mask is not None:
+            overlay = np.zeros((*self.detected_edge_mask.shape, 4), dtype=np.uint8)
+            overlay[self.detected_edge_mask] = (0, 229, 255, 180)
+            display_size = (
+                max(1, round(self.detected_edge_mask.shape[1] * self.display_scale)),
+                max(1, round(self.detected_edge_mask.shape[0] * self.display_scale)),
+            )
+            rendered = Image.fromarray(overlay, "RGBA").resize(display_size, Image.Resampling.NEAREST)
+            self.detected_edge_overlay = ImageTk.PhotoImage(rendered)
+            left, top = self.detected_edge_origin
+            self.canvas.create_image(
+                left * self.display_scale,
+                top * self.display_scale,
+                image=self.detected_edge_overlay,
+                anchor=tk.NW,
+                tags="edge",
+            )
+            return
         if self.result is None or self.analysis_origin is None:
             return
-        result = self.result
-        left_offset, top_offset = self.analysis_origin
+        if self.result.edge_detector == EDGE_DETECTOR_ERA:
+            scale = self.display_scale
+            for sample in self.era_line_samples:
+                for edge, color in ((sample.left_edge, self.fit_left_color), (sample.right_edge, self.fit_right_color)):
+                    if edge is None or len(edge.rows_px) < 2:
+                        continue
+                    points = [coordinate for row, position in zip(edge.rows_px, edge.edge_px) for coordinate in (position * scale, row * scale)]
+                    self.canvas.create_line(*points, fill=color, width=self.fit_line_width(), tags="edge")
+            return
+        overlays = [(self.result, self.analysis_origin)]
         scale = self.display_scale
-        points_left = []
-        points_right = []
-        for row, left, right in zip(result.rows_px, result.left_px, result.right_px):
-            points_left.extend([(left + left_offset) * scale, (row + top_offset) * scale])
-            points_right.extend([(right + left_offset) * scale, (row + top_offset) * scale])
-        if len(points_left) >= 4:
-            self.canvas.create_line(*points_left, fill=self.fit_left_color, width=self.fit_line_width(), tags="edge")
-        if len(points_right) >= 4:
-            self.canvas.create_line(*points_right, fill=self.fit_right_color, width=self.fit_line_width(), tags="edge")
+        for result, (left_offset, top_offset) in overlays:
+            points_left = []
+            points_right = []
+            for row, left, right in zip(result.rows_px, result.left_px, result.right_px):
+                points_left.extend([(left + left_offset) * scale, (row + top_offset) * scale])
+                points_right.extend([(right + left_offset) * scale, (row + top_offset) * scale])
+            if len(points_left) >= 4:
+                self.canvas.create_line(*points_left, fill=self.fit_left_color, width=self.fit_line_width(), tags="edge")
+            if len(points_right) >= 4:
+                self.canvas.create_line(*points_right, fill=self.fit_right_color, width=self.fit_line_width(), tags="edge")
 
     def render_bcp_overlay(self) -> None:
         self.canvas.delete("bcp")
@@ -4029,6 +5278,9 @@ class LERLWRApp(AppBase):
     def update_result_text(self) -> None:
         if self.result is None:
             return
+        if self.result.edge_detector == EDGE_DETECTOR_ERA:
+            self.update_era_result_text()
+            return
         multiplier = self.sigma_multiplier_var.get()
         result = self.result
         self.result_var.set(
@@ -4046,7 +5298,8 @@ class LERLWRApp(AppBase):
             f"平均线宽  {result.mean_width_nm:.3f} nm\n"
             f"有效点数  {len(result.rows_px)}\n"
             f"剔除点数  {result.rejected_rows}\n"
-            f"剔除阈值  {self.outlier_threshold_px():.0f} px"
+            f"剔除阈值  {self.outlier_threshold_px():.0f} px\n"
+            f"边缘检测  {result.edge_detector}（{result.edge_kernel_size}×{result.edge_kernel_size}）"
         )
 
     def update_bcp_result_text(self) -> None:
@@ -4071,12 +5324,21 @@ class LERLWRApp(AppBase):
         cd_mean, cd_standard_error = mean_and_standard_error(result.cd_means_px * scale)
         grain_labels = bcp_grain_labels(result.centers_px)
         grain_count = len(np.unique(grain_labels[grain_labels >= 0]))
-        pitch_sigma_multiplier = self.bcp_pitch_sigma_multiplier()
+        pitch_sigma_multiplier = self.sigma_multiplier_var.get()
         pitch_lines = []
         for label in PITCH_DIRECTION_LABELS:
             pitch_mean, pitch_sigma_spread = mean_and_sigma_spread(result.pitch_values_by_direction_px[label] * scale, pitch_sigma_multiplier)
             value = "无有效边" if not np.isfinite(pitch_mean) else f"{pitch_mean:.3f} ± {pitch_sigma_spread:.3f} {unit}（{pitch_sigma_multiplier:g}σ）"
             pitch_lines.append(f"Pitch {label:<7} {value}")
+        total_pitch_mean, total_pitch_sigma_spread = mean_and_sigma_spread(
+            all_directional_pitch_values(result.pitch_values_by_direction_px) * scale,
+            pitch_sigma_multiplier,
+        )
+        total_pitch_value = (
+            "无有效边"
+            if not np.isfinite(total_pitch_mean)
+            else f"{total_pitch_mean:.3f} ± {total_pitch_sigma_spread:.3f} {unit}（{pitch_sigma_multiplier:g}σ）"
+        )
         self.result_var.set(
             "BCP 垂直点阵识别\n\n"
             f"识别点数        {len(result.centers_px)}\n"
@@ -4088,6 +5350,7 @@ class LERLWRApp(AppBase):
             f"区域短轴均值    {mean_minor:.3f} {unit}\n"
             f"最近邻间距      {spacing:.3f} {unit}\n"
             + "\n".join(pitch_lines)
+            + f"\nPitch 总平均    {total_pitch_value}"
             + "\n\n"
             + f"三角网边数      {len(result.triangulation_segments_px)}\n"
             f"晶界候选线段    {len(result.boundary_segments_px)}\n"
@@ -4116,6 +5379,7 @@ class LERLWRApp(AppBase):
             self.gaussian_denoise_var.get(),
             self.gaussian_kernel_size(),
             self.gaussian_sigma_scale(),
+            self.blur_method_var.get(),
         )
         target = filedialog.asksaveasfilename(
             title="保存拟合图片",
@@ -4130,6 +5394,7 @@ class LERLWRApp(AppBase):
         output = Image.fromarray(image).convert("RGB")
         self.apply_exported_bcp_grain_overlay(output, width, height)
         self.apply_exported_bcp_centroid_layout_overlay(output, width, height)
+        self.apply_exported_edge_detection_overlay(output, width, height)
         draw = ImageDraw.Draw(output)
         if self.roi_canvas is not None and self.display_scale > 0:
             x0, y0, x1, y1 = (value / self.display_scale for value in self.roi_canvas)
@@ -4140,25 +5405,25 @@ class LERLWRApp(AppBase):
                 height,
             )
             draw.line(roi_points, fill=(0, 255, 102), width=2)
+        for sample in self.era_line_samples:
+            for bounds, color in ((sample.left_roi_bounds_px, self.fit_left_color), (sample.right_roi_bounds_px, self.fit_right_color)):
+                if bounds is None:
+                    continue
+                left, top, right, bottom = bounds
+                roi_points = rotate_points_about_center(
+                    [(left, top), (right, top), (right, bottom), (left, bottom), (left, top)],
+                    -self.rotation_degrees,
+                    width,
+                    height,
+                )
+                draw.line(roi_points, fill=color, width=1)
 
         self.draw_exported_annotations(draw, width, height)
         if self.result is not None and self.analysis_origin is not None:
-            result = self.result
-            left_offset, top_offset = self.analysis_origin
-            left_points_rotated = [
-                (float(left + left_offset), float(row + top_offset))
-                for row, left in zip(result.rows_px, result.left_px)
-            ]
-            right_points_rotated = [
-                (float(right + left_offset), float(row + top_offset))
-                for row, right in zip(result.rows_px, result.right_px)
-            ]
-            left_points = rotate_points_about_center(left_points_rotated, -self.rotation_degrees, width, height)
-            right_points = rotate_points_about_center(right_points_rotated, -self.rotation_degrees, width, height)
-            if len(left_points) >= 2:
-                draw.line(left_points, fill=self.fit_left_color, width=self.fit_line_width())
-            if len(right_points) >= 2:
-                draw.line(right_points, fill=self.fit_right_color, width=self.fit_line_width())
+            if self.result.edge_detector == EDGE_DETECTOR_ERA:
+                self.draw_exported_era_edges(draw, width, height)
+            else:
+                self.draw_exported_analysis_edges(draw, self.result, self.analysis_origin, width, height)
         self.draw_exported_bcp(draw, width, height)
 
         try:
@@ -4167,6 +5432,64 @@ class LERLWRApp(AppBase):
             messagebox.showerror("导出失败", str(exc))
             return
         self.status_var.set(f"已导出拟合图片：{target}")
+
+    def draw_exported_analysis_edges(
+        self,
+        draw: ImageDraw.ImageDraw,
+        result: AnalysisResult,
+        origin: tuple[int, int],
+        width: int,
+        height: int,
+    ) -> None:
+        left_offset, top_offset = origin
+        left_points_rotated = [
+            (float(left + left_offset), float(row + top_offset))
+            for row, left in zip(result.rows_px, result.left_px)
+        ]
+        right_points_rotated = [
+            (float(right + left_offset), float(row + top_offset))
+            for row, right in zip(result.rows_px, result.right_px)
+        ]
+        left_points = rotate_points_about_center(left_points_rotated, -self.rotation_degrees, width, height)
+        right_points = rotate_points_about_center(right_points_rotated, -self.rotation_degrees, width, height)
+        if len(left_points) >= 2:
+            draw.line(left_points, fill=self.fit_left_color, width=self.fit_line_width())
+        if len(right_points) >= 2:
+            draw.line(right_points, fill=self.fit_right_color, width=self.fit_line_width())
+
+    def draw_exported_era_edges(self, draw: ImageDraw.ImageDraw, width: int, height: int) -> None:
+        """Export every independently selected ERA edge in original image orientation."""
+        for sample in self.era_line_samples:
+            for edge, color in ((sample.left_edge, self.fit_left_color), (sample.right_edge, self.fit_right_color)):
+                if edge is None:
+                    continue
+                points = rotate_points_about_center(
+                    [(float(position), float(row)) for row, position in zip(edge.rows_px, edge.edge_px)],
+                    -self.rotation_degrees,
+                    width,
+                    height,
+                )
+                if len(points) >= 2:
+                    draw.line(points, fill=color, width=self.fit_line_width())
+
+    def apply_exported_edge_detection_overlay(self, output: Image.Image, width: int, height: int) -> None:
+        """Blend the unpaired edge mask, including an optional ROI offset, into the export."""
+        if self.detected_edge_mask is None:
+            return
+        overlay_pixels = np.zeros((height, width, 4), dtype=np.uint8)
+        left, top = self.detected_edge_origin
+        mask_height, mask_width = self.detected_edge_mask.shape
+        right = min(width, left + mask_width)
+        bottom = min(height, top + mask_height)
+        if right <= left or bottom <= top:
+            return
+        visible_mask = self.detected_edge_mask[: bottom - top, : right - left]
+        region = overlay_pixels[top:bottom, left:right]
+        region[visible_mask] = (0, 229, 255, 180)
+        overlay = Image.fromarray(overlay_pixels, "RGBA")
+        if self.rotation_degrees:
+            overlay = overlay.rotate(-self.rotation_degrees, resample=Image.Resampling.NEAREST, expand=False)
+        output.paste(overlay, (0, 0), overlay)
 
     def apply_exported_bcp_grain_overlay(self, output: Image.Image, width: int, height: int) -> None:
         """Blend the optional working-image grain layer back into original orientation."""
@@ -4300,15 +5623,41 @@ class LERLWRApp(AppBase):
                 writer.writerow(["outlier_rejection_threshold_px", self.outlier_threshold_px()])
                 if self.result is not None:
                     result = self.result
-                    writer.writerow(["ler_left_sigma_nm", result.ler_left_sigma_nm])
-                    writer.writerow(["ler_right_sigma_nm", result.ler_right_sigma_nm])
-                    writer.writerow(["lwr_sigma_nm", result.lwr_sigma_nm])
-                    writer.writerow(["total_ler_sigma_nm", result.total_ler_sigma_nm])
-                    writer.writerow(["edge_correlation_rho", result.edge_correlation])
-                    writer.writerow(["ler_left_display_nm", multiplier * result.ler_left_sigma_nm])
-                    writer.writerow(["ler_right_display_nm", multiplier * result.ler_right_sigma_nm])
-                    writer.writerow(["lwr_display_nm", multiplier * result.lwr_sigma_nm])
-                    writer.writerow(["mean_width_nm", result.mean_width_nm])
+                    aggregate = self.era_aggregate_result if result.edge_detector == EDGE_DETECTOR_ERA else None
+                    reported_ler_left = aggregate.ler_left_sigma_nm if aggregate is not None else result.ler_left_sigma_nm
+                    reported_ler_right = aggregate.ler_right_sigma_nm if aggregate is not None else result.ler_right_sigma_nm
+                    reported_lwr = aggregate.lwr_sigma_nm if aggregate is not None else result.lwr_sigma_nm
+                    reported_total_ler = aggregate.total_ler_sigma_nm if aggregate is not None else result.total_ler_sigma_nm
+                    reported_correlation = aggregate.edge_correlation if aggregate is not None else result.edge_correlation
+                    reported_mean_width = aggregate.mean_width_nm if aggregate is not None else result.mean_width_nm
+                    writer.writerow(["edge_detector", result.edge_detector])
+                    if result.edge_detector == EDGE_DETECTOR_ERA:
+                        writer.writerow(["era_input", "current_preprocessed_image_no_internal_spatial_filter"])
+                        writer.writerow(["era_polynomial_degree", self.era_polynomial_degree()])
+                        writer.writerow(["era_requested_polarity", self.era_polarity_var.get()])
+                        writer.writerow(["era_difference_weight_power", ERA_DIFFERENCE_POWER])
+                        if self.era_aggregate_result is not None:
+                            aggregate = self.era_aggregate_result
+                            writer.writerow(["era_complete_line_count", aggregate.line_count])
+                            writer.writerow(["era_total_common_valid_points", aggregate.point_count])
+                            writer.writerow(["era_mean_cd_nm", aggregate.mean_width_nm])
+                    else:
+                        writer.writerow(["edge_detector_kernel_size_px", result.edge_kernel_size])
+                        writer.writerow(["edge_detector_diagonal_weight", result.edge_diagonal_weight])
+                        writer.writerow(["edge_detector_axial_weight", result.edge_axial_weight])
+                        writer.writerow(["canny_high_threshold", result.canny_high_threshold])
+                        writer.writerow(["canny_threshold_ratio", result.canny_threshold_ratio])
+                        writer.writerow(["canny_low_threshold", result.canny_low_threshold])
+                        writer.writerow(["canny_normalization_scale_p99", result.canny_normalization_scale])
+                    writer.writerow(["ler_left_sigma_nm", reported_ler_left])
+                    writer.writerow(["ler_right_sigma_nm", reported_ler_right])
+                    writer.writerow(["lwr_sigma_nm", reported_lwr])
+                    writer.writerow(["total_ler_sigma_nm", reported_total_ler])
+                    writer.writerow(["edge_correlation_rho", reported_correlation])
+                    writer.writerow(["ler_left_display_nm", multiplier * reported_ler_left])
+                    writer.writerow(["ler_right_display_nm", multiplier * reported_ler_right])
+                    writer.writerow(["lwr_display_nm", multiplier * reported_lwr])
+                    writer.writerow(["mean_width_nm", reported_mean_width])
                 if self.bcp_result is not None:
                     bcp = self.bcp_result
                     bcp_scale = bcp.pixel_size_nm if np.isfinite(bcp.pixel_size_nm) else 1.0
@@ -4323,7 +5672,7 @@ class LERLWRApp(AppBase):
                     writer.writerow(["bcp_cd_standard_error", cd_standard_error])
                     writer.writerow(["bcp_lattice_spacing", bcp.lattice_spacing_px * bcp_scale])
                     writer.writerow(["bcp_delaunay_edge_count", len(bcp.triangulation_segments_px)])
-                    pitch_sigma_multiplier = self.bcp_pitch_sigma_multiplier()
+                    pitch_sigma_multiplier = multiplier
                     writer.writerow(["bcp_pitch_sigma_multiplier", pitch_sigma_multiplier])
                     for label in PITCH_DIRECTION_LABELS:
                         pitch_values = bcp.pitch_values_by_direction_px[label] * bcp_scale
@@ -4332,15 +5681,23 @@ class LERLWRApp(AppBase):
                         writer.writerow([f"bcp_pitch_{label}_mean", pitch_mean])
                         writer.writerow([f"bcp_pitch_{label}_1sigma", pitch_one_sigma])
                         writer.writerow([f"bcp_pitch_{label}_display_spread", pitch_display_spread])
+                    total_pitch_values = all_directional_pitch_values(bcp.pitch_values_by_direction_px) * bcp_scale
+                    total_pitch_mean, total_pitch_one_sigma = mean_and_sigma_spread(total_pitch_values, 1.0)
+                    _, total_pitch_display_spread = mean_and_sigma_spread(total_pitch_values, pitch_sigma_multiplier)
+                    writer.writerow(["bcp_pitch_total_mean", total_pitch_mean])
+                    writer.writerow(["bcp_pitch_total_1sigma", total_pitch_one_sigma])
+                    writer.writerow(["bcp_pitch_total_display_spread", total_pitch_display_spread])
                     writer.writerow(["bcp_grain_boundary_segment_count", len(bcp.boundary_segments_px)])
                     writer.writerow(["bcp_reference_sample_count", len(self.bcp_reference_circles)])
+                lcdu_samples_nm, lcdu_source = self.active_lcdu_samples()
                 lcdu_sigma = self.lcdu_sigma_nm()
-                writer.writerow(["multi_line_lcdu_sample_count", len(self.lcdu_cd_samples_nm)])
+                writer.writerow(["multi_line_lcdu_source", lcdu_source])
+                writer.writerow(["multi_line_lcdu_sample_count", len(lcdu_samples_nm)])
                 writer.writerow(["multi_line_lcdu_sigma_nm", "" if lcdu_sigma is None else lcdu_sigma])
                 writer.writerow(["multi_line_lcdu_display_nm", "" if lcdu_sigma is None else multiplier * lcdu_sigma])
                 writer.writerow([])
                 writer.writerow(["multi_line_lcdu_sample_index", "mean_cd_nm"])
-                for index, mean_cd_nm in enumerate(self.lcdu_cd_samples_nm, start=1):
+                for index, mean_cd_nm in enumerate(lcdu_samples_nm, start=1):
                     writer.writerow([index, mean_cd_nm])
                 writer.writerow([])
                 writer.writerow(["annotation_index", "type", "x0_px", "y0_px", "x1_px", "y1_px", "display_label"])
@@ -4374,19 +5731,28 @@ class LERLWRApp(AppBase):
                     for index, circle in enumerate(self.bcp_reference_circles, start=1):
                         writer.writerow([index, *circle])
                 if self.result is not None:
-                    result = self.result
-                    writer.writerow([])
-                    writer.writerow(["row_px", "left_edge_px", "right_edge_px", "left_residual_nm", "right_residual_nm", "width_nm", "width_residual_nm"])
-                    for row in zip(
-                        result.rows_px,
-                        result.left_px,
-                        result.right_px,
-                        result.left_residual_nm,
-                        result.right_residual_nm,
-                        result.width_nm,
-                        result.width_residual_nm,
-                    ):
-                        writer.writerow(row)
+                    if self.result.edge_detector == EDGE_DETECTOR_ERA:
+                        writer.writerow([])
+                        writer.writerow(["era_line_index", "side", "roi_left_px", "roi_top_px", "roi_right_px", "roi_bottom_px", "polarity", "polynomial_degree", "row_px", "edge_px", "edge_residual_nm"])
+                        for line_index, sample in enumerate(self.era_line_samples, start=1):
+                            for side, edge in (("left", sample.left_edge), ("right", sample.right_edge)):
+                                if edge is None:
+                                    continue
+                                for row, position, residual in zip(edge.rows_px, edge.edge_px, edge.residual_nm):
+                                    writer.writerow([line_index, side, *edge.roi_bounds_px, edge.polarity, edge.polynomial_degree, row, position, residual])
+                        writer.writerow([])
+                        writer.writerow(["era_line_index", "mean_cd_nm", "ler_left_sigma_nm", "ler_right_sigma_nm", "lwr_sigma_nm", "common_valid_point_count"])
+                        for line_index, sample in enumerate(self.era_line_samples, start=1):
+                            if sample.paired_result is None:
+                                continue
+                            paired = sample.paired_result
+                            writer.writerow([line_index, paired.mean_width_nm, paired.ler_left_sigma_nm, paired.ler_right_sigma_nm, paired.lwr_sigma_nm, len(paired.rows_px)])
+                    else:
+                        result = self.result
+                        writer.writerow([])
+                        writer.writerow(["row_px", "left_edge_px", "right_edge_px", "left_residual_nm", "right_residual_nm", "width_nm", "width_residual_nm"])
+                        for row in zip(result.rows_px, result.left_px, result.right_px, result.left_residual_nm, result.right_residual_nm, result.width_nm, result.width_residual_nm):
+                            writer.writerow(row)
         except OSError as exc:
             messagebox.showerror("导出失败", str(exc))
             return
