@@ -115,6 +115,12 @@ DEFAULT_BCP_CENTROID_DIAMETER = "6"
 DEFAULT_FIT_LEFT_COLOR = "#00e5ff"
 DEFAULT_FIT_RIGHT_COLOR = "#ffb000"
 DEFAULT_FIT_LINE_WIDTH = "2"
+FFT_MIN_SIDE_PX = 16
+FFT_VIEW_MAX_SIDE_PX = 360
+FFT_COORDINATE_VIEW_SIZE = (360, 210)
+FFT_WINDOW_HANN = "Hann 窗（推荐）"
+FFT_WINDOW_NONE = "不加窗"
+FFT_WINDOW_OPTIONS = (FFT_WINDOW_HANN, FFT_WINDOW_NONE)
 
 
 class VerticalScrollFrame(ttk.Frame):
@@ -222,6 +228,33 @@ class EraAggregateResult:
     lwr_sigma_nm: float
     total_ler_sigma_nm: float
     edge_correlation: float
+
+
+@dataclass
+class FFTAnalysisResult:
+    """Centered two-dimensional FFT values for one working-image region.
+
+    Frequency axes use cycles/nm when a positive calibration is available;
+    otherwise they use cycles/pixel.  Intensity is the unnormalised power
+    spectrum, retained so the CSV is quantitative rather than display-only.
+    """
+
+    frequencies_x: np.ndarray
+    frequencies_y: np.ndarray
+    magnitude: np.ndarray
+    intensity: np.ndarray
+    phase_radians: np.ndarray
+    source_image: np.ndarray
+    reconstruction_coefficients: np.ndarray
+    frequency_keep_mask: np.ndarray
+    spectrum_display: np.ndarray
+    phase_display: np.ndarray
+    reconstructed_image: np.ndarray | None
+    reconstruction_display: np.ndarray | None
+    roi_bounds_px: tuple[int, int, int, int]
+    source_shape_px: tuple[int, int]
+    coordinate_unit: str
+    window_name: str
 
 
 @dataclass
@@ -412,6 +445,206 @@ def preprocess_image(
 def normalize_and_denoise(image: np.ndarray) -> np.ndarray:
     """Keep the former public helper available with the new 3×3 default."""
     return preprocess_image(image, normalize=True, gaussian_denoise=True, gaussian_size=3)
+
+
+def fft_display_intensity(power: np.ndarray) -> np.ndarray:
+    """Render a power spectrum for viewing without altering its saved values."""
+    log_power = np.log1p(power.astype(float))
+    low, high = np.percentile(log_power, (1.0, 99.8))
+    if high <= low:
+        return np.zeros(power.shape, dtype=np.uint8)
+    return np.clip((log_power - low) * 255.0 / (high - low), 0, 255).astype(np.uint8)
+
+
+def fft_phase_rgb(phase_radians: np.ndarray) -> np.ndarray:
+    """Use a cyclic hue scale so -π and +π meet without a false discontinuity."""
+    hue = (phase_radians.astype(float) + math.pi) / (2 * math.pi)
+    hue = np.mod(hue, 1.0)
+    sector = hue * 6.0
+    chroma = np.full(phase_radians.shape, 0.88)
+    secondary = chroma * (1.0 - np.abs(np.mod(sector, 2.0) - 1.0))
+    zeros = np.zeros_like(chroma)
+    red = np.select(
+        (sector < 1, sector < 2, sector < 3, sector < 4, sector < 5),
+        (chroma, secondary, zeros, zeros, secondary),
+        default=chroma,
+    )
+    green = np.select(
+        (sector < 1, sector < 2, sector < 3, sector < 4, sector < 5),
+        (secondary, chroma, chroma, secondary, zeros),
+        default=zeros,
+    )
+    blue = np.select(
+        (sector < 1, sector < 2, sector < 3, sector < 4, sector < 5),
+        (zeros, zeros, secondary, chroma, chroma),
+        default=secondary,
+    )
+    base = 0.10
+    return np.dstack((red + base, green + base, blue + base)).clip(0, 1)
+
+
+def fft_line_chart_rgb(
+    x_values: np.ndarray,
+    series: tuple[tuple[np.ndarray, str, str], ...],
+    *,
+    title: str,
+    x_label: str,
+    y_label: str,
+    size: tuple[int, int] = FFT_COORDINATE_VIEW_SIZE,
+) -> np.ndarray:
+    """Draw a compact coordinate line chart using only Pillow."""
+    view_width, view_height = size
+    canvas = Image.new("RGB", size, "#181818")
+    draw = ImageDraw.Draw(canvas)
+    foreground = "#d9d9d9"
+    grid = "#4a4a4a"
+    left, top, right, bottom = 43, 24, view_width - 12, view_height - 34
+    all_values = np.concatenate([values.ravel() for values, _label, _color in series])
+    low, high = np.percentile(all_values[np.isfinite(all_values)], (1.0, 99.0))
+    if high <= low:
+        high = low + 1.0
+    x_low, x_high = float(x_values[0]), float(x_values[-1])
+    if math.isclose(x_low, x_high):
+        x_high = x_low + 1.0
+    for fraction in (0.0, 0.5, 1.0):
+        x = round(left + (right - left) * fraction)
+        y = round(top + (bottom - top) * fraction)
+        draw.line((x, top, x, bottom), fill=grid)
+        draw.line((left, y, right, y), fill=grid)
+    draw.rectangle((left, top, right, bottom), outline=foreground)
+    for series_index, (values, label, color) in enumerate(series):
+        points = []
+        for index, value in enumerate(values):
+            x = left + (float(x_values[index]) - x_low) * (right - left) / (x_high - x_low)
+            y = bottom - (float(value) - low) * (bottom - top) / (high - low)
+            points.append((round(x), round(np.clip(y, top, bottom))))
+        if len(points) >= 2:
+            draw.line(points, fill=color, width=2)
+        draw.text((left + 5, top + 4 + series_index * 12), label, fill=color)
+    draw.text((right - 20, bottom + 3), x_label, fill=foreground)
+    draw.text((4, top - 1), y_label, fill=foreground)
+    draw.text((left, bottom + 3), f"{x_values[0]:.2g}", fill="#aaaaaa")
+    draw.text((right - 31, bottom + 3), f"{x_values[-1]:.2g}", fill="#aaaaaa")
+    draw.text((left + 3, bottom - 10), f"{low:.2g}", fill="#aaaaaa")
+    draw.text((left + 3, top + 2), f"{high:.2g}", fill="#aaaaaa")
+    draw.text((left, 5), title, fill=foreground)
+    return np.asarray(canvas, dtype=np.uint8)
+
+
+def fft_3d_spectrum_rgb(
+    intensity: np.ndarray,
+    keep_mask: np.ndarray,
+    *,
+    size: tuple[int, int] = FFT_COORDINATE_VIEW_SIZE,
+) -> np.ndarray:
+    """Render a perspective wireframe of the 2D frequency power spectrum."""
+    width, height = size
+    canvas = Image.new("RGB", size, "#181818")
+    draw = ImageDraw.Draw(canvas)
+    foreground = "#d9d9d9"
+    grid = "#4a4a4a"
+    log_intensity = np.log1p(intensity.astype(float)).copy()
+    log_intensity[~keep_mask] = 0.0
+    low, high = np.percentile(log_intensity, (5.0, 99.0))
+    if high <= low:
+        high = low + 1.0
+
+    origin = (48, height - 31)
+    x_end = (width - 22, height - 31)
+    y_end = (111, 46)
+    z_end = (48, 18)
+    draw.line((origin, x_end), fill=foreground, width=1)
+    draw.line((origin, y_end), fill=foreground, width=1)
+    draw.line((origin, z_end), fill=foreground, width=1)
+    for fraction in (0.25, 0.5, 0.75, 1.0):
+        draw.line(
+            (origin[0] + (x_end[0] - origin[0]) * fraction, origin[1], y_end[0] + (x_end[0] - origin[0]) * fraction, y_end[1]),
+            fill=grid,
+        )
+    palette = ("#56d3ff", "#ffcd57", "#7ce38b", "#ee8ccd", "#b995ff", "#ff906b")
+    row_indices = np.linspace(0, intensity.shape[0] - 1, 13, dtype=int)
+    column_indices = np.linspace(0, intensity.shape[1] - 1, min(64, intensity.shape[1]), dtype=int)
+    for row_order, row in enumerate(row_indices):
+        points = []
+        y_fraction = row_order / max(1, len(row_indices) - 1)
+        for column_order, column in enumerate(column_indices):
+            x_fraction = column_order / max(1, len(column_indices) - 1)
+            z_fraction = np.clip((log_intensity[row, column] - low) / (high - low), 0.0, 1.0)
+            x = origin[0] + (x_end[0] - origin[0]) * x_fraction + (y_end[0] - origin[0]) * y_fraction
+            y = origin[1] + (y_end[1] - origin[1]) * y_fraction - (origin[1] - z_end[1]) * z_fraction
+            points.append((round(x), round(y)))
+        draw.line(points, fill=palette[row_order % len(palette)], width=1)
+    draw.text((width - 28, height - 25), "fx", fill=foreground)
+    draw.text((y_end[0] - 8, y_end[1] - 15), "fy", fill=foreground)
+    draw.text((z_end[0] - 25, z_end[1] - 4), "log I", fill=foreground)
+    draw.text((52, 4), "三维频谱曲面", fill=foreground)
+    return np.asarray(canvas, dtype=np.uint8)
+
+
+def analyze_fft_2d(
+    image: np.ndarray,
+    pixel_size_nm: float | None = None,
+    window_name: str = FFT_WINDOW_HANN,
+    roi_bounds_px: tuple[int, int, int, int] | None = None,
+) -> FFTAnalysisResult:
+    """Calculate a centered FFT, retaining its physical coordinate axes and phase."""
+    if image.ndim != 2:
+        raise ValueError("二维 FFT 只支持灰度图像。")
+    height, width = image.shape
+    if height < FFT_MIN_SIDE_PX or width < FFT_MIN_SIDE_PX:
+        raise ValueError(f"FFT 区域至少需要 {FFT_MIN_SIDE_PX} × {FFT_MIN_SIDE_PX} px。")
+    reconstruction_coefficients = np.fft.fftshift(np.fft.fft2(image.astype(float)))
+    source = image.astype(float)
+    source -= np.mean(source)
+    if window_name == FFT_WINDOW_HANN:
+        window = np.outer(np.hanning(height), np.hanning(width))
+        source *= window
+    elif window_name != FFT_WINDOW_NONE:
+        raise ValueError("未知的 FFT 窗函数。")
+    shifted = np.fft.fftshift(np.fft.fft2(source))
+    magnitude = np.abs(shifted)
+    intensity = magnitude**2
+    phase = np.angle(shifted)
+    spacing = pixel_size_nm if pixel_size_nm is not None and pixel_size_nm > 0 else 1.0
+    coordinate_unit = "cycles/nm" if pixel_size_nm is not None and pixel_size_nm > 0 else "cycles/pixel"
+    frequencies_x = np.fft.fftshift(np.fft.fftfreq(width, d=spacing))
+    frequencies_y = np.fft.fftshift(np.fft.fftfreq(height, d=spacing))
+    phase_rgb = (fft_phase_rgb(phase) * 255.0).round().clip(0, 255).astype(np.uint8)
+    return FFTAnalysisResult(
+        frequencies_x=frequencies_x,
+        frequencies_y=frequencies_y,
+        magnitude=magnitude,
+        intensity=intensity,
+        phase_radians=phase,
+        source_image=image.copy(),
+        reconstruction_coefficients=reconstruction_coefficients,
+        frequency_keep_mask=np.ones(image.shape, dtype=bool),
+        spectrum_display=fft_display_intensity(intensity),
+        phase_display=phase_rgb,
+        reconstructed_image=None,
+        reconstruction_display=None,
+        roi_bounds_px=roi_bounds_px or (0, 0, width, height),
+        source_shape_px=(height, width),
+        coordinate_unit=coordinate_unit,
+        window_name=window_name,
+    )
+
+
+def fft_conjugate_index(index: int, length: int) -> int:
+    """Return the fftshifted index for the negative of one frequency bin."""
+    return (-index) % length if length % 2 == 0 else (length - 1 - index) % length
+
+
+def inverse_masked_fft(result: FFTAnalysisResult) -> np.ndarray:
+    """Invert the unwindowed source FFT after a conjugate-symmetric mask is applied."""
+    filtered = result.reconstruction_coefficients * result.frequency_keep_mask
+    reconstructed = np.fft.ifft2(np.fft.ifftshift(filtered))
+    return reconstructed.real
+
+
+def fft_reconstruction_display(image: np.ndarray) -> np.ndarray:
+    """Return a PNG-ready view while retaining float reconstruction values separately."""
+    return np.clip(np.rint(image), 0, 255).astype(np.uint8)
 
 
 def remove_bottom_information_bar(image: np.ndarray) -> tuple[np.ndarray, int]:
@@ -2067,6 +2300,41 @@ class LERLWRApp(AppBase):
         self.roi_drag_anchor: tuple[float, float] | None = None
         self.roi_start_bounds: tuple[float, float, float, float] | None = None
         self.roi_was_changed = False
+        self.fft_roi_canvas: tuple[float, float, float, float] | None = None
+        self.fft_roi_drag_start: tuple[float, float] | None = None
+        self.fft_roi_mode = False
+        self.fft_result: FFTAnalysisResult | None = None
+        self.fft_dialog: tk.Toplevel | None = None
+        self.fft_spectrum_photo: ImageTk.PhotoImage | None = None
+        self.fft_phase_photo: ImageTk.PhotoImage | None = None
+        self.fft_reconstruction_photo: ImageTk.PhotoImage | None = None
+        self.fft_frequency_plot_photo: ImageTk.PhotoImage | None = None
+        self.fft_time_plot_photo: ImageTk.PhotoImage | None = None
+        self.fft_3d_plot_photo: ImageTk.PhotoImage | None = None
+        self.fft_spectrum_canvas: tk.Canvas | None = None
+        self.fft_phase_canvas: tk.Canvas | None = None
+        self.fft_reconstruction_canvas: tk.Canvas | None = None
+        self.fft_frequency_plot_canvas: tk.Canvas | None = None
+        self.fft_time_plot_canvas: tk.Canvas | None = None
+        self.fft_3d_plot_canvas: tk.Canvas | None = None
+        self.fft_frequency_plot_frame: ttk.LabelFrame | None = None
+        self.fft_time_plot_frame: ttk.LabelFrame | None = None
+        self.fft_3d_plot_frame: ttk.LabelFrame | None = None
+        self.fft_frequency_plot_button: ttk.Button | None = None
+        self.fft_time_plot_button: ttk.Button | None = None
+        self.fft_3d_plot_button: ttk.Button | None = None
+        self.fft_frequency_plot_visible = False
+        self.fft_time_plot_visible = False
+        self.fft_3d_plot_visible = False
+        self.fft_spectrum_zoom = 1.0
+        self.fft_phase_zoom = 1.0
+        self.fft_reconstruction_zoom = 1.0
+        self.fft_pan_canvas: tk.Canvas | None = None
+        self.fft_mask_mode = False
+        self.fft_mask_start: tuple[tk.Canvas, float, float] | None = None
+        self.fft_fine_mask_mode: bool | None = None
+        self.fft_fine_mask_last_bin: tuple[int, int] | None = None
+        self.fft_fine_mask_changed = False
         self.detected_edge_mask: np.ndarray | None = None
         self.detected_edge_origin: tuple[int, int] = (0, 0)
         self.detected_edge_overlay: ImageTk.PhotoImage | None = None
@@ -2089,6 +2357,7 @@ class LERLWRApp(AppBase):
         self.era_aggregate_result: EraAggregateResult | None = None
         self.era_active_sample_index: int | None = None
         self.era_pending_roi_target: tuple[int, str] | None = None
+        self.show_era_rois = True
         self.era_sample_listbox: tk.Listbox | None = None
         self.bcp_result: BCPAnalysisResult | None = None
         self.bcp_metrics_finalized = False
@@ -2144,6 +2413,11 @@ class LERLWRApp(AppBase):
         self.canny_low_threshold_text_var = tk.StringVar(value="0.050")
         self.edge_kernel_preview_var = tk.StringVar(value="")
         self.bcp_use_dog_var = tk.BooleanVar(value=True)
+        self.fft_window_var = tk.StringVar(value=FFT_WINDOW_HANN)
+        self.fft_query_var = tk.StringVar(value="尚未计算二维 FFT。")
+        self.fft_delete_fx_var = tk.StringVar(value="")
+        self.fft_delete_fy_var = tk.StringVar(value="")
+        self.fft_mask_brush_radius_var = tk.IntVar(value=0)
         self.sigma_multiplier_var = tk.DoubleVar(value=1.0)
         self.outlier_level_var = tk.StringVar(value=DEFAULT_OUTLIER_LEVEL)
         self.lcdu_summary_var = tk.StringVar(value="LCDU 样本：0 条线")
@@ -2305,8 +2579,9 @@ class LERLWRApp(AppBase):
         self.analysis_tools_panel = ttk.LabelFrame(body, text="分析功能", padding=(10, 6))
         self.analysis_tools_panel_visible = False
         ttk.Button(self.analysis_tools_panel, text="测量 LER / LWR", command=self.open_ler_lwr_dialog).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(self.analysis_tools_panel, text="识别 BCP 点阵", command=self.open_bcp_recognition_dialog).pack(side=tk.LEFT)
-        ttk.Label(self.analysis_tools_panel, text="两项分析各自在独立窗口中设置与操作。", foreground="#666666").pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Button(self.analysis_tools_panel, text="识别 BCP 点阵", command=self.open_bcp_recognition_dialog).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(self.analysis_tools_panel, text="二维 FFT 频谱 / 相位", command=self.open_fft_dialog).pack(side=tk.LEFT)
+        ttk.Label(self.analysis_tools_panel, text="各项分析均在独立窗口中设置与操作。", foreground="#666666").pack(side=tk.LEFT, padx=(12, 0))
 
         content = ttk.PanedWindow(body, orient=tk.HORIZONTAL)
         self.main_content = content
@@ -2502,6 +2777,7 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.bcp_result = None
+        self.clear_fft_analysis(clear_roi=True)
         self.recognition_duration_var.set("识别耗时：—")
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
@@ -2576,6 +2852,7 @@ class LERLWRApp(AppBase):
         self.bcp_result = state.bcp_result
         self.bcp_metrics_finalized = state.bcp_metrics_finalized
         self.rebuild_working_images()
+        self.clear_fft_analysis(clear_roi=True)
         self.draw_image()
         if self.result is not None:
             self.update_result_text()
@@ -2644,6 +2921,7 @@ class LERLWRApp(AppBase):
             self.result = None
             self.analysis_origin = None
             self.bcp_result = None
+            self.clear_fft_analysis(clear_roi=True)
             self.clear_bcp_completion_selection(redraw=False)
             self.discard_bcp_reference_circles()
             self.roi_canvas = None
@@ -2668,6 +2946,7 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.bcp_result = None
+        self.clear_fft_analysis(clear_roi=True)
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
         self.roi_canvas = None
@@ -2705,6 +2984,7 @@ class LERLWRApp(AppBase):
         self.result = None
         self.analysis_origin = None
         self.bcp_result = None
+        self.clear_fft_analysis(clear_roi=True)
         self.clear_bcp_completion_selection(redraw=False)
         self.discard_bcp_reference_circles()
         self.roi_canvas = None
@@ -2743,6 +3023,830 @@ class LERLWRApp(AppBase):
             self.analysis_tools_button.configure(text="分析功能 ▾")
         self.analysis_tools_panel_visible = not self.analysis_tools_panel_visible
 
+    def open_fft_dialog(self) -> None:
+        """Open the non-modal 2D FFT viewer and controls."""
+        if self.processed_image is None:
+            messagebox.showinfo("请先打开图像", "请先打开一张 SEM 图像，再进行二维 FFT。")
+            return
+        if self.fft_dialog is not None and self.fft_dialog.winfo_exists():
+            self.fft_dialog.deiconify()
+            self.fft_dialog.lift()
+            return
+        dialog = tk.Toplevel(self)
+        self.fft_dialog = dialog
+        dialog.title("二维 FFT：频谱、相位、时域与三维图")
+        dialog_height = min(920, max(680, self.winfo_screenheight() - 100))
+        dialog.geometry(f"1280x{dialog_height}")
+        dialog.minsize(920, 640)
+        # Keep this viewer independent of the main window so it can stay on a
+        # different display instead of being hidden with its owner.
+        dialog.protocol("WM_DELETE_WINDOW", self.close_fft_dialog)
+        content = ttk.Frame(dialog, padding=12)
+        content.pack(fill=tk.BOTH, expand=True)
+        controls = ttk.LabelFrame(content, text="分析区域与输出", padding=(10, 7))
+        controls.pack(fill=tk.X)
+        ttk.Button(controls, text="框选 FFT 区域", command=self.enable_fft_roi_mode).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(controls, text="使用整张图", command=self.use_full_image_for_fft).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Label(controls, text="边界窗：").pack(side=tk.LEFT)
+        ttk.Combobox(
+            controls,
+            textvariable=self.fft_window_var,
+            values=FFT_WINDOW_OPTIONS,
+            state="readonly",
+            width=16,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(controls, text="计算 / 刷新", command=self.calculate_fft).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Button(controls, text="导出 PNG + CSV", command=self.export_fft_results).pack(side=tk.LEFT)
+        edit_controls = ttk.Frame(content)
+        edit_controls.pack(fill=tk.X, pady=(7, 0))
+        ttk.Button(edit_controls, text="遮掩频率（在图上拖动）", command=self.enable_fft_mask_mode).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(edit_controls, text="恢复全部频率", command=self.reset_fft_frequency_mask).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Label(edit_controls, text="精确删除：fx").pack(side=tk.LEFT)
+        ttk.Entry(edit_controls, textvariable=self.fft_delete_fx_var, width=10).pack(side=tk.LEFT, padx=(3, 5))
+        ttk.Label(edit_controls, text="fy").pack(side=tk.LEFT)
+        ttk.Entry(edit_controls, textvariable=self.fft_delete_fy_var, width=10).pack(side=tk.LEFT, padx=(3, 6))
+        ttk.Button(edit_controls, text="删除该频率点", command=self.delete_fft_frequency_by_coordinate).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Button(edit_controls, text="恢复该频率点", command=self.restore_fft_frequency_by_coordinate).pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Button(edit_controls, text="逆变换重建", command=self.reconstruct_fft_image).pack(side=tk.LEFT)
+        fine_mask_controls = ttk.Frame(content)
+        fine_mask_controls.pack(fill=tk.X, pady=(5, 0))
+        ttk.Label(fine_mask_controls, text="精细笔刷半径（频率格）：").pack(side=tk.LEFT)
+        tk.Spinbox(fine_mask_controls, from_=0, to=12, textvariable=self.fft_mask_brush_radius_var, width=4).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(fine_mask_controls, text="精细遮掩笔刷", command=lambda: self.enable_fft_fine_mask_mode(False)).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(fine_mask_controls, text="精细恢复笔刷", command=lambda: self.enable_fft_fine_mask_mode(True)).pack(side=tk.LEFT)
+        ttk.Label(
+            content,
+            text="默认使用当前预处理灰度图；未框选时自动处理整图。细笔刷半径 0 表示单个频率格；所有遮掩与恢复均会同步处理共轭频率。",
+            foreground="#555555",
+        ).pack(anchor="w", pady=(7, 5))
+        images = tk.PanedWindow(
+            content,
+            orient=tk.HORIZONTAL,
+            sashrelief=tk.RAISED,
+            sashwidth=8,
+            showhandle=True,
+            background="#b8b8b8",
+        )
+        images.pack(fill=tk.BOTH, expand=True)
+        spectrum_column = tk.PanedWindow(
+            images, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=7, showhandle=True, background="#b8b8b8"
+        )
+        phase_column = tk.PanedWindow(
+            images, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=7, showhandle=True, background="#b8b8b8"
+        )
+        reconstruction_column = tk.PanedWindow(
+            images, orient=tk.VERTICAL, sashrelief=tk.RAISED, sashwidth=7, showhandle=True, background="#b8b8b8"
+        )
+        images.add(spectrum_column, minsize=280)
+        images.add(phase_column, minsize=280)
+        images.add(reconstruction_column, minsize=280)
+        spectrum_frame = ttk.LabelFrame(spectrum_column, text="对数功率频谱（中心 = 零频）", padding=6)
+        spectrum_column.add(spectrum_frame, minsize=220)
+        self.fft_frequency_plot_frame = ttk.LabelFrame(spectrum_column, text="频域图像（fx / log I）", padding=4)
+        phase_frame = ttk.LabelFrame(phase_column, text="相位图（循环色相，−π 至 +π）", padding=6)
+        phase_column.add(phase_frame, minsize=220)
+        self.fft_3d_plot_frame = ttk.LabelFrame(phase_column, text="三维图像（fx / fy / log I）", padding=4)
+        reconstruction_frame = ttk.LabelFrame(reconstruction_column, text="逆变换重建图", padding=6)
+        reconstruction_column.add(reconstruction_frame, minsize=220)
+        self.fft_time_plot_frame = ttk.LabelFrame(reconstruction_column, text="时域图像（空间 x / 强度）", padding=4)
+        spectrum_image_controls = ttk.Frame(spectrum_frame)
+        spectrum_image_controls.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(spectrum_image_controls, text="缩小", command=lambda: self.zoom_fft_image_view("spectrum", 0.8)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(spectrum_image_controls, text="放大", command=lambda: self.zoom_fft_image_view("spectrum", 1.25)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(spectrum_image_controls, text="适合窗口", command=lambda: self.reset_fft_image_view_zoom("spectrum")).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(spectrum_image_controls, text="拖动", command=lambda: self.enable_fft_pan_mode(self.fft_spectrum_canvas, "频谱图")).pack(side=tk.LEFT)
+        self.fft_frequency_plot_button = ttk.Button(spectrum_image_controls, text="频域图 ▸", command=lambda: self.toggle_fft_plot("frequency"))
+        self.fft_frequency_plot_button.pack(side=tk.LEFT, padx=(7, 0))
+        spectrum_view = ttk.Frame(spectrum_frame)
+        spectrum_view.pack(fill=tk.BOTH, expand=True)
+        spectrum_x_scroll = ttk.Scrollbar(spectrum_view, orient=tk.HORIZONTAL)
+        spectrum_y_scroll = ttk.Scrollbar(spectrum_view, orient=tk.VERTICAL)
+        self.fft_spectrum_canvas = tk.Canvas(
+            spectrum_view,
+            background="#202020",
+            width=FFT_VIEW_MAX_SIDE_PX,
+            height=FFT_VIEW_MAX_SIDE_PX,
+            highlightthickness=0,
+            xscrollcommand=spectrum_x_scroll.set,
+            yscrollcommand=spectrum_y_scroll.set,
+        )
+        spectrum_x_scroll.configure(command=self.fft_spectrum_canvas.xview)
+        spectrum_y_scroll.configure(command=self.fft_spectrum_canvas.yview)
+        spectrum_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        spectrum_y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fft_spectrum_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        phase_image_controls = ttk.Frame(phase_frame)
+        phase_image_controls.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(phase_image_controls, text="缩小", command=lambda: self.zoom_fft_image_view("phase", 0.8)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(phase_image_controls, text="放大", command=lambda: self.zoom_fft_image_view("phase", 1.25)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(phase_image_controls, text="适合窗口", command=lambda: self.reset_fft_image_view_zoom("phase")).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(phase_image_controls, text="拖动", command=lambda: self.enable_fft_pan_mode(self.fft_phase_canvas, "相位图")).pack(side=tk.LEFT)
+        self.fft_3d_plot_button = ttk.Button(phase_image_controls, text="三维图 ▸", command=lambda: self.toggle_fft_plot("3d"))
+        self.fft_3d_plot_button.pack(side=tk.LEFT, padx=(7, 0))
+        phase_view = ttk.Frame(phase_frame)
+        phase_view.pack(fill=tk.BOTH, expand=True)
+        phase_x_scroll = ttk.Scrollbar(phase_view, orient=tk.HORIZONTAL)
+        phase_y_scroll = ttk.Scrollbar(phase_view, orient=tk.VERTICAL)
+        self.fft_phase_canvas = tk.Canvas(
+            phase_view,
+            background="#202020",
+            width=FFT_VIEW_MAX_SIDE_PX,
+            height=FFT_VIEW_MAX_SIDE_PX,
+            highlightthickness=0,
+            xscrollcommand=phase_x_scroll.set,
+            yscrollcommand=phase_y_scroll.set,
+        )
+        phase_x_scroll.configure(command=self.fft_phase_canvas.xview)
+        phase_y_scroll.configure(command=self.fft_phase_canvas.yview)
+        phase_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        phase_y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fft_phase_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        reconstruction_image_controls = ttk.Frame(reconstruction_frame)
+        reconstruction_image_controls.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(reconstruction_image_controls, text="缩小", command=lambda: self.zoom_fft_image_view("reconstruction", 0.8)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(reconstruction_image_controls, text="放大", command=lambda: self.zoom_fft_image_view("reconstruction", 1.25)).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(reconstruction_image_controls, text="适合窗口", command=lambda: self.reset_fft_image_view_zoom("reconstruction")).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(reconstruction_image_controls, text="拖动", command=lambda: self.enable_fft_pan_mode(self.fft_reconstruction_canvas, "重建图")).pack(side=tk.LEFT)
+        self.fft_time_plot_button = ttk.Button(reconstruction_image_controls, text="时域图 ▸", command=lambda: self.toggle_fft_plot("time"))
+        self.fft_time_plot_button.pack(side=tk.LEFT, padx=(7, 0))
+        reconstruction_view = ttk.Frame(reconstruction_frame)
+        reconstruction_view.pack(fill=tk.BOTH, expand=True)
+        reconstruction_x_scroll = ttk.Scrollbar(reconstruction_view, orient=tk.HORIZONTAL)
+        reconstruction_y_scroll = ttk.Scrollbar(reconstruction_view, orient=tk.VERTICAL)
+        self.fft_reconstruction_canvas = tk.Canvas(
+            reconstruction_view,
+            background="#202020",
+            width=FFT_VIEW_MAX_SIDE_PX,
+            height=FFT_VIEW_MAX_SIDE_PX,
+            highlightthickness=0,
+            xscrollcommand=reconstruction_x_scroll.set,
+            yscrollcommand=reconstruction_y_scroll.set,
+        )
+        reconstruction_x_scroll.configure(command=self.fft_reconstruction_canvas.xview)
+        reconstruction_y_scroll.configure(command=self.fft_reconstruction_canvas.yview)
+        reconstruction_x_scroll.pack(side=tk.BOTTOM, fill=tk.X)
+        reconstruction_y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.fft_reconstruction_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.fft_frequency_plot_canvas = tk.Canvas(
+            self.fft_frequency_plot_frame,
+            background="#181818",
+            width=FFT_COORDINATE_VIEW_SIZE[0],
+            height=FFT_COORDINATE_VIEW_SIZE[1],
+            highlightthickness=0,
+        )
+        self.fft_frequency_plot_canvas.pack(fill=tk.X)
+        self.fft_time_plot_canvas = tk.Canvas(
+            self.fft_time_plot_frame,
+            background="#181818",
+            width=FFT_COORDINATE_VIEW_SIZE[0],
+            height=FFT_COORDINATE_VIEW_SIZE[1],
+            highlightthickness=0,
+        )
+        self.fft_time_plot_canvas.pack(fill=tk.X)
+        self.fft_3d_plot_canvas = tk.Canvas(
+            self.fft_3d_plot_frame,
+            background="#181818",
+            width=FFT_COORDINATE_VIEW_SIZE[0],
+            height=FFT_COORDINATE_VIEW_SIZE[1],
+            highlightthickness=0,
+        )
+        self.fft_3d_plot_canvas.pack(fill=tk.X)
+        for canvas in (self.fft_spectrum_canvas, self.fft_phase_canvas):
+            canvas.bind("<ButtonPress-1>", self.start_fft_canvas_action)
+            canvas.bind("<B1-Motion>", self.move_fft_canvas_action)
+            canvas.bind("<ButtonRelease-1>", self.finish_fft_canvas_action)
+        self.fft_reconstruction_canvas.bind("<ButtonPress-1>", self.start_fft_reconstruction_action)
+        self.fft_reconstruction_canvas.bind("<B1-Motion>", self.move_fft_reconstruction_action)
+        self.fft_reconstruction_canvas.bind("<ButtonRelease-1>", self.finish_fft_reconstruction_action)
+        ttk.Label(content, textvariable=self.fft_query_var, font=("Menlo", 11), justify=tk.LEFT).pack(anchor="w", pady=(8, 0))
+        if self.fft_result is not None:
+            self.render_fft_result()
+        else:
+            self.fft_query_var.set("请在主图拖动框选区域，或直接点“计算 / 刷新”分析整图。")
+
+    def toggle_fft_plot(self, plot_name: str) -> None:
+        """Expand or collapse one of the optional frequency/time/3D displays."""
+        if plot_name == "frequency":
+            visible_attribute = "fft_frequency_plot_visible"
+            frame = self.fft_frequency_plot_frame
+            button = self.fft_frequency_plot_button
+            label = "频域图"
+        elif plot_name == "time":
+            visible_attribute = "fft_time_plot_visible"
+            frame = self.fft_time_plot_frame
+            button = self.fft_time_plot_button
+            label = "时域图"
+        else:
+            visible_attribute = "fft_3d_plot_visible"
+            frame = self.fft_3d_plot_frame
+            button = self.fft_3d_plot_button
+            label = "三维图"
+        visible = not getattr(self, visible_attribute)
+        setattr(self, visible_attribute, visible)
+        if frame is not None:
+            if visible:
+                frame.master.add(frame, minsize=150)
+            else:
+                frame.master.forget(frame)
+        if button is not None:
+            button.configure(text=f"{label} {'▾' if visible else '▸'}")
+        if visible and self.fft_result is not None:
+            self.render_fft_result()
+
+    def close_fft_dialog(self) -> None:
+        if self.fft_dialog is not None and self.fft_dialog.winfo_exists():
+            self.fft_dialog.destroy()
+        self.fft_dialog = None
+        self.fft_spectrum_canvas = None
+        self.fft_phase_canvas = None
+        self.fft_reconstruction_canvas = None
+        self.fft_frequency_plot_canvas = None
+        self.fft_time_plot_canvas = None
+        self.fft_3d_plot_canvas = None
+        self.fft_frequency_plot_frame = None
+        self.fft_time_plot_frame = None
+        self.fft_3d_plot_frame = None
+        self.fft_frequency_plot_button = None
+        self.fft_time_plot_button = None
+        self.fft_3d_plot_button = None
+        self.fft_frequency_plot_visible = False
+        self.fft_time_plot_visible = False
+        self.fft_3d_plot_visible = False
+        self.fft_spectrum_photo = None
+        self.fft_phase_photo = None
+        self.fft_reconstruction_photo = None
+        self.fft_frequency_plot_photo = None
+        self.fft_time_plot_photo = None
+        self.fft_3d_plot_photo = None
+
+    def clear_fft_analysis(self, clear_roi: bool = True) -> None:
+        """Invalidate FFT values whenever their working-image coordinates change."""
+        self.fft_result = None
+        self.fft_roi_mode = False
+        self.fft_roi_drag_start = None
+        self.fft_mask_mode = False
+        self.fft_mask_start = None
+        self.fft_fine_mask_mode = None
+        self.fft_fine_mask_last_bin = None
+        self.fft_fine_mask_changed = False
+        self.fft_pan_canvas = None
+        self.fft_spectrum_zoom = 1.0
+        self.fft_phase_zoom = 1.0
+        self.fft_reconstruction_zoom = 1.0
+        if clear_roi:
+            self.fft_roi_canvas = None
+        if self.raw_image is not None:
+            self.draw_fft_roi()
+        self.clear_fft_viewer()
+        if self.fft_dialog is not None and self.fft_dialog.winfo_exists():
+            self.fft_query_var.set("当前图像或预处理已改变；请重新选择 FFT 区域并计算。")
+
+    def clear_fft_viewer(self) -> None:
+        for canvas in (
+            self.fft_spectrum_canvas,
+            self.fft_phase_canvas,
+            self.fft_reconstruction_canvas,
+            self.fft_frequency_plot_canvas,
+            self.fft_time_plot_canvas,
+            self.fft_3d_plot_canvas,
+        ):
+            if canvas is not None and canvas.winfo_exists():
+                canvas.delete("all")
+        self.fft_spectrum_photo = None
+        self.fft_phase_photo = None
+        self.fft_reconstruction_photo = None
+        self.fft_frequency_plot_photo = None
+        self.fft_time_plot_photo = None
+        self.fft_3d_plot_photo = None
+
+    def enable_fft_roi_mode(self) -> None:
+        if self.raw_image is None:
+            return
+        self.fft_result = None
+        self.clear_fft_viewer()
+        self.fft_mask_mode = False
+        self.fft_fine_mask_mode = None
+        self.fft_roi_mode = True
+        self.ler_lwr_roi_mode = False
+        self.status_var.set("FFT 框选已启用：请在主图拖动鼠标选择区域（最小 16 × 16 px）。")
+        self.draw_fft_roi()
+        self.focus_set()
+
+    def use_full_image_for_fft(self) -> None:
+        self.fft_result = None
+        self.clear_fft_viewer()
+        self.fft_mask_mode = False
+        self.fft_fine_mask_mode = None
+        self.fft_roi_canvas = None
+        self.fft_roi_mode = False
+        self.draw_fft_roi()
+        self.fft_query_var.set("已选择整张当前预处理图；点击“计算 / 刷新”执行二维 FFT。")
+        self.status_var.set("二维 FFT 将使用整张当前预处理图。")
+
+    def draw_fft_roi(self) -> None:
+        self.canvas.delete("fft_roi")
+        if self.fft_roi_canvas is None:
+            return
+        x0, y0, x1, y1 = self.normalized_roi(self.fft_roi_canvas)
+        self.fft_roi_canvas = (x0, y0, x1, y1)
+        self.canvas.create_rectangle(x0, y0, x1, y1, outline="#ff9f1c", width=2, dash=(6, 3), tags="fft_roi")
+        self.canvas.create_text(x0 + 5, y0 + 10, anchor=tk.W, text="FFT", fill="#ffb347", font=("Menlo", 10, "bold"), tags="fft_roi")
+
+    def start_fft_roi(self, event: tk.Event) -> None:
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.fft_roi_drag_start = (x, y)
+        self.fft_roi_canvas = (x, y, x, y)
+        self.draw_fft_roi()
+
+    def move_fft_roi(self, event: tk.Event) -> None:
+        if self.fft_roi_drag_start is None:
+            return
+        x0, y0 = self.fft_roi_drag_start
+        x, y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self.fft_roi_canvas = self.normalized_roi((x0, y0, x, y))
+        self.draw_fft_roi()
+
+    def finish_fft_roi(self, event: tk.Event) -> None:
+        self.move_fft_roi(event)
+        self.fft_roi_drag_start = None
+        self.fft_roi_mode = False
+        if self.fft_roi_canvas is None:
+            return
+        x0, y0, x1, y1 = self.fft_roi_canvas
+        width = (x1 - x0) / self.display_scale
+        height = (y1 - y0) / self.display_scale
+        if width < FFT_MIN_SIDE_PX or height < FFT_MIN_SIDE_PX:
+            self.fft_roi_canvas = None
+            self.draw_fft_roi()
+            self.status_var.set(f"FFT 选区过小；请至少框选 {FFT_MIN_SIDE_PX} × {FFT_MIN_SIDE_PX} px。")
+            return
+        self.fft_query_var.set(f"FFT 选区：{round(width)} × {round(height)} px；点击“计算 / 刷新”开始。")
+        self.status_var.set("FFT 选区已确定；可在二维 FFT 窗口点击“计算 / 刷新”。")
+
+    def selected_fft_region(self) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+        if self.processed_image is None:
+            raise ValueError("图像未准备完成。")
+        if self.fft_roi_canvas is None:
+            height, width = self.processed_image.shape
+            return self.processed_image, (0, 0, width, height)
+        x0, y0, x1, y1 = self.fft_roi_canvas
+        left = max(0, math.floor(x0 / self.display_scale))
+        top = max(0, math.floor(y0 / self.display_scale))
+        right = min(self.processed_image.shape[1], math.ceil(x1 / self.display_scale))
+        bottom = min(self.processed_image.shape[0], math.ceil(y1 / self.display_scale))
+        if right - left < FFT_MIN_SIDE_PX or bottom - top < FFT_MIN_SIDE_PX:
+            raise ValueError(f"FFT 选区至少需要 {FFT_MIN_SIDE_PX} × {FFT_MIN_SIDE_PX} px。")
+        return self.processed_image[top:bottom, left:right], (left, top, right, bottom)
+
+    def calculate_fft(self) -> None:
+        try:
+            region, bounds = self.selected_fft_region()
+            self.fft_result = analyze_fft_2d(
+                region,
+                pixel_size_nm=self.measurement_pixel_size(),
+                window_name=self.fft_window_var.get(),
+                roi_bounds_px=bounds,
+            )
+        except ValueError as exc:
+            messagebox.showwarning("无法计算二维 FFT", str(exc), parent=self.fft_dialog or self)
+            return
+        self.fft_spectrum_zoom = 1.0
+        self.fft_phase_zoom = 1.0
+        self.fft_reconstruction_zoom = 1.0
+        self.fft_pan_canvas = None
+        self.render_fft_result()
+        scope = "整图" if self.fft_roi_canvas is None else f"选区 {bounds[2] - bounds[0]} × {bounds[3] - bounds[1]} px"
+        self.status_var.set(f"已计算二维 FFT（{scope}，{self.fft_window_var.get()}）。")
+
+    def render_fft_result(self) -> None:
+        if (
+            self.fft_result is None
+            or self.fft_spectrum_canvas is None
+            or self.fft_phase_canvas is None
+            or self.fft_reconstruction_canvas is None
+            or self.fft_frequency_plot_canvas is None
+            or self.fft_time_plot_canvas is None
+            or self.fft_3d_plot_canvas is None
+        ):
+            return
+        result = self.fft_result
+        height, width = result.source_shape_px
+        base_scale = min(1.0, FFT_VIEW_MAX_SIDE_PX / max(width, height))
+        spectrum_scale = base_scale * self.fft_spectrum_zoom
+        phase_scale = base_scale * self.fft_phase_zoom
+        spectrum_size = (max(1, round(width * spectrum_scale)), max(1, round(height * spectrum_scale)))
+        phase_size = (max(1, round(width * phase_scale)), max(1, round(height * phase_scale)))
+        spectrum_display = result.spectrum_display.copy()
+        phase_display = result.phase_display.copy()
+        spectrum_display[~result.frequency_keep_mask] = 0
+        phase_display[~result.frequency_keep_mask] = 0
+        spectrum_image = Image.fromarray(spectrum_display).resize(spectrum_size, Image.Resampling.NEAREST)
+        phase_image = Image.fromarray(phase_display, "RGB").resize(phase_size, Image.Resampling.NEAREST)
+        self.fft_spectrum_photo = ImageTk.PhotoImage(spectrum_image)
+        self.fft_phase_photo = ImageTk.PhotoImage(phase_image)
+        if result.reconstruction_display is None:
+            reconstruction_display = np.zeros(result.source_shape_px, dtype=np.uint8)
+        else:
+            reconstruction_display = result.reconstruction_display
+        reconstruction_scale = base_scale * self.fft_reconstruction_zoom
+        reconstruction_size = (max(1, round(width * reconstruction_scale)), max(1, round(height * reconstruction_scale)))
+        reconstruction_image = Image.fromarray(reconstruction_display).resize(reconstruction_size, Image.Resampling.NEAREST)
+        self.fft_reconstruction_photo = ImageTk.PhotoImage(reconstruction_image)
+        for canvas, photo, image_size in (
+            (self.fft_spectrum_canvas, self.fft_spectrum_photo, spectrum_size),
+            (self.fft_phase_canvas, self.fft_phase_photo, phase_size),
+        ):
+            canvas.configure(scrollregion=(0, 0, *image_size))
+            canvas.delete("all")
+            canvas.create_image(0, 0, image=photo, anchor=tk.NW)
+        self.fft_reconstruction_canvas.configure(scrollregion=(0, 0, *reconstruction_size))
+        self.fft_reconstruction_canvas.delete("all")
+        self.fft_reconstruction_canvas.create_image(0, 0, image=self.fft_reconstruction_photo, anchor=tk.NW)
+        if self.fft_frequency_plot_visible:
+            zero_row = int(np.argmin(np.abs(result.frequencies_y)))
+            frequency_trace = np.log1p(result.intensity[zero_row]).copy()
+            frequency_trace[~result.frequency_keep_mask[zero_row]] = 0.0
+            frequency_plot = fft_line_chart_rgb(
+                result.frequencies_x,
+                ((frequency_trace, "功率剖面（fy = 0）", "#56d3ff"),),
+                title="频域图像：零纵向频率剖面",
+                x_label="fx",
+                y_label="log I",
+            )
+            self.fft_frequency_plot_photo = ImageTk.PhotoImage(Image.fromarray(frequency_plot))
+            self.fft_frequency_plot_canvas.configure(width=FFT_COORDINATE_VIEW_SIZE[0], height=FFT_COORDINATE_VIEW_SIZE[1])
+            self.fft_frequency_plot_canvas.delete("all")
+            self.fft_frequency_plot_canvas.create_image(0, 0, image=self.fft_frequency_plot_photo, anchor=tk.NW)
+        else:
+            self.fft_frequency_plot_canvas.delete("all")
+            self.fft_frequency_plot_photo = None
+        if self.fft_time_plot_visible:
+            center_row = result.source_shape_px[0] // 2
+            source_trace = result.source_image[center_row].astype(float)
+            reconstructed = result.reconstructed_image if result.reconstructed_image is not None else result.source_image.astype(float)
+            reconstructed_trace = reconstructed[center_row].astype(float)
+            time_plot = fft_line_chart_rgb(
+                np.arange(result.source_shape_px[1], dtype=float),
+                (
+                    (source_trace, "原图", "#b9b9b9"),
+                    (reconstructed_trace, "当前重构", "#56d3ff"),
+                ),
+                title="时域图像：中心水平剖面",
+                x_label="x",
+                y_label="强度",
+            )
+            self.fft_time_plot_photo = ImageTk.PhotoImage(Image.fromarray(time_plot))
+            self.fft_time_plot_canvas.configure(width=FFT_COORDINATE_VIEW_SIZE[0], height=FFT_COORDINATE_VIEW_SIZE[1])
+            self.fft_time_plot_canvas.delete("all")
+            self.fft_time_plot_canvas.create_image(0, 0, image=self.fft_time_plot_photo, anchor=tk.NW)
+        else:
+            self.fft_time_plot_canvas.delete("all")
+            self.fft_time_plot_photo = None
+        if self.fft_3d_plot_visible:
+            spectrum_3d = fft_3d_spectrum_rgb(result.intensity, result.frequency_keep_mask)
+            self.fft_3d_plot_photo = ImageTk.PhotoImage(Image.fromarray(spectrum_3d))
+            self.fft_3d_plot_canvas.configure(width=FFT_COORDINATE_VIEW_SIZE[0], height=FFT_COORDINATE_VIEW_SIZE[1])
+            self.fft_3d_plot_canvas.delete("all")
+            self.fft_3d_plot_canvas.create_image(0, 0, image=self.fft_3d_plot_photo, anchor=tk.NW)
+        else:
+            self.fft_3d_plot_canvas.delete("all")
+            self.fft_3d_plot_photo = None
+        left, top, right, bottom = result.roi_bounds_px
+        self.fft_query_var.set(
+            f"FFT 已完成：源区域 x={left}…{right}, y={top}…{bottom} px；"
+            f"坐标单位 {result.coordinate_unit}。点击图像查询一个频率点；黑色位置表示已遮掩频率。"
+        )
+
+    def query_fft_coordinate(self, event: tk.Event) -> None:
+        if self.fft_result is None:
+            return
+        result = self.fft_result
+        x = int(np.clip(self.fft_source_coordinate(event.widget.canvasx(event.x), event.widget), 0, result.source_shape_px[1] - 1))
+        y = int(np.clip(self.fft_source_coordinate(event.widget.canvasy(event.y), event.widget), 0, result.source_shape_px[0] - 1))
+        self.fft_delete_fx_var.set(f"{result.frequencies_x[x]:.8g}")
+        self.fft_delete_fy_var.set(f"{result.frequencies_y[y]:.8g}")
+        mask_text = "保留" if result.frequency_keep_mask[y, x] else "已遮掩"
+        self.fft_query_var.set(
+            f"频率坐标：fx={result.frequencies_x[x]:.6g}, fy={result.frequencies_y[y]:.6g} {result.coordinate_unit}    "
+            f"强度={result.intensity[y, x]:.6g}    幅值={result.magnitude[y, x]:.6g}    相位={result.phase_radians[y, x]:+.6f} rad    当前：{mask_text}"
+        )
+
+    def fft_source_coordinate(self, coordinate: float, canvas: tk.Canvas) -> float:
+        scale = self.fft_image_view_scale(canvas)
+        return 0.0 if scale <= 0 else coordinate / scale
+
+    def fft_image_view_scale(self, canvas: tk.Canvas) -> float:
+        if self.fft_result is None:
+            return 1.0
+        height, width = self.fft_result.source_shape_px
+        base_scale = min(1.0, FFT_VIEW_MAX_SIDE_PX / max(width, height))
+        if canvas is self.fft_spectrum_canvas:
+            return base_scale * self.fft_spectrum_zoom
+        if canvas is self.fft_phase_canvas:
+            return base_scale * self.fft_phase_zoom
+        return base_scale * self.fft_reconstruction_zoom
+
+    def fft_image_view_parts(self, view_name: str) -> tuple[str, tk.Canvas | None, str]:
+        if view_name == "spectrum":
+            return "fft_spectrum_zoom", self.fft_spectrum_canvas, "频谱图"
+        if view_name == "phase":
+            return "fft_phase_zoom", self.fft_phase_canvas, "相位图"
+        return "fft_reconstruction_zoom", self.fft_reconstruction_canvas, "重建图"
+
+    def zoom_fft_image_view(self, view_name: str, factor: float) -> None:
+        """Scale one FFT image pane without changing either of the other views."""
+        if self.fft_result is None:
+            messagebox.showinfo("请先计算 FFT", "请先计算二维 FFT，再放大图像。", parent=self.fft_dialog or self)
+            return
+        attribute, _canvas, label = self.fft_image_view_parts(view_name)
+        zoom = float(np.clip(getattr(self, attribute) * factor, 0.5, 12.0))
+        if math.isclose(zoom, getattr(self, attribute)):
+            return
+        setattr(self, attribute, zoom)
+        self.render_fft_result()
+        self.fft_query_var.set(f"{label}缩放：{zoom * 100:.0f}%（其他两张图不受影响）。")
+
+    def reset_fft_image_view_zoom(self, view_name: str) -> None:
+        if self.fft_result is None:
+            return
+        attribute, canvas, label = self.fft_image_view_parts(view_name)
+        setattr(self, attribute, 1.0)
+        self.render_fft_result()
+        if canvas is not None and canvas.winfo_exists():
+            canvas.xview_moveto(0.0)
+            canvas.yview_moveto(0.0)
+        self.fft_query_var.set(f"{label}已恢复为适合窗口大小。")
+
+    def enable_fft_pan_mode(self, canvas: tk.Canvas | None, label: str) -> None:
+        if self.fft_result is None or canvas is None:
+            messagebox.showinfo("请先计算 FFT", "请先计算二维 FFT，再拖动图像。", parent=self.fft_dialog or self)
+            return
+        self.fft_mask_mode = False
+        self.fft_mask_start = None
+        self.fft_pan_canvas = canvas
+        self.fft_fine_mask_mode = None
+        canvas.focus_set()
+        self.fft_query_var.set(f"{label}拖动模式：在该图上按住左键拖动平移；松开后自动返回普通操作。")
+
+    def enable_fft_mask_mode(self) -> None:
+        if self.fft_result is None:
+            messagebox.showinfo("请先计算 FFT", "请先点击“计算 / 刷新”，再遮掩频率。", parent=self.fft_dialog or self)
+            return
+        self.fft_pan_canvas = None
+        self.fft_fine_mask_mode = None
+        self.fft_mask_mode = True
+        self.fft_query_var.set("频率遮掩模式：请在频谱图或相位图上拖动矩形。程序会同步遮掩其共轭镜像频率。")
+
+    def enable_fft_fine_mask_mode(self, keep_frequency: bool) -> None:
+        if self.fft_result is None:
+            messagebox.showinfo("请先计算 FFT", "请先点击“计算 / 刷新”，再使用精细笔刷。", parent=self.fft_dialog or self)
+            return
+        self.fft_pan_canvas = None
+        self.fft_mask_mode = False
+        self.fft_mask_start = None
+        self.fft_fine_mask_mode = keep_frequency
+        self.fft_fine_mask_last_bin = None
+        self.fft_fine_mask_changed = False
+        action = "恢复" if keep_frequency else "遮掩"
+        self.fft_query_var.set(f"精细{action}笔刷：在频谱图或相位图拖动一次；半径 {self.fft_mask_brush_radius()} 格，0 表示单格。")
+
+    def start_fft_canvas_action(self, event: tk.Event) -> None:
+        if event.widget is self.fft_pan_canvas:
+            event.widget.scan_mark(event.x, event.y)
+            return
+        if self.fft_fine_mask_mode is not None:
+            self.paint_fft_fine_mask(event)
+            return
+        if not self.fft_mask_mode:
+            self.query_fft_coordinate(event)
+            return
+        canvas = event.widget
+        x, y = canvas.canvasx(event.x), canvas.canvasy(event.y)
+        self.fft_mask_start = (canvas, x, y)
+        canvas.delete("fft_mask_preview")
+        canvas.create_rectangle(x, y, x, y, outline="#ff4d4f", width=2, dash=(4, 2), tags="fft_mask_preview")
+
+    def move_fft_canvas_action(self, event: tk.Event) -> None:
+        if event.widget is self.fft_pan_canvas:
+            event.widget.scan_dragto(event.x, event.y, gain=1)
+            return
+        if self.fft_fine_mask_mode is not None:
+            self.paint_fft_fine_mask(event)
+            return
+        if self.fft_mask_start is None:
+            return
+        canvas, start_x, start_y = self.fft_mask_start
+        if event.widget is not canvas:
+            return
+        canvas.coords("fft_mask_preview", start_x, start_y, canvas.canvasx(event.x), canvas.canvasy(event.y))
+
+    def finish_fft_canvas_action(self, event: tk.Event) -> None:
+        if event.widget is self.fft_pan_canvas:
+            self.fft_pan_canvas = None
+            self.fft_query_var.set("图像已平移；可继续点击读取坐标，或选择“遮掩频率”进行框选。")
+            return
+        if self.fft_fine_mask_mode is not None:
+            event.widget.delete("fft_brush_preview")
+            changed = self.fft_fine_mask_changed
+            self.fft_fine_mask_mode = None
+            self.fft_fine_mask_last_bin = None
+            self.fft_fine_mask_changed = False
+            if changed:
+                self.reconstruct_fft_image()
+            return
+        if self.fft_mask_start is None or self.fft_result is None:
+            return
+        canvas, start_x, start_y = self.fft_mask_start
+        if event.widget is not canvas:
+            return
+        end_x, end_y = canvas.canvasx(event.x), canvas.canvasy(event.y)
+        canvas.delete("fft_mask_preview")
+        self.fft_mask_start = None
+        self.fft_mask_mode = False
+        result = self.fft_result
+        x0, x1 = sorted((self.fft_source_coordinate(start_x, canvas), self.fft_source_coordinate(end_x, canvas)))
+        y0, y1 = sorted((self.fft_source_coordinate(start_y, canvas), self.fft_source_coordinate(end_y, canvas)))
+        left = int(np.clip(math.floor(x0), 0, result.source_shape_px[1] - 1))
+        right = int(np.clip(math.ceil(x1), 0, result.source_shape_px[1] - 1))
+        top = int(np.clip(math.floor(y0), 0, result.source_shape_px[0] - 1))
+        bottom = int(np.clip(math.ceil(y1), 0, result.source_shape_px[0] - 1))
+        self.apply_fft_mask_bounds(left, top, right, bottom)
+
+    def start_fft_reconstruction_action(self, event: tk.Event) -> None:
+        if event.widget is self.fft_pan_canvas:
+            event.widget.scan_mark(event.x, event.y)
+
+    def move_fft_reconstruction_action(self, event: tk.Event) -> None:
+        if event.widget is self.fft_pan_canvas:
+            event.widget.scan_dragto(event.x, event.y, gain=1)
+
+    def finish_fft_reconstruction_action(self, event: tk.Event) -> None:
+        if event.widget is self.fft_pan_canvas:
+            self.fft_pan_canvas = None
+            self.fft_query_var.set("重建图已平移；可继续使用上方控制缩放或再次选择“拖动”。")
+
+    def paint_fft_fine_mask(self, event: tk.Event) -> None:
+        """Apply one small symmetric brush stamp without reconstructing per motion event."""
+        if self.fft_result is None or self.fft_fine_mask_mode is None:
+            return
+        result = self.fft_result
+        canvas = event.widget
+        column = int(np.clip(self.fft_source_coordinate(canvas.canvasx(event.x), canvas), 0, result.source_shape_px[1] - 1))
+        row = int(np.clip(self.fft_source_coordinate(canvas.canvasy(event.y), canvas), 0, result.source_shape_px[0] - 1))
+        if (row, column) == self.fft_fine_mask_last_bin:
+            return
+        radius = self.fft_mask_brush_radius()
+        left, right = column - radius, column + radius
+        top, bottom = row - radius, row + radius
+        self.set_fft_mask_bounds(left, top, right, bottom, keep_frequency=self.fft_fine_mask_mode)
+        self.fft_fine_mask_last_bin = (row, column)
+        self.fft_fine_mask_changed = True
+        scale = self.fft_image_view_scale(canvas)
+        canvas.delete("fft_brush_preview")
+        canvas.create_rectangle(
+            left * scale,
+            top * scale,
+            (right + 1) * scale,
+            (bottom + 1) * scale,
+            outline="#5ad8ff" if self.fft_fine_mask_mode else "#ff4d4f",
+            width=2,
+            dash=(3, 2),
+            tags="fft_brush_preview",
+        )
+
+    def fft_mask_brush_radius(self) -> int:
+        try:
+            return int(np.clip(self.fft_mask_brush_radius_var.get(), 0, 12))
+        except tk.TclError:
+            return 0
+
+    def apply_fft_mask_bounds(self, left: int, top: int, right: int, bottom: int) -> None:
+        """Delete a frequency rectangle and its conjugate mirror before reconstruction."""
+        self.set_fft_mask_bounds(left, top, right, bottom, keep_frequency=False)
+        self.reconstruct_fft_image()
+
+    def set_fft_mask_bounds(self, left: int, top: int, right: int, bottom: int, *, keep_frequency: bool) -> None:
+        """Change a frequency rectangle and its conjugate mirror, without reconstruction."""
+        if self.fft_result is None:
+            return
+        result = self.fft_result
+        height, width = result.source_shape_px
+        left, right = sorted((int(np.clip(left, 0, width - 1)), int(np.clip(right, 0, width - 1))))
+        top, bottom = sorted((int(np.clip(top, 0, height - 1)), int(np.clip(bottom, 0, height - 1))))
+        selected_y = np.arange(top, bottom + 1)
+        selected_x = np.arange(left, right + 1)
+        result.frequency_keep_mask[np.ix_(selected_y, selected_x)] = keep_frequency
+        mirror_y = np.asarray([fft_conjugate_index(index, height) for index in selected_y])
+        mirror_x = np.asarray([fft_conjugate_index(index, width) for index in selected_x])
+        result.frequency_keep_mask[np.ix_(mirror_y, mirror_x)] = keep_frequency
+
+    def delete_fft_frequency_by_coordinate(self) -> None:
+        if self.fft_result is None:
+            messagebox.showinfo("请先计算 FFT", "请先计算二维 FFT。", parent=self.fft_dialog or self)
+            return
+        try:
+            frequency_x = float(self.fft_delete_fx_var.get())
+            frequency_y = float(self.fft_delete_fy_var.get())
+        except ValueError:
+            messagebox.showwarning("频率坐标无效", "请输入数字 fx 和 fy；也可以先点击频谱图自动填入。", parent=self.fft_dialog or self)
+            return
+        result = self.fft_result
+        column = int(np.argmin(np.abs(result.frequencies_x - frequency_x)))
+        row = int(np.argmin(np.abs(result.frequencies_y - frequency_y)))
+        self.apply_fft_mask_bounds(column, row, column, row)
+
+    def restore_fft_frequency_by_coordinate(self) -> None:
+        if self.fft_result is None:
+            messagebox.showinfo("请先计算 FFT", "请先计算二维 FFT。", parent=self.fft_dialog or self)
+            return
+        try:
+            frequency_x = float(self.fft_delete_fx_var.get())
+            frequency_y = float(self.fft_delete_fy_var.get())
+        except ValueError:
+            messagebox.showwarning("频率坐标无效", "请输入数字 fx 和 fy；也可以先点击频谱图自动填入。", parent=self.fft_dialog or self)
+            return
+        result = self.fft_result
+        column = int(np.argmin(np.abs(result.frequencies_x - frequency_x)))
+        row = int(np.argmin(np.abs(result.frequencies_y - frequency_y)))
+        self.set_fft_mask_bounds(column, row, column, row, keep_frequency=True)
+        self.reconstruct_fft_image()
+
+    def reset_fft_frequency_mask(self) -> None:
+        if self.fft_result is None:
+            return
+        self.fft_result.frequency_keep_mask.fill(True)
+        self.reconstruct_fft_image()
+
+    def reconstruct_fft_image(self) -> None:
+        if self.fft_result is None:
+            messagebox.showinfo("请先计算 FFT", "请先计算二维 FFT。", parent=self.fft_dialog or self)
+            return
+        result = self.fft_result
+        result.reconstructed_image = inverse_masked_fft(result)
+        result.reconstruction_display = fft_reconstruction_display(result.reconstructed_image)
+        self.render_fft_result()
+        removed = int(result.frequency_keep_mask.size - np.count_nonzero(result.frequency_keep_mask))
+        self.fft_query_var.set(f"已完成逆变换重建：已遮掩 {removed} / {result.frequency_keep_mask.size} 个频率栅格（包含自动同步的共轭频率）。")
+        self.status_var.set("二维 FFT 频率遮掩已逆变换为重建图；可导出 PNG 与 CSV。")
+
+    def export_fft_results(self) -> None:
+        if self.fft_result is None:
+            messagebox.showinfo("暂无 FFT 结果", "请先计算二维 FFT。", parent=self.fft_dialog or self)
+            return
+        initial = f"{self.image_path.stem if self.image_path else 'sem'}_fft"
+        target = filedialog.asksaveasfilename(
+            title="保存二维 FFT 坐标数据",
+            defaultextension=".csv",
+            initialfile=f"{initial}_coordinates.csv",
+            filetypes=[("CSV 文件", "*.csv")],
+            parent=self.fft_dialog or self,
+        )
+        if not target:
+            return
+        csv_path = Path(target)
+        spectrum_path = csv_path.with_name(f"{csv_path.stem}_spectrum.png")
+        phase_path = csv_path.with_name(f"{csv_path.stem}_phase.png")
+        reconstruction_path = csv_path.with_name(f"{csv_path.stem}_reconstruction.png")
+        result = self.fft_result
+        if result.reconstruction_display is None:
+            self.reconstruct_fft_image()
+        try:
+            with open(csv_path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(["source", str(self.image_path) if self.image_path else ""])
+                writer.writerow(["fft_window", result.window_name])
+                writer.writerow(["coordinate_unit", result.coordinate_unit])
+                writer.writerow(["roi_left_px", result.roi_bounds_px[0]])
+                writer.writerow(["roi_top_px", result.roi_bounds_px[1]])
+                writer.writerow(["roi_right_px", result.roi_bounds_px[2]])
+                writer.writerow(["roi_bottom_px", result.roi_bounds_px[3]])
+                writer.writerow(["masked_frequency_bin_count", int(result.frequency_keep_mask.size - np.count_nonzero(result.frequency_keep_mask))])
+                writer.writerow([])
+                writer.writerow(["frequency_x", "frequency_y", "magnitude", "intensity", "phase_radians", "mask_kept"])
+                for row_index, frequency_y in enumerate(result.frequencies_y):
+                    for column_index, frequency_x in enumerate(result.frequencies_x):
+                        writer.writerow([
+                            frequency_x,
+                            frequency_y,
+                            result.magnitude[row_index, column_index],
+                            result.intensity[row_index, column_index],
+                            result.phase_radians[row_index, column_index],
+                            result.frequency_keep_mask[row_index, column_index],
+                        ])
+            spectrum_display = result.spectrum_display.copy()
+            phase_display = result.phase_display.copy()
+            spectrum_display[~result.frequency_keep_mask] = 0
+            phase_display[~result.frequency_keep_mask] = 0
+            Image.fromarray(spectrum_display).save(spectrum_path, "PNG")
+            Image.fromarray(phase_display, "RGB").save(phase_path, "PNG")
+            if result.reconstruction_display is not None:
+                Image.fromarray(result.reconstruction_display).save(reconstruction_path, "PNG")
+        except OSError as exc:
+            messagebox.showerror("FFT 导出失败", str(exc), parent=self.fft_dialog or self)
+            return
+        self.status_var.set(f"已导出 FFT：{csv_path.name}、{spectrum_path.name}、{phase_path.name}、{reconstruction_path.name}")
+        messagebox.showinfo("FFT 已导出", f"已保存：\n{csv_path}\n{spectrum_path}\n{phase_path}\n{reconstruction_path}", parent=self.fft_dialog or self)
+
     def gaussian_kernel_size(self) -> int:
         return int(self.gaussian_kernel_size_var.get().split()[0])
 
@@ -2778,6 +3882,7 @@ class LERLWRApp(AppBase):
         self.analysis_origin = None
         self.clear_era_line_samples(redraw=False)
         self.bcp_result = None
+        self.clear_fft_analysis(clear_roi=True)
         self.clear_bcp_completion_selection(redraw=False)
         self.clear_auto_line_candidates(redraw=False)
         self.rebuild_working_images()
@@ -2807,6 +3912,9 @@ class LERLWRApp(AppBase):
         roi_image_coordinates = None
         if self.roi_canvas is not None and old_scale > 0:
             roi_image_coordinates = tuple(value / old_scale for value in self.roi_canvas)
+        fft_roi_image_coordinates = None
+        if self.fft_roi_canvas is not None and old_scale > 0:
+            fft_roi_image_coordinates = tuple(value / old_scale for value in self.fft_roi_canvas)
         self.base_scale = min(MAX_VIEW_WIDTH / width, MAX_VIEW_HEIGHT / height, 1.0)
         self.display_scale = self.base_scale * self.zoom_factor
         display_size = (max(1, round(width * self.display_scale)), max(1, round(height * self.display_scale)))
@@ -2819,7 +3927,10 @@ class LERLWRApp(AppBase):
             self.roi_canvas = tuple(value * self.display_scale for value in roi_image_coordinates)
         else:
             self.roi_rectangle = None
+        if fft_roi_image_coordinates is not None:
+            self.fft_roi_canvas = tuple(value * self.display_scale for value in fft_roi_image_coordinates)
         self.draw_roi()
+        self.draw_fft_roi()
         self.render_analysis_overlay()
         self.render_bcp_overlay()
         self.draw_bcp_completion_polygon()
@@ -2870,6 +3981,8 @@ class LERLWRApp(AppBase):
     def draw_era_rois(self) -> None:
         """Show the stored manual single-edge ROIs without making them editable on canvas."""
         self.canvas.delete("era_roi")
+        if not self.show_era_rois:
+            return
         for index, sample in enumerate(self.era_line_samples, start=1):
             for side, bounds, color in (
                 ("L", sample.left_roi_bounds_px, self.fit_left_color),
@@ -2928,6 +4041,9 @@ class LERLWRApp(AppBase):
         return None
 
     def update_canvas_cursor(self, event: tk.Event) -> None:
+        if self.fft_roi_mode:
+            self.canvas.configure(cursor="crosshair")
+            return
         if self.bcp_completion_mode:
             self.canvas.configure(cursor="pencil")
             return
@@ -3238,6 +4354,9 @@ class LERLWRApp(AppBase):
 
 
     def start_canvas_action(self, event: tk.Event) -> None:
+        if self.fft_roi_mode and not self.space_held:
+            self.start_fft_roi(event)
+            return
         if self.bcp_split_mode and not self.space_held:
             self.start_bcp_manual_split_draw(event)
             return
@@ -3299,6 +4418,9 @@ class LERLWRApp(AppBase):
         self.clear_detected_edges(redraw)
 
     def move_canvas_action(self, event: tk.Event) -> None:
+        if self.fft_roi_mode and self.fft_roi_drag_start is not None:
+            self.move_fft_roi(event)
+            return
         if self.annotation_selection_start is not None:
             self.move_annotation_selection(event)
             return
@@ -3323,6 +4445,9 @@ class LERLWRApp(AppBase):
         self.draw_annotations()
 
     def finish_canvas_action(self, event: tk.Event) -> None:
+        if self.fft_roi_mode and self.fft_roi_drag_start is not None:
+            self.finish_fft_roi(event)
+            return
         if self.annotation_selection_start is not None:
             self.finish_annotation_selection(event)
             return
@@ -3605,6 +4730,8 @@ class LERLWRApp(AppBase):
 
     def scroll_active_window(self, event: tk.Event) -> str | None:
         top_level = event.widget.winfo_toplevel()
+        if self.ler_lwr_dialog is not None and top_level == self.ler_lwr_dialog and self.ler_lwr_dialog_scroll is not None:
+            return self.ler_lwr_dialog_scroll.scroll_wheel(event)
         if self.bcp_dialog is not None and top_level == self.bcp_dialog and self.bcp_dialog_scroll is not None:
             return self.bcp_dialog_scroll.scroll_wheel(event)
         if top_level == self:
@@ -3691,6 +4818,20 @@ class LERLWRApp(AppBase):
         self.result_var.set("ROI 已清除；下一次识别 / 分析将使用整张图像。")
         self.status_var.set("已清除 ROI；将使用整图。")
         return "break"
+
+    def hide_roi_after_successful_analysis(self) -> None:
+        """Remove the temporary selection outline while preserving the completed result."""
+        if self.roi_canvas is None:
+            return
+        self.roi_canvas = None
+        self.roi_rectangle = None
+        self.drag_start = None
+        self.roi_drag_mode = None
+        self.roi_drag_anchor = None
+        self.roi_start_bounds = None
+        self.roi_was_changed = False
+        self.ler_lwr_roi_mode = False
+        self.canvas.delete("roi")
 
     def selected_roi(self) -> tuple[np.ndarray, int, int]:
         if self.raw_image is None or self.roi_canvas is None:
@@ -3805,17 +4946,31 @@ class LERLWRApp(AppBase):
     def start_era_roi_selection(self, side: str) -> None:
         if self.raw_image is None:
             return
-        self.selected_era_line_sample()
+        sample = self.selected_era_line_sample()
         if side not in ("left", "right"):
             raise ValueError("单边 ROI 只能指定为左边或右边。")
         self.era_pending_roi_target = (self.era_active_sample_index, side)
-        self.roi_canvas = None
+        self.show_era_rois = True
+        saved_bounds = sample.left_roi_bounds_px if side == "left" else sample.right_roi_bounds_px
+        if saved_bounds is None:
+            self.roi_canvas = None
+        else:
+            left, top, right, bottom = saved_bounds
+            self.roi_canvas = (
+                left * self.display_scale,
+                top * self.display_scale,
+                right * self.display_scale,
+                bottom * self.display_scale,
+            )
         self.ler_lwr_roi_mode = True
         self.active_annotation_index = None
         self.draw_roi()
         self.canvas.configure(cursor="crosshair")
         side_name = "左边" if side == "left" else "右边"
-        self.status_var.set(f"请在主图拖动框选线样本 {self.era_active_sample_index + 1} 的{side_name}单边 ROI。")
+        if saved_bounds is None:
+            self.status_var.set(f"请在主图拖动框选线样本 {self.era_active_sample_index + 1} 的{side_name}单边 ROI。")
+        else:
+            self.status_var.set(f"已载入线样本 {self.era_active_sample_index + 1} 的{side_name} ROI；拖动框内可移动，拖动边或角可调整大小。")
 
     def store_pending_era_roi(self) -> bool:
         if self.era_pending_roi_target is None:
@@ -3838,6 +4993,7 @@ class LERLWRApp(AppBase):
         self.era_pending_roi_target = None
         self.roi_canvas = None
         self.roi_rectangle = None
+        self.ler_lwr_roi_mode = False
         self.refresh_era_sample_list()
         self.draw_roi()
         side_name = "左边" if side == "left" else "右边"
@@ -3885,6 +5041,7 @@ class LERLWRApp(AppBase):
         self.refresh_era_sample_list()
         self.update_lcdu_summary_text()
         self.update_era_result_text()
+        self.show_era_rois = False
 
     def update_era_result_text(self) -> None:
         if self.era_aggregate_result is None:
@@ -4055,6 +5212,7 @@ class LERLWRApp(AppBase):
             self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_result = None
             self.clear_bcp_completion_selection(redraw=False)
+            self.hide_roi_after_successful_analysis()
             self.draw_image()
             if detector == EDGE_DETECTOR_LAPLACIAN:
                 self.update_result_text()
@@ -4119,8 +5277,8 @@ class LERLWRApp(AppBase):
         era_buttons = ttk.Frame(era_controls)
         era_buttons.pack(anchor="w", pady=(8, 0))
         ttk.Button(era_buttons, text="新建线样本", command=self.new_era_line_sample).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(era_buttons, text="框选左边 ROI", command=lambda: self.start_era_roi_selection("left")).pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Button(era_buttons, text="框选右边 ROI", command=lambda: self.start_era_roi_selection("right")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(era_buttons, text="框选 / 调整左边 ROI", command=lambda: self.start_era_roi_selection("left")).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(era_buttons, text="框选 / 调整右边 ROI", command=lambda: self.start_era_roi_selection("right")).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(era_buttons, text="删除线样本", command=self.delete_selected_era_line_sample).pack(side=tk.LEFT)
         self.era_sample_listbox = tk.Listbox(era_controls, height=4, exportselection=False)
         self.era_sample_listbox.pack(fill=tk.X, pady=(8, 0))
