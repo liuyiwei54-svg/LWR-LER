@@ -14,12 +14,15 @@ import sys
 import tempfile
 import time
 import tkinter as tk
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, scrolledtext, ttk
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
+
+from auto_line_detection import detect_line_candidates
+from periodic_line_detection import BrightBandCandidate, bright_band_position, bright_band_search_bounds, detect_bright_bands, select_periodic_pairs
 
 VENDOR_DIRECTORY = Path(__file__).with_name("vendor")
 if VENDOR_DIRECTORY.exists():
@@ -36,6 +39,8 @@ except ImportError:
     DND_AVAILABLE = False
 
 
+APP_VERSION = "4.0.0"
+
 MAX_VIEW_WIDTH = 980
 MAX_VIEW_HEIGHT = 620
 ZOOM_MIN = 0.25
@@ -44,6 +49,7 @@ ZOOM_STEP = 0.10
 MIN_ROI_WIDTH = 24
 MIN_ROI_HEIGHT = 80
 MIN_ERA_ROI_WIDTH = 12
+MIN_BRIGHT_BAND_ROI_WIDTH = 5
 MIN_ERA_ROI_HEIGHT = 80
 ROI_HANDLE_SIZE = 5
 ROI_HANDLE_HIT = 10
@@ -80,6 +86,12 @@ ERA_POLARITY_FALLING = "下降沿（亮→暗）"
 ERA_POLARITIES = (ERA_POLARITY_AUTO, ERA_POLARITY_RISING, ERA_POLARITY_FALLING)
 ERA_DEFAULT_POLYNOMIAL_DEGREE = 3
 ERA_DIFFERENCE_POWER = 4
+AUTO_LINE_BRIGHT = "亮线（暗背景）"
+AUTO_LINE_DARK = "暗线（亮背景）"
+AUTO_MODE_PERIODIC = "周期亮边（槽 / 平台）"
+AUTO_MODE_SOLID = "实体亮线 / 暗线（原模式）"
+PERIODIC_KIND_LABELS = {"槽": "trench", "平台": "platform"}
+PERIODIC_POSITION_LABELS = {"亮带中心": "center", "亮带左侧": "left", "亮带右侧": "right"}
 VERTICAL_EDGE_SUPPORT_WINDOW_PX = 41
 VERTICAL_EDGE_SUPPORT_MIN_POINTS = 24
 CD_RAY_STEP_PX = 0.25
@@ -207,13 +219,36 @@ class SingleEdgeResult:
 
 @dataclass
 class EraLineSample:
-    """User-defined left/right single-edge ROIs for one physical line."""
+    """Editable left/right single-edge ROIs for one physical line."""
 
     left_roi_bounds_px: tuple[int, int, int, int] | None = None
     right_roi_bounds_px: tuple[int, int, int, int] | None = None
     left_edge: SingleEdgeResult | None = None
     right_edge: SingleEdgeResult | None = None
     paired_result: AnalysisResult | None = None
+    selection_source: str = "manual"
+    line_polarity: str | None = None
+    recognition_support_fraction: float | None = None
+    measurement_error: str | None = None
+    edge_profile_kind: str = "transition"
+    left_position_definition: str = "center"
+    right_position_definition: str = "center"
+    target_kind: str | None = None
+    interval_index: int | None = None
+    reference_interval: int | None = None
+    reference_kind: str | None = None
+    discovery_signature: tuple | None = None
+    left_reference_band_px: tuple[float, float] | None = None
+    right_reference_band_px: tuple[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class PeriodicLineSettings:
+    reference_interval: int = 1
+    reference_kind: str = "trench"
+    target_kind: str = "trench"
+    left_definition: str = "center"
+    right_definition: str = "center"
 
 
 @dataclass
@@ -304,6 +339,9 @@ class EditorState:
     analysis_origin: tuple[int, int] | None
     bcp_result: BCPAnalysisResult | None
     bcp_metrics_finalized: bool
+    era_line_samples: list[EraLineSample]
+    era_aggregate_result: EraAggregateResult | None
+    show_era_rois: bool
 
 
 def read_sem_pixel_size_nm(image: Image.Image) -> float | None:
@@ -368,6 +406,14 @@ def normalize_intensity(image: np.ndarray) -> np.ndarray:
     if high <= low:
         return np.zeros(image.shape, dtype=np.uint8)
     return np.clip((image - low) * 255.0 / (high - low), 0, 255).astype(np.uint8)
+
+
+def grayscale_image_uint8(image: Image.Image) -> np.ndarray:
+    """Convert an imported image to visible 8-bit grayscale without clipping 16-bit data."""
+    pixels = np.asarray(image)
+    if pixels.ndim == 2:
+        return pixels.copy() if pixels.dtype == np.uint8 else normalize_intensity(pixels)
+    return np.asarray(image.convert("L"))
 
 
 def gaussian_kernel(size: int, sigma_scale: float = 1.0) -> np.ndarray:
@@ -1106,6 +1152,143 @@ def analyze_roi(
     )
 
 
+def automatic_era_line_samples(
+    image: np.ndarray,
+    bright_lines: bool = True,
+    origin_px: tuple[int, int] = (0, 0),
+) -> list[EraLineSample]:
+    """Turn detected line bands into editable single-edge ROIs in working coordinates."""
+    samples = []
+    offset_x, offset_y = origin_px
+    for candidate in detect_line_candidates(image, bright_lines, MIN_ERA_ROI_WIDTH, MIN_ERA_ROI_HEIGHT):
+        bounds = [
+            (left + offset_x, top + offset_y, right + offset_x, bottom + offset_y)
+            for left, top, right, bottom in (candidate.left_roi_bounds_px, candidate.right_roi_bounds_px)
+        ]
+        samples.append(EraLineSample(
+            left_roi_bounds_px=bounds[0],
+            right_roi_bounds_px=bounds[1],
+            selection_source="automatic",
+            line_polarity="bright" if bright_lines else "dark",
+            recognition_support_fraction=candidate.support_fraction,
+        ))
+    return samples
+
+
+def periodic_line_samples(
+    image: np.ndarray,
+    settings: PeriodicLineSettings,
+    origin_px: tuple[int, int] = (0, 0),
+    bands: list[BrightBandCandidate] | None = None,
+) -> list[EraLineSample]:
+    """Pair adjacent bright boundaries according to a user-labeled periodic interval."""
+    if settings.left_definition not in PERIODIC_POSITION_LABELS.values() or settings.right_definition not in PERIODIC_POSITION_LABELS.values():
+        raise ValueError("亮带取点只能选择中心、左侧或右侧。")
+    bands = detect_bright_bands(image) if bands is None else bands
+    pairs = select_periodic_pairs(bands, settings.reference_interval, settings.reference_kind, settings.target_kind)
+    offset_x, offset_y = origin_px
+    samples = []
+    for first, second in pairs:
+        bounds = [
+            (left + offset_x, top + offset_y, right + offset_x, bottom + offset_y)
+            for left, top, right, bottom in (bands[first].roi_bounds_px, bands[second].roi_bounds_px)
+        ]
+        samples.append(EraLineSample(
+            left_roi_bounds_px=bounds[0], right_roi_bounds_px=bounds[1],
+            selection_source="automatic", edge_profile_kind="bright_band",
+            recognition_support_fraction=min(bands[first].support_fraction, bands[second].support_fraction),
+            left_position_definition=settings.left_definition,
+            right_position_definition=settings.right_definition,
+            target_kind=settings.target_kind, interval_index=first + 1,
+            reference_interval=settings.reference_interval, reference_kind=settings.reference_kind,
+            left_reference_band_px=(bands[first].left_half_px + offset_x, bands[first].right_half_px + offset_x),
+            right_reference_band_px=(bands[second].left_half_px + offset_x, bands[second].right_half_px + offset_x),
+        ))
+    return samples
+
+
+def reference_bright_band(image: np.ndarray, bounds: tuple[int, int, int, int]) -> tuple[float, float]:
+    """Resolve a deliberately adjusted band once, before fitting any scanline."""
+    left, top, right, bottom = bounds
+    profile = np.median(image[top:bottom, left:right].astype(float), axis=0)
+    reference = (bright_band_position(profile, "left") + left, bright_band_position(profile, "right") + left)
+    if not all(math.isfinite(value) for value in reference):
+        raise ValueError("选区未包含一条完整、明确的亮带；请调整选区。")
+    return reference
+
+
+def analyze_bright_band_edge(
+    image: np.ndarray,
+    roi_bounds_px: tuple[int, int, int, int],
+    pixel_size_nm: float,
+    definition: str = "center",
+    max_jump_px: float = 12.0,
+    reference_band_px: tuple[float, float] | None = None,
+) -> SingleEdgeResult:
+    """Measure a bright boundary at its left/right half-height or their midpoint."""
+    if not math.isfinite(pixel_size_nm) or pixel_size_nm <= 0:
+        raise ValueError("像素尺寸必须为大于 0 的有限数值。")
+    if definition not in PERIODIC_POSITION_LABELS.values():
+        raise ValueError("亮带取点只能选择中心、左侧或右侧。")
+    left, top, right, bottom = roi_bounds_px
+    if not (0 <= left < right <= image.shape[1] and 0 <= top < bottom <= image.shape[0]):
+        raise ValueError("亮带 ROI 超出图像范围。")
+    region = image[top:bottom, left:right]
+    if region.shape[0] < MIN_ERA_ROI_HEIGHT or region.shape[1] < MIN_BRIGHT_BAND_ROI_WIDTH:
+        raise ValueError("亮带 ROI 至少需要 5 px 宽、80 px 高，并包含两侧局部暗背景。")
+    numeric_region = region.astype(float)
+    if reference_band_px is None:
+        reference_band_px = reference_bright_band(image, roi_bounds_px)
+    reference_local = (reference_band_px[0] - left, reference_band_px[1] - left)
+    try:
+        search_start, search_stop = bright_band_search_bounds(region.shape[1], reference_local)
+    except ValueError as exc:
+        raise ValueError("亮带 ROI 未包含有效的预览亮边；请重新预览或调整选区。") from exc
+    flank = max(1, min(3, region.shape[1] // 5))
+    backgrounds = np.maximum(np.median(numeric_region[:, :flank], axis=1), np.median(numeric_region[:, -flank:], axis=1))
+    contrasts = np.max(numeric_region[:, search_start:search_stop], axis=1) - backgrounds
+    minimum_contrast = max(1e-9, 0.2 * float(np.percentile(contrasts, 75)))
+    trace = np.asarray([
+        bright_band_position(row, definition, reference_local) if contrast > minimum_contrast else np.nan
+        for row, contrast in zip(region, contrasts)
+    ], dtype=float)
+    repaired, valid = replace_outliers(trace, max_jump_px)
+    if np.count_nonzero(valid) < max(30, math.ceil(region.shape[0] * 0.6)):
+        raise ValueError("亮带有效行不足；请检查是否完整包含单条亮带及其两侧暗区。")
+    rows = np.arange(region.shape[0], dtype=float)[valid] + top
+    positions = repaired[valid] + left
+    baseline = np.polyval(np.polyfit(rows, positions, 1), rows)
+    residuals = (positions - baseline) * pixel_size_nm
+    return SingleEdgeResult(
+        rows, positions, residuals,
+        math.sqrt(float(np.dot(residuals, residuals)) / (len(rows) - 2)),
+        int(np.count_nonzero(~valid)), roi_bounds_px, f"bright_band_{definition}", 0,
+    )
+
+
+def single_edge_segments(edge: SingleEdgeResult, split_missing_rows: bool = False) -> list[np.ndarray]:
+    """Keep rejected periodic scanlines visibly absent from canvas and exports."""
+    points = np.column_stack((edge.edge_px, edge.rows_px))
+    cuts = np.flatnonzero(np.diff(edge.rows_px) > 1) + 1 if split_missing_rows else []
+    return [segment for segment in np.split(points, cuts) if len(segment) >= 2]
+
+
+def automatic_era_row_mask(
+    image: np.ndarray,
+    roi_bounds_px: tuple[int, int, int, int],
+    polarity: str,
+) -> np.ndarray:
+    """Exclude contrast-free rows from automatic fits without filtering measurement pixels."""
+    left, top, right, bottom = roi_bounds_px
+    region = image[top:bottom, left:right].astype(float)
+    flank = max(2, min(8, region.shape[1] // 4))
+    sign = 1 if polarity == ERA_POLARITY_RISING else -1
+    contrast = sign * (np.median(region[:, -flank:], axis=1) - np.median(region[:, :flank], axis=1))
+    typical_contrast = max(0.0, float(np.percentile(contrast, 75)))
+    noise = np.median(np.abs(np.diff(region, axis=1)), axis=1) / 0.9538725524
+    return contrast > np.maximum(3.0 * noise, max(1e-9, 0.2 * typical_contrast))
+
+
 def era_polarity_sign(image: np.ndarray, polarity: str) -> tuple[int, str]:
     """Resolve the expected intensity transition of one manually selected edge ROI."""
     if polarity == ERA_POLARITY_RISING:
@@ -1170,6 +1353,7 @@ def analyze_single_edge_era(
     polynomial_degree: int = ERA_DEFAULT_POLYNOMIAL_DEGREE,
     polarity: str = ERA_POLARITY_AUTO,
     max_jump_px: float = 12.0,
+    valid_rows_mask: np.ndarray | None = None,
 ) -> SingleEdgeResult:
     """Independently locate one SEM edge with an ERA-style profile fit.
 
@@ -1185,11 +1369,17 @@ def analyze_single_edge_era(
     height, width = roi.shape
     if width < MIN_ERA_ROI_WIDTH or height < MIN_ERA_ROI_HEIGHT:
         raise ValueError("单边 ROI 过小；请至少包含 80 个沿线方向像素和约 12 px 横向灰度过渡区域。")
+    if valid_rows_mask is None:
+        valid_rows_mask = np.ones(height, dtype=bool)
+    if not isinstance(valid_rows_mask, np.ndarray) or valid_rows_mask.shape != (height,) or valid_rows_mask.dtype != np.bool_:
+        raise ValueError("有效行掩膜必须与单边 ROI 的高度一致，且为布尔数组。")
+    if not valid_rows_mask.any():
+        raise ValueError("单边 ROI 没有具有足够亮暗对比的扫描行。")
     polarity_sign, resolved_polarity = era_polarity_sign(roi, polarity)
-    reference_difference = polarity_sign * np.diff(np.median(roi.astype(float), axis=0))
+    reference_difference = polarity_sign * np.diff(np.median(roi[valid_rows_mask].astype(float), axis=0))
     reference_x = float(np.argmax(reference_difference) + 0.5)
     trace = np.array(
-        [era_edge_position(roi[row], reference_x, polarity_sign, polynomial_degree) for row in range(height)],
+        [era_edge_position(roi[row], reference_x, polarity_sign, polynomial_degree) if valid_rows_mask[row] else np.nan for row in range(height)],
         dtype=float,
     )
     repaired_trace, valid = replace_outliers(trace, max_jump_px)
@@ -2358,6 +2548,9 @@ class LERLWRApp(AppBase):
         self.era_active_sample_index: int | None = None
         self.era_pending_roi_target: tuple[int, str] | None = None
         self.show_era_rois = True
+        self.periodic_bands = []
+        self.periodic_origin_px = (0, 0)
+        self.periodic_preview_signature = None
         self.era_sample_listbox: tk.Listbox | None = None
         self.bcp_result: BCPAnalysisResult | None = None
         self.bcp_metrics_finalized = False
@@ -2402,6 +2595,15 @@ class LERLWRApp(AppBase):
         self.edge_detector_var = tk.StringVar(value=EDGE_DETECTOR_SCHARR)
         self.era_polarity_var = tk.StringVar(value=ERA_POLARITY_AUTO)
         self.era_polynomial_degree_var = tk.StringVar(value=str(ERA_DEFAULT_POLYNOMIAL_DEGREE))
+        self.auto_line_polarity_var = tk.StringVar(value=AUTO_LINE_BRIGHT)
+        self.auto_line_use_roi_var = tk.BooleanVar(value=False)
+        self.auto_line_mode_var = tk.StringVar(value=AUTO_MODE_PERIODIC)
+        self.periodic_preview_visible_var = tk.BooleanVar(value=True)
+        self.periodic_reference_interval_var = tk.StringVar(value="1")
+        self.periodic_reference_kind_var = tk.StringVar(value="请选择")
+        self.periodic_target_kind_var = tk.StringVar(value="槽")
+        self.periodic_left_position_var = tk.StringVar(value="亮带中心")
+        self.periodic_right_position_var = tk.StringVar(value="亮带中心")
         self.edge_kernel_size_var = tk.StringVar(value="3 × 3")
         self.edge_diagonal_weight_var = tk.StringVar(value="3")
         self.edge_axial_weight_var = tk.StringVar(value="10")
@@ -2412,7 +2614,7 @@ class LERLWRApp(AppBase):
         self.canny_threshold_ratio_text_var = tk.StringVar(value="2.50")
         self.canny_low_threshold_text_var = tk.StringVar(value="0.050")
         self.edge_kernel_preview_var = tk.StringVar(value="")
-        self.bcp_use_dog_var = tk.BooleanVar(value=True)
+        self.bcp_use_dog_var = tk.BooleanVar(value=False)
         self.fft_window_var = tk.StringVar(value=FFT_WINDOW_HANN)
         self.fft_query_var = tk.StringVar(value="尚未计算二维 FFT。")
         self.fft_delete_fx_var = tk.StringVar(value="")
@@ -2566,7 +2768,7 @@ class LERLWRApp(AppBase):
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(
             self.image_processing_panel,
-            text="DoG 过强时可取消勾选，改以原始亮暗强度分割。",
+            text="默认关闭；DoG 过强时可取消勾选，改以原始亮暗强度分割。",
             foreground="#666666",
         ).pack(side=tk.LEFT)
         ttk.Label(
@@ -2754,8 +2956,8 @@ class LERLWRApp(AppBase):
             with Image.open(path) as source:
                 metadata_pixel_size = read_sem_pixel_size_nm(source)
                 self.metadata_text = format_tiff_metadata(source, path)
-                image = source.convert("L")
-                self.original_image, self.info_bar_crop_height_px = remove_bottom_information_bar(np.asarray(image))
+                image = grayscale_image_uint8(source)
+                self.original_image, self.info_bar_crop_height_px = remove_bottom_information_bar(image)
         except (OSError, ValueError) as exc:
             messagebox.showerror("无法读取", f"无法读取图像：\n{exc}")
             return
@@ -2789,7 +2991,7 @@ class LERLWRApp(AppBase):
         self.annotations.clear()
         self.active_annotation_index = None
         self.draw_image(reset_view=True)
-        self.result_var.set("请框选一条线及两侧背景，然后点击“分析选区”。")
+        self.result_var.set("打开 LER/LWR 测量窗口，可自动找线并测量，或手动选择单边 ROI。")
         crop_note = f"；已自动裁掉底部信息栏 {self.info_bar_crop_height_px} px" if self.info_bar_crop_height_px else ""
         self.status_var.set(
             f"已打开：{self.image_path.name}  ({self.raw_image.shape[1]} × {self.raw_image.shape[0]} px)；"
@@ -2813,6 +3015,9 @@ class LERLWRApp(AppBase):
             self.analysis_origin,
             self.bcp_result,
             self.bcp_metrics_finalized,
+            [replace(sample) for sample in self.era_line_samples],
+            self.era_aggregate_result,
+            self.show_era_rois,
         )
 
     def record_undo_state(self) -> None:
@@ -2835,6 +3040,7 @@ class LERLWRApp(AppBase):
             self.status_var.set("没有可撤销的操作。")
             return "break"
         state = self.undo_history.pop()
+        self.clear_periodic_preview()
         self.roi_canvas = state.roi_canvas
         self.annotations = [MeasurementAnnotation(item.kind, item.bounds_px, item.color) for item in state.annotations]
         self.active_annotation_index = state.active_annotation_index
@@ -2851,6 +3057,26 @@ class LERLWRApp(AppBase):
         self.analysis_origin = state.analysis_origin
         self.bcp_result = state.bcp_result
         self.bcp_metrics_finalized = state.bcp_metrics_finalized
+        self.era_line_samples = [replace(sample) for sample in state.era_line_samples]
+        self.era_aggregate_result = state.era_aggregate_result
+        self.era_lcdu_cd_samples_nm = [
+            sample.paired_result.mean_width_nm for sample in self.era_line_samples
+            if sample.paired_result is not None
+        ] if self.era_aggregate_result is not None else []
+        self.era_active_sample_index = 0 if self.era_line_samples else None
+        self.era_pending_roi_target = None
+        self.show_era_rois = state.show_era_rois
+        periodic_sample = next((sample for sample in self.era_line_samples if sample.edge_profile_kind == "bright_band"), None)
+        if periodic_sample is not None:
+            self.periodic_preview_signature = periodic_sample.discovery_signature
+            self.auto_line_mode_var.set(AUTO_MODE_PERIODIC)
+            self.periodic_reference_interval_var.set(str(periodic_sample.reference_interval))
+            self.periodic_reference_kind_var.set(next(label for label, value in PERIODIC_KIND_LABELS.items() if value == periodic_sample.reference_kind))
+            self.periodic_target_kind_var.set(next(label for label, value in PERIODIC_KIND_LABELS.items() if value == periodic_sample.target_kind))
+            self.periodic_left_position_var.set(next(label for label, value in PERIODIC_POSITION_LABELS.items() if value == periodic_sample.left_position_definition))
+            self.periodic_right_position_var.set(next(label for label, value in PERIODIC_POSITION_LABELS.items() if value == periodic_sample.right_position_definition))
+        self.refresh_era_sample_list()
+        self.update_lcdu_summary_text()
         self.rebuild_working_images()
         self.clear_fft_analysis(clear_roi=True)
         self.draw_image()
@@ -3979,19 +4205,23 @@ class LERLWRApp(AppBase):
         self.draw_era_rois()
 
     def draw_era_rois(self) -> None:
-        """Show the stored manual single-edge ROIs without making them editable on canvas."""
+        """Show stored single-edge ROIs; explicit selection enables editing."""
         self.canvas.delete("era_roi")
+        self.canvas.delete("era_band_reference")
+        self.draw_periodic_preview()
         if not self.show_era_rois:
             return
+        scale = self.display_scale
         for index, sample in enumerate(self.era_line_samples, start=1):
-            for side, bounds, color in (
-                ("L", sample.left_roi_bounds_px, self.fit_left_color),
-                ("R", sample.right_roi_bounds_px, self.fit_right_color),
+            for side, bounds, color, reference in (
+                ("L", sample.left_roi_bounds_px, self.fit_left_color, sample.left_reference_band_px),
+                ("R", sample.right_roi_bounds_px, self.fit_right_color, sample.right_reference_band_px),
             ):
                 if bounds is None:
                     continue
+                # The rectangle must be the ROI that is actually measured, not a
+                # narrow band drawn in its place.
                 left, top, right, bottom = bounds
-                scale = self.display_scale
                 self.canvas.create_rectangle(
                     left * scale,
                     top * scale,
@@ -4005,11 +4235,23 @@ class LERLWRApp(AppBase):
                 self.canvas.create_text(
                     left * scale + 4,
                     top * scale + 10,
-                    text=f"{index}{side}",
+                    text=f"{index}{side} 选区",
                     anchor=tk.W,
                     fill=color,
                     tags="era_roi",
                 )
+                if sample.edge_profile_kind == "bright_band" and reference is not None and self.periodic_preview_visible_var.get():
+                    band_left, band_right = reference
+                    self.canvas.create_rectangle(
+                        band_left * scale,
+                        top * scale,
+                        band_right * scale,
+                        bottom * scale,
+                        outline="#ffe066",
+                        width=1,
+                        dash=(2, 2),
+                        tags="era_band_reference",
+                    )
 
     def roi_handle_positions(self) -> dict[str, tuple[float, float]]:
         if self.roi_canvas is None:
@@ -4231,9 +4473,21 @@ class LERLWRApp(AppBase):
             pixel_size = float(self.pixel_size_var.get())
         except ValueError:
             return None
-        return pixel_size if pixel_size > 0 else None
+        return pixel_size if math.isfinite(pixel_size) and pixel_size > 0 else None
 
     def refresh_annotation_labels(self, *_args: str) -> None:
+        if self.result is not None:
+            pixel_size = self.measurement_pixel_size()
+            if pixel_size is None or not math.isclose(pixel_size, self.result.pixel_size_nm, rel_tol=1e-12):
+                if self.result.edge_detector == EDGE_DETECTOR_ERA:
+                    self.invalidate_era_results()
+                    self.era_line_samples = [replace(sample, left_edge=None, right_edge=None, paired_result=None) for sample in self.era_line_samples]
+                    self.refresh_era_sample_list()
+                else:
+                    self.result = None
+                    self.analysis_origin = None
+                    self.canvas.delete("edge")
+                    self.result_var.set("像素尺寸已变化；请重新测量。")
         if self.raw_image is not None:
             self.draw_annotations()
 
@@ -4794,6 +5048,8 @@ class LERLWRApp(AppBase):
             self.roi_was_changed = False
             return
         if self.roi_was_changed:
+            if self.auto_line_use_roi_var.get():
+                self.periodic_scope_changed()
             self.result = None
             self.analysis_origin = None
             self.clear_auto_line_candidates(redraw=False)
@@ -4806,6 +5062,8 @@ class LERLWRApp(AppBase):
         if self.roi_canvas is None:
             return "break"
         self.record_undo_state()
+        if self.auto_line_use_roi_var.get() and self.era_pending_roi_target is None:
+            self.periodic_scope_changed()
         self.roi_canvas = None
         self.roi_rectangle = None
         self.drag_start = None
@@ -4874,11 +5132,15 @@ class LERLWRApp(AppBase):
         top = max(0, math.floor(y0 / self.display_scale))
         right = min(self.raw_image.shape[1], math.ceil(x1 / self.display_scale))
         bottom = min(self.raw_image.shape[0], math.ceil(y1 / self.display_scale))
-        if right - left < MIN_ERA_ROI_WIDTH or bottom - top < MIN_ERA_ROI_HEIGHT:
-            raise ValueError("单边 ROI 过小；请至少框选约 12 px 宽和 80 px 高。")
+        target = self.era_pending_roi_target
+        periodic = target is not None and self.era_line_samples[target[0]].edge_profile_kind == "bright_band"
+        minimum_width = MIN_BRIGHT_BAND_ROI_WIDTH if periodic else MIN_ERA_ROI_WIDTH
+        if right - left < minimum_width or bottom - top < MIN_ERA_ROI_HEIGHT:
+            raise ValueError(f"单边 ROI 过小；请至少框选约 {minimum_width} px 宽和 80 px 高。")
         return left, top, right, bottom
 
     def clear_era_line_samples(self, redraw: bool = True) -> None:
+        self.clear_periodic_preview()
         self.era_line_samples.clear()
         self.era_aggregate_result = None
         self.era_lcdu_cd_samples_nm.clear()
@@ -4890,12 +5152,13 @@ class LERLWRApp(AppBase):
         self.update_lcdu_summary_text()
 
     def invalidate_era_results(self) -> None:
-        """Hide stale ERA traces whenever its user-defined sample set changes."""
+        """Hide stale ERA traces whenever its editable sample set changes."""
         self.era_aggregate_result = None
         self.era_lcdu_cd_samples_nm.clear()
         self.result = None
         self.analysis_origin = None
         self.canvas.delete("edge")
+        self.result_var.set("线样本已变化；请重新分析。")
         self.update_lcdu_summary_text()
 
     def new_era_line_sample(self) -> None:
@@ -4916,6 +5179,8 @@ class LERLWRApp(AppBase):
         selected = self.era_sample_listbox.curselection()
         if selected:
             self.era_active_sample_index = selected[0]
+            self.show_era_rois = True
+            self.draw_era_rois()
 
     def refresh_era_sample_list(self) -> None:
         if self.era_sample_listbox is None:
@@ -4925,8 +5190,12 @@ class LERLWRApp(AppBase):
         for index, sample in enumerate(self.era_line_samples, start=1):
             left = "左边已选" if sample.left_roi_bounds_px is not None else "左边未选"
             right = "右边已选" if sample.right_roi_bounds_px is not None else "右边未选"
-            measured = "已计算" if sample.paired_result is not None else "待计算"
-            self.era_sample_listbox.insert(tk.END, f"线 {index}: {left}，{right}，{measured}")
+            measured = "拟合失败" if sample.measurement_error else "已计算" if sample.paired_result is not None else "待计算"
+            source = {"manual": "手动", "automatic": "自动", "automatic_adjusted": "自动后调整"}[sample.selection_source]
+            if sample.edge_profile_kind == "bright_band":
+                kind = "槽" if sample.target_kind == "trench" else "平台"
+                source += f"，{kind}区{sample.interval_index}"
+            self.era_sample_listbox.insert(tk.END, f"线 {index}（{source}）: {left}，{right}，{measured}")
         if selected_index is not None and self.era_line_samples:
             self.era_sample_listbox.selection_set(selected_index)
             self.era_sample_listbox.activate(selected_index)
@@ -4985,10 +5254,15 @@ class LERLWRApp(AppBase):
         if side == "left":
             sample.left_roi_bounds_px = bounds
             sample.left_edge = None
+            sample.left_reference_band_px = None
         else:
             sample.right_roi_bounds_px = bounds
             sample.right_edge = None
+            sample.right_reference_band_px = None
         sample.paired_result = None
+        sample.measurement_error = None
+        if sample.selection_source != "manual":
+            sample.selection_source = "automatic_adjusted"
         self.invalidate_era_results()
         self.era_pending_roi_target = None
         self.roi_canvas = None
@@ -5000,38 +5274,230 @@ class LERLWRApp(AppBase):
         self.status_var.set(f"线样本 {sample_index + 1} 的{side_name}单边 ROI 已保存。")
         return True
 
+    def automatic_line_region(self) -> tuple[np.ndarray, int, int]:
+        if self.processed_image is None:
+            raise ValueError("请先打开 SEM 图像。")
+        if self.auto_line_use_roi_var.get():
+            return self.selected_roi()
+        return self.processed_image, 0, 0
+
+    def periodic_line_settings(self) -> PeriodicLineSettings:
+        try:
+            return PeriodicLineSettings(
+                int(self.periodic_reference_interval_var.get()),
+                PERIODIC_KIND_LABELS[self.periodic_reference_kind_var.get()],
+                PERIODIC_KIND_LABELS[self.periodic_target_kind_var.get()],
+                PERIODIC_POSITION_LABELS[self.periodic_left_position_var.get()],
+                PERIODIC_POSITION_LABELS[self.periodic_right_position_var.get()],
+            )
+        except (ValueError, KeyError) as exc:
+            raise ValueError("请先预览亮边，指定参考区编号是槽还是平台，并选择左右取点。") from exc
+
+    def clear_periodic_preview(self) -> None:
+        self.periodic_bands = []
+        self.periodic_preview_signature = None
+        self.periodic_reference_kind_var.set("请选择")
+        self.canvas.delete("periodic_preview")
+
+    def periodic_options_changed(self, _event: object = None) -> None:
+        periodic_samples = [sample for sample in self.era_line_samples if sample.edge_profile_kind == "bright_band"]
+        changed = False
+        if periodic_samples:
+            try:
+                settings = self.periodic_line_settings()
+                expected = (settings.reference_interval, settings.reference_kind, settings.target_kind, settings.left_definition, settings.right_definition)
+                changed = self.auto_line_mode_var.get() != AUTO_MODE_PERIODIC or any(
+                    (sample.reference_interval, sample.reference_kind, sample.target_kind, sample.left_position_definition, sample.right_position_definition) != expected
+                    for sample in periodic_samples
+                )
+            except ValueError:
+                changed = True
+        if changed:
+            self.record_undo_state()
+            self.invalidate_era_results()
+            self.era_line_samples = [replace(sample, left_edge=None, right_edge=None, paired_result=None) for sample in self.era_line_samples]
+            self.refresh_era_sample_list()
+            self.status_var.set("槽/平台或亮带取点已变化；请重新自动找线并测量。")
+        self.draw_periodic_preview()
+
+    def periodic_scope_changed(self) -> None:
+        self.clear_periodic_preview()
+        if any(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples):
+            self.invalidate_era_results()
+            self.era_line_samples = [replace(sample, left_edge=None, right_edge=None, paired_result=None) for sample in self.era_line_samples]
+            self.refresh_era_sample_list()
+        self.status_var.set("分析范围已变化；请重新预览并标定槽/平台参考区。")
+
+    def preview_periodic_lines(self) -> None:
+        try:
+            image, left, top = self.automatic_line_region()
+            bands = detect_bright_bands(image)
+            if len(bands) < 2:
+                raise ValueError("至少需要两条完整亮边；请检查区域或先旋转图像。")
+            self.auto_line_mode_var.set(AUTO_MODE_PERIODIC)
+            signature = (id(self.processed_image), left, top, image.shape, tuple(band.center_x_px for band in bands))
+            if signature != self.periodic_preview_signature:
+                self.periodic_reference_kind_var.set("请选择")
+            self.record_undo_state()
+            self.periodic_bands = bands
+            self.periodic_origin_px = (left, top)
+            self.periodic_preview_signature = signature
+            self.periodic_preview_visible_var.set(True)
+            self.invalidate_era_results()
+            self.clear_detected_edges(redraw=False)
+            self.show_era_rois = False
+            self.draw_image()
+            self.result_var.set(f"识别 {len(bands)} 条亮边、{len(bands) - 1} 个相邻区间。\n请在预览中选一个区号，指定它是槽还是平台，再选择测量对象及左右取点。")
+            self.status_var.set("黄框标记亮带，区号从左向右排列；槽/平台标签由你指定。")
+        except ValueError as exc:
+            messagebox.showwarning("无法预览周期亮边", str(exc))
+
+    def draw_periodic_preview(self) -> None:
+        self.canvas.delete("periodic_preview")
+        if not self.periodic_preview_visible_var.get() or not self.periodic_bands or self.auto_line_mode_var.get() != AUTO_MODE_PERIODIC:
+            return
+        scale = self.display_scale
+        offset_x, offset_y = self.periodic_origin_px
+        for band in self.periodic_bands:
+            top, bottom = band.roi_bounds_px[1], band.roi_bounds_px[3]
+            self.canvas.create_rectangle(
+                (band.left_half_px + offset_x) * scale, (top + offset_y) * scale,
+                (band.right_half_px + offset_x) * scale, (bottom + offset_y) * scale,
+                outline="#ffe066", width=1, dash=(3, 3), tags="periodic_preview",
+            )
+        for index, (first, second) in enumerate(zip(self.periodic_bands, self.periodic_bands[1:]), start=1):
+            label = f"区{index}"
+            if self.periodic_reference_kind_var.get() in PERIODIC_KIND_LABELS:
+                try:
+                    same_kind = (index - int(self.periodic_reference_interval_var.get())) % 2 == 0
+                    kind = self.periodic_reference_kind_var.get()
+                    label += f" {kind if same_kind else '平台' if kind == '槽' else '槽'}"
+                except ValueError:
+                    pass
+            self.canvas.create_text(
+                ((first.center_x_px + second.center_x_px) / 2 + offset_x) * scale,
+                (offset_y + 14 + 16 * (index % 2)) * scale,
+                text=label, fill="#ffe066", font=("Helvetica", 10), tags="periodic_preview",
+            )
+
+    def recognize_era_lines(self, measure: bool = False) -> None:
+        """Discover line pairs once, replacing the editable sample set without duplicates."""
+        try:
+            if self.processed_image is None:
+                raise ValueError("请先打开 SEM 图像。")
+            if measure:
+                pixel_size = float(self.pixel_size_var.get())
+                if not math.isfinite(pixel_size) or pixel_size <= 0:
+                    raise ValueError("请先填写大于 0 的像素尺寸（nm/pixel）。")
+            started_at = time.perf_counter()
+            image, left, top = self.automatic_line_region()
+            if self.auto_line_mode_var.get() == AUTO_MODE_PERIODIC:
+                scope_signature = (id(self.processed_image), left, top, image.shape)
+                signature = self.periodic_preview_signature
+                if signature is None or scope_signature != signature[:4] or not self.periodic_bands:
+                    self.preview_periodic_lines()
+                    raise ValueError("请根据新预览指定参考区是槽还是平台，然后重新测量。")
+                settings = self.periodic_line_settings()
+                samples = periodic_line_samples(image, settings, (left, top), bands=self.periodic_bands)
+                samples = [replace(sample, discovery_signature=signature) for sample in samples]
+            else:
+                bright_lines = self.auto_line_polarity_var.get() == AUTO_LINE_BRIGHT
+                samples = automatic_era_line_samples(image, bright_lines, (left, top))
+            if not samples:
+                raise ValueError("未找到可分离的完整线条；请检查亮线/暗线设置，必要时旋转图像或缩小分析区域。")
+            self.record_undo_state()
+            self.era_line_samples = samples
+            self.era_active_sample_index = 0
+            self.era_pending_roi_target = None
+            self.ler_lwr_roi_mode = False
+            self.show_era_rois = True
+            if self.auto_line_mode_var.get() == AUTO_MODE_PERIODIC:
+                self.periodic_preview_visible_var.set(False)
+            self.invalidate_era_results()
+            self.clear_detected_edges(redraw=False)
+            self.bcp_result = None
+            self.clear_bcp_completion_selection(redraw=False)
+            self.edge_detector_var.set(EDGE_DETECTOR_ERA)
+            self.update_edge_kernel_preview()
+            self.refresh_era_sample_list()
+            self.result_var.set(f"自动识别到 {len(samples)} 根完整线条。\n可检查左右线框、调整或删除样本，再点击“开始识别 / 分析”。")
+            self.status_var.set(f"自动找线完成：{len(samples)} 根；重复识别会刷新样本，Command+Z 可撤销。")
+            self.draw_image()
+            if measure:
+                self.run_era_analysis()
+                self.bcp_result = None
+                self.clear_bcp_completion_selection(redraw=False)
+                self.draw_image()
+                self.status_var.set(f"自动识别 {len(samples)} 根线，{self.era_aggregate_result.line_count} 根完成测量；结果见右侧。")
+            self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
+        except ValueError as exc:
+            messagebox.showwarning("无法自动测量", str(exc))
+
     def run_era_analysis(self) -> None:
         if self.processed_image is None:
             raise ValueError("图像未准备完成。")
         pixel_size = float(self.pixel_size_var.get())
+        if not math.isfinite(pixel_size) or pixel_size <= 0:
+            raise ValueError("像素尺寸必须为大于 0 的有限数值。")
+        if any(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples):
+            settings = self.periodic_line_settings()
+            expected = (settings.reference_interval, settings.reference_kind, settings.target_kind, settings.left_definition, settings.right_definition)
+            for sample in self.era_line_samples:
+                if sample.edge_profile_kind == "bright_band":
+                    if sample.discovery_signature != self.periodic_preview_signature:
+                        self.invalidate_era_results()
+                        raise ValueError("周期预览或分析范围已变化；请重新自动找线生成样本。")
+                    actual = (sample.reference_interval, sample.reference_kind, sample.target_kind, sample.left_position_definition, sample.right_position_definition)
+                    if actual != expected:
+                        self.invalidate_era_results()
+                        raise ValueError("周期配对或取点规则已变化；请重新自动找线生成样本。")
         degree = self.era_polynomial_degree()
         complete_results = []
-        for index, sample in enumerate(self.era_line_samples, start=1):
-            if sample.left_roi_bounds_px is not None:
-                sample.left_edge = analyze_single_edge_era(
-                    self.processed_image,
-                    sample.left_roi_bounds_px,
-                    pixel_size,
-                    degree,
-                    self.era_polarity_var.get(),
-                    self.outlier_threshold_px(),
-                )
-            if sample.right_roi_bounds_px is not None:
-                sample.right_edge = analyze_single_edge_era(
-                    self.processed_image,
-                    sample.right_roi_bounds_px,
-                    pixel_size,
-                    degree,
-                    self.era_polarity_var.get(),
-                    self.outlier_threshold_px(),
-                )
-            sample.paired_result = None
-            if sample.left_edge is not None and sample.right_edge is not None:
-                sample.paired_result = pair_single_edges(sample.left_edge, sample.right_edge, pixel_size)
-                complete_results.append(sample.paired_result)
-            elif sample.left_roi_bounds_px is not None or sample.right_roi_bounds_px is not None:
-                self.status_var.set(f"线样本 {index} 只有一条边；已输出其 LER，但未参与 CD/LWR 汇总。")
+        measured_samples = []
+        self.invalidate_era_results()
+        for original in self.era_line_samples:
+            sample = replace(original, left_edge=None, right_edge=None, paired_result=None, measurement_error=None)
+            measured_samples.append(sample)
+            try:
+                for side in ("left", "right"):
+                    bounds = getattr(sample, f"{side}_roi_bounds_px")
+                    if bounds is None:
+                        continue
+                    if sample.edge_profile_kind == "bright_band":
+                        reference = getattr(sample, f"{side}_reference_band_px")
+                        if reference is None:
+                            reference = reference_bright_band(self.processed_image, bounds)
+                            setattr(sample, f"{side}_reference_band_px", reference)
+                        edge = analyze_bright_band_edge(
+                            self.processed_image, bounds, pixel_size,
+                            getattr(sample, f"{side}_position_definition"), self.outlier_threshold_px(),
+                            reference_band_px=reference,
+                        )
+                        setattr(sample, f"{side}_edge", edge)
+                        continue
+                    polarity = self.era_polarity_var.get()
+                    if sample.line_polarity is not None:
+                        rising = (sample.line_polarity == "bright") == (side == "left")
+                        polarity = ERA_POLARITY_RISING if rising else ERA_POLARITY_FALLING
+                    row_mask = automatic_era_row_mask(self.processed_image, bounds, polarity) if sample.selection_source != "manual" else None
+                    edge = analyze_single_edge_era(
+                        self.processed_image, bounds, pixel_size, degree, polarity, self.outlier_threshold_px(),
+                        valid_rows_mask=row_mask,
+                    )
+                    setattr(sample, f"{side}_edge", edge)
+                if sample.left_edge is not None and sample.right_edge is not None:
+                    sample.paired_result = pair_single_edges(sample.left_edge, sample.right_edge, pixel_size)
+                    complete_results.append(sample.paired_result)
+            except ValueError as exc:
+                if sample.selection_source == "manual":
+                    raise
+                sample.left_edge = sample.right_edge = None
+                sample.measurement_error = str(exc)
+        self.era_line_samples = measured_samples
+        self.refresh_era_sample_list()
         if not complete_results:
+            if any(sample.measurement_error for sample in measured_samples):
+                raise ValueError("已找出线条，但均未通过单边拟合；请检查左右线框或调整预处理后重试。")
             raise ValueError("至少需要一个线样本的左、右单边 ROI 都已框选，才能计算 CD/LWR。")
         self.era_aggregate_result = aggregate_era_line_results(complete_results)
         self.era_lcdu_cd_samples_nm = [result.mean_width_nm for result in complete_results]
@@ -5042,22 +5508,37 @@ class LERLWRApp(AppBase):
         self.update_lcdu_summary_text()
         self.update_era_result_text()
         self.show_era_rois = False
+        if any(sample.edge_profile_kind == "bright_band" for sample in measured_samples):
+            self.periodic_preview_visible_var.set(False)
+            self.draw_periodic_preview()
+            self.canvas.delete("era_band_reference")
 
     def update_era_result_text(self) -> None:
         if self.era_aggregate_result is None:
             return
         summary = self.era_aggregate_result
         multiplier = self.sigma_multiplier_var.get()
+        automatic_count = sum(sample.selection_source != "manual" for sample in self.era_line_samples)
+        periodic_samples = [sample for sample in self.era_line_samples if sample.edge_profile_kind == "bright_band"]
+        mode = "自动多线测量" if automatic_count else "单边测量"
+        method = "周期亮边，半高插值" if periodic_samples else f"ERA，{self.era_polynomial_degree()} 次拟合"
+        failed_count = sum(sample.measurement_error is not None for sample in self.era_line_samples)
         lines = [
-            f"单边测量（ERA，{self.era_polynomial_degree()} 次拟合）",
+            f"{mode}（{method}）",
             f"输出：{multiplier:.1f}σ（主窗口“显示/导出倍数”）",
-            f"已完成线样本  {summary.line_count} 根；共同有效点 {summary.point_count}",
+            f"当前线样本 {len(self.era_line_samples)} 根；成功 {summary.line_count} 根，失败 {failed_count} 根",
+            f"共同有效点    {summary.point_count}",
             f"平均 CD        {summary.mean_width_nm:.3f} nm",
             f"左 ER（LER_L）  {multiplier * summary.ler_left_sigma_nm:.3f} nm",
             f"右 ER（LER_R）  {multiplier * summary.ler_right_sigma_nm:.3f} nm",
             f"宽度 LWR        {multiplier * summary.lwr_sigma_nm:.3f} nm",
             f"原始 σ（L/R/W） {summary.ler_left_sigma_nm:.3f} / {summary.ler_right_sigma_nm:.3f} / {summary.lwr_sigma_nm:.3f} nm",
         ]
+        if periodic_samples:
+            sample = periodic_samples[0]
+            kind = "槽" if sample.target_kind == "trench" else "平台"
+            labels = {value: label for label, value in PERIODIC_POSITION_LABELS.items()}
+            lines.insert(1, f"对象：{kind}；左：{labels[sample.left_position_definition]}，右：{labels[sample.right_position_definition]}")
         lcdu_sigma = self.lcdu_sigma_nm()
         if lcdu_sigma is not None:
             lines.append(f"LCDU（{len(self.era_lcdu_cd_samples_nm)} 根） {multiplier * lcdu_sigma:.3f} nm")
@@ -5065,7 +5546,9 @@ class LERLWRApp(AppBase):
             lines.append("LCDU             还需至少 2 根完整线样本")
         lines.extend(("", "逐线结果："))
         for index, sample in enumerate(self.era_line_samples, start=1):
-            if sample.paired_result is not None:
+            if sample.measurement_error is not None:
+                lines.append(f"线 {index}: 未参与统计（{sample.measurement_error}）")
+            elif sample.paired_result is not None:
                 result = sample.paired_result
                 lines.append(
                     f"线 {index}: CD {result.mean_width_nm:.3f} nm，"
@@ -5164,7 +5647,10 @@ class LERLWRApp(AppBase):
                 self.bcp_result = None
                 self.clear_bcp_completion_selection(redraw=False)
                 self.draw_image()
-                self.status_var.set("单边 ERA 分析完成；左右边仅按你保存到同一线样本的 ROI 配对。")
+                if any(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples):
+                    self.status_var.set("周期亮边测量完成；已使用你指定的槽/平台及左右取点规则。")
+                else:
+                    self.status_var.set("单边 ERA 分析完成；左右边仅按你保存到同一线样本的 ROI 配对。")
                 return
             analysis_image, left_offset, top_offset, uses_roi = self.selected_ler_lwr_region()
             region_name = "ROI 内" if uses_roi else "整图"
@@ -5240,7 +5726,7 @@ class LERLWRApp(AppBase):
         self.ler_lwr_dialog_scroll.pack(fill=tk.BOTH, expand=True)
         content = self.ler_lwr_dialog_scroll.content
         ttk.Label(content, text="LER / LWR 测量", font=("Helvetica", 15, "bold")).pack(anchor="w")
-        ttk.Label(content, text="Scharr/Canny 只显示未配对边缘；拉普拉斯使用一个线 ROI。单边测量（ERA）则由你分别框选左右单边 ROI，绝不自动找边或配对。", wraplength=410).pack(anchor="w", pady=(7, 10))
+        ttk.Label(content, text="可自动找出多根线，再用 ERA 分别测量左右边缘；也可手动选边。Scharr/Canny 显示边缘，拉普拉斯测量单根线。", wraplength=410).pack(anchor="w", pady=(7, 10))
 
         roi_controls = ttk.LabelFrame(content, text="识别区域（可选 ROI）", padding=10)
         roi_controls.pack(fill=tk.X)
@@ -5264,16 +5750,61 @@ class LERLWRApp(AppBase):
         )
         detector_selector.pack(side=tk.LEFT)
         detector_selector.bind("<<ComboboxSelected>>", self.change_edge_detector)
+
+        auto_controls = ttk.LabelFrame(content, text="自动多线测量", padding=10)
+        auto_controls.pack(fill=tk.X, pady=(0, 10), before=roi_controls)
+        ttk.Label(auto_controls, text="周期亮边：先预览区号，指定一个槽/平台，再批量测量同类区域。大倾角请先旋转校正。", wraplength=390).pack(anchor="w")
+        model_row = ttk.Frame(auto_controls)
+        model_row.pack(anchor="w", pady=(8, 0))
+        ttk.Label(model_row, text="图像形貌：").pack(side=tk.LEFT)
+        model_selector = ttk.Combobox(model_row, textvariable=self.auto_line_mode_var, state="readonly", values=(AUTO_MODE_PERIODIC, AUTO_MODE_SOLID), width=24)
+        model_selector.pack(side=tk.LEFT)
+        model_selector.bind("<<ComboboxSelected>>", self.periodic_options_changed)
+        periodic_row = ttk.Frame(auto_controls)
+        periodic_row.pack(anchor="w", pady=(8, 0))
+        ttk.Button(periodic_row, text="预览亮边 / 区号", command=self.preview_periodic_lines).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(periodic_row, text="参考区号：").pack(side=tk.LEFT)
+        reference_entry = ttk.Entry(periodic_row, textvariable=self.periodic_reference_interval_var, width=4)
+        reference_entry.pack(side=tk.LEFT)
+        reference_entry.bind("<FocusOut>", self.periodic_options_changed)
+        reference_entry.bind("<Return>", self.periodic_options_changed)
+        ttk.Checkbutton(
+            auto_controls, text="显示预览亮边 / 区号",
+            variable=self.periodic_preview_visible_var, command=self.draw_era_rois,
+        ).pack(anchor="w", pady=(5, 0))
+        for text, variable, values in (
+            ("该参考区是：", self.periodic_reference_kind_var, ("请选择", "槽", "平台")),
+            ("本次测量：", self.periodic_target_kind_var, ("槽", "平台")),
+            ("左侧亮带取点：", self.periodic_left_position_var, tuple(PERIODIC_POSITION_LABELS)),
+            ("右侧亮带取点：", self.periodic_right_position_var, tuple(PERIODIC_POSITION_LABELS)),
+        ):
+            row = ttk.Frame(auto_controls)
+            row.pack(anchor="w", pady=(5, 0))
+            ttk.Label(row, text=text).pack(side=tk.LEFT)
+            selector = ttk.Combobox(row, textvariable=variable, state="readonly", values=values, width=14)
+            selector.pack(side=tk.LEFT)
+            selector.bind("<<ComboboxSelected>>", self.periodic_options_changed)
+        ttk.Label(auto_controls, text="左/右按图像横坐标方向。两侧取各自半高位置；中心取两者中点。槽/平台必须由你标定，不能仅凭灰度确定。", wraplength=390, foreground="#666666").pack(anchor="w", pady=(5, 0))
+        auto_options = ttk.Frame(auto_controls)
+        auto_options.pack(anchor="w", pady=(8, 0))
+        ttk.Label(auto_options, text="原模式线条亮暗：").pack(side=tk.LEFT)
+        ttk.Combobox(auto_options, textvariable=self.auto_line_polarity_var, state="readonly", values=(AUTO_LINE_BRIGHT, AUTO_LINE_DARK), width=18).pack(side=tk.LEFT)
+        ttk.Checkbutton(auto_controls, text="仅在当前绿色 ROI 内找线", variable=self.auto_line_use_roi_var, command=self.periodic_scope_changed).pack(anchor="w", pady=(6, 0))
+        auto_buttons = ttk.Frame(auto_controls)
+        auto_buttons.pack(anchor="w", pady=(8, 0))
+        ttk.Button(auto_buttons, text="自动找线（预览）", command=self.recognize_era_lines).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(auto_buttons, text="自动找线并测量", command=lambda: self.recognize_era_lines(measure=True)).pack(side=tk.LEFT)
+        ttk.Label(auto_controls, text="重新找线会刷新下方线样本，可用 Command+Z 撤销。预览后可调整、删除样本，再点击“开始识别 / 分析”。", foreground="#666666", wraplength=390).pack(anchor="w", pady=(6, 0))
         era_controls = ttk.LabelFrame(content, text="单边测量（ERA）", padding=10)
         era_controls.pack(fill=tk.X, pady=(10, 0))
-        ttk.Label(era_controls, text="输入为当前图像处理后的图像；此算法不额外做 5×7 或任何内部空间滤波。每个 ROI 仅覆盖一条边，只有同一线样本的左右两边才计算 CD/LWR。", wraplength=390).pack(anchor="w")
+        ttk.Label(era_controls, text="使用当前预处理图，不额外平滑。周期样本每框包含一条完整亮带及两侧暗区；手动 ERA 每框包含一条单调过渡。点击样本可查看线框。", wraplength=390).pack(anchor="w")
         era_options = ttk.Frame(era_controls)
         era_options.pack(anchor="w", pady=(8, 0))
-        ttk.Label(era_options, text="边缘方向：").pack(side=tk.LEFT)
+        ttk.Label(era_options, text="手动边方向：").pack(side=tk.LEFT)
         ttk.Combobox(era_options, textvariable=self.era_polarity_var, state="readonly", values=ERA_POLARITIES, width=15).pack(side=tk.LEFT, padx=(2, 10))
-        ttk.Label(era_options, text="拟合次数：").pack(side=tk.LEFT)
+        ttk.Label(era_options, text="ERA 次数：").pack(side=tk.LEFT)
         ttk.Combobox(era_options, textvariable=self.era_polynomial_degree_var, state="readonly", values=("2", "3", "4"), width=3).pack(side=tk.LEFT, padx=(2, 0))
-        ttk.Label(era_controls, text="默认三次。四次是可选扩展：仅从拟合区内、方向正确且最接近导数重心的 0.5 交点中取一个。", foreground="#666666", wraplength=390).pack(anchor="w", pady=(5, 0))
+        ttk.Label(era_controls, text="ERA 默认三次。周期亮边使用半高位置的亚像素线性插值，不使用 ERA 的次数与方向选项。", foreground="#666666", wraplength=390).pack(anchor="w", pady=(5, 0))
         era_buttons = ttk.Frame(era_controls)
         era_buttons.pack(anchor="w", pady=(8, 0))
         ttk.Button(era_buttons, text="新建线样本", command=self.new_era_line_sample).pack(side=tk.LEFT, padx=(0, 6))
@@ -6154,8 +6685,9 @@ class LERLWRApp(AppBase):
                 for edge, color in ((sample.left_edge, self.fit_left_color), (sample.right_edge, self.fit_right_color)):
                     if edge is None or len(edge.rows_px) < 2:
                         continue
-                    points = [coordinate for row, position in zip(edge.rows_px, edge.edge_px) for coordinate in (position * scale, row * scale)]
-                    self.canvas.create_line(*points, fill=color, width=self.fit_line_width(), tags="edge")
+                    for segment in single_edge_segments(edge, sample.edge_profile_kind == "bright_band"):
+                        points = (segment * scale).ravel().tolist()
+                        self.canvas.create_line(*points, fill=color, width=self.fit_line_width(), tags="edge")
             return
         overlays = [(self.result, self.analysis_origin)]
         scale = self.display_scale
@@ -6621,13 +7153,10 @@ class LERLWRApp(AppBase):
             for edge, color in ((sample.left_edge, self.fit_left_color), (sample.right_edge, self.fit_right_color)):
                 if edge is None:
                     continue
-                points = rotate_points_about_center(
-                    [(float(position), float(row)) for row, position in zip(edge.rows_px, edge.edge_px)],
-                    -self.rotation_degrees,
-                    width,
-                    height,
-                )
-                if len(points) >= 2:
+                for segment in single_edge_segments(edge, sample.edge_profile_kind == "bright_band"):
+                    points = rotate_points_about_center(
+                        [(float(x), float(y)) for x, y in segment], -self.rotation_degrees, width, height,
+                    )
                     draw.line(points, fill=color, width=self.fit_line_width())
 
     def apply_exported_edge_detection_overlay(self, output: Image.Image, width: int, height: int) -> None:
@@ -6756,6 +7285,11 @@ class LERLWRApp(AppBase):
             draw.text((label_point[0] + 4, label_point[1] - 14), self.annotation_label(annotation), fill=self.annotation_color(annotation))
 
     def export_csv(self) -> None:
+        if self.result is not None:
+            pixel_size = self.measurement_pixel_size()
+            if pixel_size is None or not math.isclose(pixel_size, self.result.pixel_size_nm, rel_tol=1e-12):
+                messagebox.showwarning("请重新测量", "像素尺寸与当前结果不一致；请按当前标定重新计算后导出。")
+                return
         if self.result is None and self.bcp_result is None and not self.annotations:
             messagebox.showinfo("暂无结果", "请先完成 LER/LWR、BCP 点阵分析或添加通用测量标注。")
             return
@@ -6788,12 +7322,23 @@ class LERLWRApp(AppBase):
                     reported_total_ler = aggregate.total_ler_sigma_nm if aggregate is not None else result.total_ler_sigma_nm
                     reported_correlation = aggregate.edge_correlation if aggregate is not None else result.edge_correlation
                     reported_mean_width = aggregate.mean_width_nm if aggregate is not None else result.mean_width_nm
-                    writer.writerow(["edge_detector", result.edge_detector])
+                    periodic_count = sum(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples) if result.edge_detector == EDGE_DETECTOR_ERA else 0
+                    method_name = "周期亮边（半高取点）" if periodic_count and periodic_count == len(self.era_line_samples) else result.edge_detector
+                    writer.writerow(["edge_detector", method_name])
                     if result.edge_detector == EDGE_DETECTOR_ERA:
                         writer.writerow(["era_input", "current_preprocessed_image_no_internal_spatial_filter"])
-                        writer.writerow(["era_polynomial_degree", self.era_polynomial_degree()])
+                        automatic_count = sum(sample.selection_source != "manual" for sample in self.era_line_samples)
+                        writer.writerow(["era_automatic_line_sample_count", automatic_count])
+                        writer.writerow(["periodic_bright_band_sample_count", periodic_count])
+                        writer.writerow(["periodic_position_method", "individual_flank_half_height_linear_interpolation_center_is_midpoint" if periodic_count else "not_used"])
+                        writer.writerow(["periodic_row_support_policy", "both_flanks_single_peak_and_amplitude_gt_0.2_roi_p75" if periodic_count else "not_used"])
+                        writer.writerow(["periodic_peak_identity_policy", "preview_band_center_radius_max_2px_0.75_halfheight_width_no_dark_region_fallback" if periodic_count else "not_used"])
+                        writer.writerow(["era_automatic_polarity_policy", "per_sample_profile_model" if periodic_count else "per_line_bright_dark_left_right" if automatic_count else "not_used"])
+                        writer.writerow(["era_automatic_row_support_policy", "per_sample_profile_model" if periodic_count else "flank_contrast_gt_max_3sigma_noise_0.2_p75_contrast" if automatic_count else "not_used"])
+                        writer.writerow(["era_failed_line_sample_count", sum(sample.measurement_error is not None for sample in self.era_line_samples)])
+                        writer.writerow(["era_polynomial_degree", "not_used" if periodic_count == len(self.era_line_samples) and periodic_count else self.era_polynomial_degree()])
                         writer.writerow(["era_requested_polarity", self.era_polarity_var.get()])
-                        writer.writerow(["era_difference_weight_power", ERA_DIFFERENCE_POWER])
+                        writer.writerow(["era_difference_weight_power", "not_used" if periodic_count == len(self.era_line_samples) and periodic_count else ERA_DIFFERENCE_POWER])
                         if self.era_aggregate_result is not None:
                             aggregate = self.era_aggregate_result
                             writer.writerow(["era_complete_line_count", aggregate.line_count])
@@ -6891,6 +7436,11 @@ class LERLWRApp(AppBase):
                 if self.result is not None:
                     if self.result.edge_detector == EDGE_DETECTOR_ERA:
                         writer.writerow([])
+                        writer.writerow(["era_line_index", "selection_source", "line_polarity", "recognition_support_fraction", "measurement_status", "measurement_error", "edge_profile_kind", "target_kind", "interval_index", "reference_interval", "reference_kind", "left_reference_band_left_px", "left_reference_band_right_px", "right_reference_band_left_px", "right_reference_band_right_px", "left_position_definition", "right_position_definition"])
+                        for line_index, sample in enumerate(self.era_line_samples, start=1):
+                            status = "failed" if sample.measurement_error else "complete" if sample.paired_result is not None else "incomplete"
+                            writer.writerow([line_index, sample.selection_source, sample.line_polarity or "", sample.recognition_support_fraction, status, sample.measurement_error or "", sample.edge_profile_kind, sample.target_kind or "", sample.interval_index, sample.reference_interval, sample.reference_kind or "", *(sample.left_reference_band_px or ("", "")), *(sample.right_reference_band_px or ("", "")), sample.left_position_definition, sample.right_position_definition])
+                        writer.writerow([])
                         writer.writerow(["era_line_index", "side", "roi_left_px", "roi_top_px", "roi_right_px", "roi_bottom_px", "polarity", "polynomial_degree", "row_px", "edge_px", "edge_residual_nm"])
                         for line_index, sample in enumerate(self.era_line_samples, start=1):
                             for side, edge in (("left", sample.left_edge), ("right", sample.right_edge)):
@@ -6917,7 +7467,35 @@ class LERLWRApp(AppBase):
         self.status_var.set(f"已导出：{target}")
 
 
+def run_release_self_test() -> None:
+    """Check the frozen application's measurement imports without creating a GUI."""
+    y, x = np.mgrid[:180, :90]
+    image = np.where((x > 25 + 2 * np.sin(y / 18)) & (x < 58 + 2 * np.cos(y / 20)), 190, 45).astype(np.uint8)
+    result = analyze_roi(image, 0.2)
+    if len(result.rows_px) != 180 or not 6 < result.mean_width_nm < 7:
+        raise RuntimeError("Single-line measurement self-test failed.")
+    profile = np.array([40, 40, 49, 70, 119, 182, 218, 203, 155, 136, 158, 198, 206, 167, 92, 51, 39, 38, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40], dtype=float)
+    image = np.tile(np.r_[np.full(20, 40), np.tile(profile, 6), np.full(20, 40)], (180, 1))
+    bands = detect_bright_bands(image)
+    samples = periodic_line_samples(image, PeriodicLineSettings(1, "trench", "trench", "center", "center"), bands=bands)
+    if len(bands) != 12 or len(samples) != 6:
+        raise RuntimeError("Periodic bright-band discovery self-test failed.")
+    for sample in samples:
+        edges = [analyze_bright_band_edge(image, getattr(sample, f"{side}_roi_bounds_px"), 0.2,
+                                        reference_band_px=getattr(sample, f"{side}_reference_band_px"))
+                 for side in ("left", "right")]
+        if not 0 < pair_single_edges(*edges, 0.2).mean_width_nm < 2:
+            raise RuntimeError("Periodic edge measurement self-test failed.")
+    print(f"SEM measure {APP_VERSION}: self-test OK (180 scanlines, 12 bright bands, 6 measured pairs)")
+
+
 if __name__ == "__main__":
+    if "--version" in sys.argv:
+        print(APP_VERSION)
+        raise SystemExit(0)
+    if "--self-test" in sys.argv:
+        run_release_self_test()
+        raise SystemExit(0)
     instance_lock = acquire_single_instance_lock()
     if instance_lock is None:
         show_already_running_message()
