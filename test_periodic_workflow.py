@@ -309,11 +309,97 @@ class PeriodicWorkflowTests(unittest.TestCase):
         state = periodic_state()
         state.draw_periodic_preview()
         labels = [call.kwargs.get("text", "") for call in state.canvas.create_text.call_args_list]
+        # Only the calibration reference keeps "区N 槽/平台"; the others show the bare number.
         self.assertIn("区1 槽", labels)
-        self.assertIn("区2 平台", labels)
+        self.assertIn("2", labels)
+        self.assertNotIn("区2 平台", labels)
+        rows = [call.kwargs.get("font") for call in state.canvas.create_text.call_args_list]
+        self.assertTrue(all(font == ("Helvetica", app.PERIODIC_LABEL_FONT_PX) for font in rows))
+        self.assertGreaterEqual(len(state.periodic_label_rows[1] + state.periodic_label_rows[2]), len(labels))
+        # Labels sit on fixed screen rows inside the ROI top, never above/at the ROI edge.
+        placed = [call for call in state.canvas.create_text.call_args_list]
+        roi_top = min(band.roi_bounds_px[1] for band in state.periodic_bands)
+        tops = [call.args[1] for call in placed if call.args]
+        self.assertTrue(tops)
+        self.assertTrue(all(y >= roi_top + app.PERIODIC_LABEL_ROW_INSET_PX for y in tops))
+        self.assertTrue(set(tops) <= {roi_top + app.PERIODIC_LABEL_ROW_INSET_PX,
+                                      roi_top + app.PERIODIC_LABEL_ROW_INSET_PX + app.PERIODIC_LABEL_ROW_GAP_PX})
+        self.assertGreaterEqual(app.PERIODIC_LABEL_ROW_GAP_PX, abs(app.PERIODIC_LABEL_FONT_PX) + 8)
+        left = min(band.left_half_px for band in state.periodic_bands)
+        right = max(band.right_half_px for band in state.periodic_bands)
+        for call in placed:
+            x = call.args[0]
+            half = (state.periodic_label_width(call.kwargs["text"]) + 2 * app.PERIODIC_LABEL_PAD_PX) / 2
+            self.assertGreaterEqual(x - half, left - 1e-6)
+            self.assertLessEqual(x + half, right + 1e-6)
+        self.assertEqual(state.periodic_interval_label(2), "区2 平台")
+        self.assertEqual(state.periodic_interval_label(1), "区1 槽")
         state.processed_image = state.processed_image.copy()
         state.preview_periodic_lines()
         self.assertEqual(state.periodic_reference_kind_var.get(), "请选择")
+
+    def test_hover_interval_uses_roi_origin(self):
+        state = periodic_state()
+        state.periodic_origin_px = (100, 40)
+        state.display_scale = 0.5
+        first, second = state.periodic_bands[0], state.periodic_bands[1]
+        global_x = (first.center_x_px + second.center_x_px) / 2 + 100
+        global_y = (first.roi_bounds_px[1] + first.roi_bounds_px[3]) / 2 + 40
+        self.assertEqual(state.periodic_interval_at_canvas(global_x * 0.5, global_y * 0.5), 1)
+        outside = (second.center_x_px + (state.periodic_bands[2].center_x_px - second.center_x_px) / 2 + 100) * 0.5
+        self.assertEqual(state.periodic_interval_at_canvas(outside, global_y * 0.5), 2)
+        self.assertIsNone(state.periodic_interval_at_canvas(global_x * 0.5, 0.0))
+
+    def test_reference_interval_outside_band_range_has_no_label(self):
+        state = periodic_state()
+        interval_count = len(state.periodic_bands) - 1
+        for value, expected in (("0", None), ("-1", None), (str(interval_count + 1), None),
+                               ("1", 1), (str(interval_count), interval_count)):
+            state.periodic_reference_interval_var.set(value)
+            self.assertEqual(state.periodic_reference_index(), expected)
+        state.periodic_reference_interval_var.set(str(interval_count + 1))
+        with patch.object(app, "detect_bright_bands", side_effect=AssertionError("unexpected redetection")):
+            state.draw_periodic_preview()
+        labels = [call.kwargs.get("text", "") for call in state.canvas.create_text.call_args_list]
+        self.assertTrue(all("区" not in label for label in labels))
+
+    def test_labels_stay_inside_narrow_roi_and_small_display(self):
+        state = periodic_state()
+        state.periodic_origin_px = (0, 0)
+        state.display_scale = 1.0
+        state.periodic_bands = [
+            app.BrightBandCandidate((band.roi_bounds_px[0], 90, band.roi_bounds_px[2], 90 + 40),
+                                    band.center_x_px, band.left_half_px, band.right_half_px, band.support_fraction)
+            for band in state.periodic_bands
+        ]
+        state.draw_periodic_preview()
+        texts = state.canvas.create_text.call_args_list
+        self.assertTrue(texts)
+        # Only the first row fits wholly inside the short ROI; one label per row keeps them apart.
+        self.assertEqual({call.args[1] for call in texts}, {90 + app.PERIODIC_LABEL_ROW_INSET_PX})
+        self.assertEqual(len({call.args[0] for call in texts}), len(texts))
+        mid = (state.periodic_bands[0].center_x_px + state.periodic_bands[1].center_x_px) / 2
+        self.assertEqual(state.periodic_interval_at_canvas(mid, 100), 1)
+
+    def test_reference_label_is_clamped_inside_narrow_roi(self):
+        state = periodic_state()
+        state.periodic_reference_interval_var.set("1")
+        # Shrink the preview ROI horizontally: the wide "区1 槽" label must be clamped, not cut off.
+        state.periodic_bands = [
+            app.BrightBandCandidate(band.roi_bounds_px, band.center_x_px,
+                                    band.left_half_px, band.right_half_px, band.support_fraction)
+            for band in state.periodic_bands
+        ]
+        state.display_scale = 1.0
+        state.draw_periodic_preview()
+        texts = [call for call in state.canvas.create_text.call_args_list if "区" in call.kwargs.get("text", "")]
+        self.assertEqual(len(texts), 1)
+        x = texts[0].args[0]
+        width = state.periodic_label_width(texts[0].kwargs["text"]) + 2 * app.PERIODIC_LABEL_PAD_PX
+        left = min(band.left_half_px for band in state.periodic_bands)
+        right = max(band.right_half_px for band in state.periodic_bands)
+        self.assertGreaterEqual(x - width / 2, left - 1e-6)
+        self.assertLessEqual(x + width / 2, right + 1e-6)
 
     def test_analysis_scope_change_invalidates_labels_results_and_lcdu(self):
         state = periodic_state()

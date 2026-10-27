@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, scrolledtext, ttk
@@ -39,7 +40,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.0.1"
 
 MAX_VIEW_WIDTH = 980
 MAX_VIEW_HEIGHT = 620
@@ -92,6 +93,21 @@ AUTO_MODE_PERIODIC = "周期亮边（槽 / 平台）"
 AUTO_MODE_SOLID = "实体亮线 / 暗线（原模式）"
 PERIODIC_KIND_LABELS = {"槽": "trench", "平台": "platform"}
 PERIODIC_POSITION_LABELS = {"亮带中心": "center", "亮带左侧": "left", "亮带右侧": "right"}
+# Interval number labels use fixed screen-pixel rows so dense previews stay legible.
+PERIODIC_LABEL_FONT_PX = -12
+PERIODIC_LABEL_ROW_GAP_PX = 22
+PERIODIC_LABEL_PAD_PX = 3
+PERIODIC_LABEL_ROW_INSET_PX = 12
+PERIODIC_LABEL_BG_FILL = "#18202b"
+PERIODIC_LABEL_BG_PAD_PX = 1
+# ERA sample ROI labels ("1L"/"1R") reuse the periodic label metrics: same fixed font,
+# same two screen rows inside the ROI top, same dark plate. No second layout.
+ERA_LABEL_ROW_GAP_PX = PERIODIC_LABEL_ROW_GAP_PX
+ERA_LABEL_ROW_INSET_PX = PERIODIC_LABEL_ROW_INSET_PX
+PERIODIC_LABEL_COLOR = "#ffe066"
+# Owner tags: sample labels/plates follow the sample-ROI switch, interval numbers the preview switch.
+ERA_LABEL_TAGS = ("era_roi", "era_roi_label")
+ERA_LABEL_BACKGROUND_TAGS = ("era_roi", "era_roi_label_background")
 VERTICAL_EDGE_SUPPORT_WINDOW_PX = 41
 VERTICAL_EDGE_SUPPORT_MIN_POINTS = 24
 CD_RAY_STEP_PX = 0.25
@@ -781,6 +797,15 @@ def find_rotation_to_vertical(image: np.ndarray) -> float:
     coarse_best = min(coarse_angles, key=lambda angle: score(preview, angle))
     fine_angles = np.arange(coarse_best - 3.0, coarse_best + 3.01, 0.1)
     return float(min(fine_angles, key=lambda angle: score(image, angle)))
+
+
+def row_boxes_overlap(box: tuple[float, float, float, float],
+                      others: list[tuple[float, float, float, float]], gap: float) -> bool:
+    """True when a real 2D text bbox overlaps (with ``gap`` px) any already occupied text bbox."""
+    left, top, right, bottom = box
+    return any(not (right < other_left - gap or left > other_right + gap
+                    or bottom < other_top - gap or top > other_bottom + gap)
+               for other_left, other_top, other_right, other_bottom in others)
 
 
 def acquire_single_instance_lock():
@@ -2550,6 +2575,12 @@ class LERLWRApp(AppBase):
         self.show_era_rois = True
         self.periodic_bands = []
         self.periodic_origin_px = (0, 0)
+        self.periodic_label_rows: dict[int, list[int]] = {1: [], 2: []}
+        # Real 2D text bboxes per screen row, shared by periodic interval numbers and
+        # ERA sample ROI labels so the two families never cover each other.
+        self.label_row_boxes: dict[int, list[tuple[float, float, float, float]]] = {1: [], 2: []}
+        # ERA sample ROI tags ("1L"/"1R") keep their own accepted items for redraw/cleanup.
+        self.era_roi_label_rows: dict[int, list[int]] = {1: [], 2: []}
         self.periodic_preview_signature = None
         self.era_sample_listbox: tk.Listbox | None = None
         self.bcp_result: BCPAnalysisResult | None = None
@@ -2881,6 +2912,7 @@ class LERLWRApp(AppBase):
         self.canvas.bind("<Button-5>", self.zoom_with_space_wheel)
         self.canvas.bind("<Enter>", lambda _event: self.canvas.focus_set())
         self.canvas.bind("<Motion>", self.update_canvas_cursor)
+        self.canvas.bind("<Motion>", self.periodic_hover_motion, add="+")
         self.canvas.bind("<BackSpace>", self.clear_selection)
         self.canvas.bind("<Delete>", self.clear_selection)
         self.bind_all("<KeyPress-space>", self.start_pan_mode)
@@ -4204,18 +4236,53 @@ class LERLWRApp(AppBase):
             )
         self.draw_era_rois()
 
+    def era_roi_label_entries(self) -> list[tuple[str, tuple[int, int, int, int], str]]:
+        """Return ``(label, global ROI bounds px, colour)`` for every stored left/right ROI."""
+        entries = []
+        for index, sample in enumerate(self.era_line_samples, start=1):
+            for side, bounds, color in (
+                ("L", sample.left_roi_bounds_px, self.fit_left_color),
+                ("R", sample.right_roi_bounds_px, self.fit_right_color),
+            ):
+                if bounds is None:
+                    continue
+                entries.append((f"{index}{side}", tuple(bounds), color))
+        return entries
+
+    def era_label_precedence(self, key: tuple) -> tuple:
+        """Sort key: the active sample's two labels come first, the rest follow in order."""
+        index = int(key[1][:-1]) - 1
+        return (index != self.era_active_sample_index, index, key[1][-1])
+
+    def era_label_row_anchors(self, bounds: tuple[int, int, int, int], scale: float) -> dict[int, float]:
+        """Fixed screen-pixel rows counted from this ROI's own top, clipped to its height."""
+        top, bottom = bounds[1] * scale, bounds[3] * scale
+        anchors = {}
+        for row, inset in ((1, ERA_LABEL_ROW_INSET_PX), (2, ERA_LABEL_ROW_INSET_PX + ERA_LABEL_ROW_GAP_PX)):
+            y = top + inset
+            if y <= bottom:
+                anchors[row] = y
+        return anchors
+
     def draw_era_rois(self) -> None:
-        """Show stored single-edge ROIs; explicit selection enables editing."""
+        """Show stored single-edge ROIs; explicit selection enables editing.
+
+        Two phases: every ROI rectangle and yellow reference band is drawn first, then the
+        sample labels, so a later ROI edge can never be drawn over already placed text.
+        """
         self.canvas.delete("era_roi")
+        self.canvas.delete("era_roi_label_background")
         self.canvas.delete("era_band_reference")
-        self.draw_periodic_preview()
-        if not self.show_era_rois:
+        self.era_roi_label_rows = {1: [], 2: []}
+        if not self.show_era_rois or not self.era_line_samples:
+            self.draw_periodic_preview()
             return
         scale = self.display_scale
-        for index, sample in enumerate(self.era_line_samples, start=1):
-            for side, bounds, color, reference in (
-                ("L", sample.left_roi_bounds_px, self.fit_left_color, sample.left_reference_band_px),
-                ("R", sample.right_roi_bounds_px, self.fit_right_color, sample.right_reference_band_px),
+        references = []
+        for sample in self.era_line_samples:
+            for bounds, color, reference in (
+                (sample.left_roi_bounds_px, self.fit_left_color, sample.left_reference_band_px),
+                (sample.right_roi_bounds_px, self.fit_right_color, sample.right_reference_band_px),
             ):
                 if bounds is None:
                     continue
@@ -4232,26 +4299,42 @@ class LERLWRApp(AppBase):
                     dash=(5, 3),
                     tags="era_roi",
                 )
-                self.canvas.create_text(
-                    left * scale + 4,
-                    top * scale + 10,
-                    text=f"{index}{side} 选区",
-                    anchor=tk.W,
-                    fill=color,
-                    tags="era_roi",
-                )
-                if sample.edge_profile_kind == "bright_band" and reference is not None and self.periodic_preview_visible_var.get():
-                    band_left, band_right = reference
-                    self.canvas.create_rectangle(
-                        band_left * scale,
-                        top * scale,
-                        band_right * scale,
-                        bottom * scale,
-                        outline="#ffe066",
-                        width=1,
-                        dash=(2, 2),
-                        tags="era_band_reference",
-                    )
+                if (sample.edge_profile_kind == "bright_band" and reference is not None
+                        and self.periodic_preview_visible_var.get()):
+                    references.append((reference, top, bottom))
+        for (band_left, band_right), top, bottom in references:
+            self.canvas.create_rectangle(
+                band_left * scale,
+                top * scale,
+                band_right * scale,
+                bottom * scale,
+                outline="#ffe066",
+                width=1,
+                dash=(2, 2),
+                tags="era_band_reference",
+            )
+        self.draw_periodic_preview()
+        self.draw_era_roi_labels()
+
+    def draw_era_roi_labels(self) -> None:
+        """Place ``1L``/``1R`` tags next to their own ROI, never moving the ROI itself.
+
+        The horizontal span is the union of every drawn ROI (never one narrow ROI's own
+        width), so a short tag can still be shifted sideways instead of being dropped.
+        """
+        entries = self.era_roi_label_entries()
+        if not entries:
+            return
+        scale = self.display_scale
+        left = math.floor(min(bounds[0] for _, bounds, _ in entries) * scale)
+        right = math.ceil(max(bounds[2] for _, bounds, _ in entries) * scale)
+        ordered = sorted(enumerate(entries), key=lambda pair: self.era_label_precedence((pair[0], pair[1][0])))
+        for _, (label, roi, color) in ordered:
+            anchors = self.era_label_row_anchors(roi, scale)
+            if not anchors:
+                continue
+            bounds = (left, roi[1] * scale, right, roi[3] * scale)
+            self.place_roi_label(label, (roi[0] + roi[2]) / 2 * scale, anchors, bounds, color=color)
 
     def roi_handle_positions(self) -> dict[str, tuple[float, float]]:
         if self.roi_canvas is None:
@@ -5348,37 +5431,302 @@ class LERLWRApp(AppBase):
             self.show_era_rois = False
             self.draw_image()
             self.result_var.set(f"识别 {len(bands)} 条亮边、{len(bands) - 1} 个相邻区间。\n请在预览中选一个区号，指定它是槽还是平台，再选择测量对象及左右取点。")
-            self.status_var.set("黄框标记亮带，区号从左向右排列；槽/平台标签由你指定。")
+            self.status_var.set("黄框标记亮带，区号从左向右排列；槽/平台标签由你指定。图顶数字为区号，过密自动避让/省略，鼠标移入区间可在底部查看完整编号与类别。")
         except ValueError as exc:
             messagebox.showwarning("无法预览周期亮边", str(exc))
 
+    def periodic_reference_index(self) -> int | None:
+        """Return the labeled interval number of the calibration reference, if valid."""
+        if self.periodic_reference_kind_var.get() not in PERIODIC_KIND_LABELS:
+            return None
+        try:
+            reference = int(self.periodic_reference_interval_var.get())
+        except ValueError:
+            return None
+        if not 1 <= reference <= len(self.periodic_bands) - 1:
+            return None
+        return reference
+
+    def periodic_interval_label(self, index: int) -> str:
+        return f"区{index} {self.periodic_interval_kind_label(index)}"
+
+    def periodic_interval_kind_label(self, index: int) -> str:
+        kind = self.periodic_reference_kind_var.get()
+        reference = self.periodic_reference_index()
+        if kind not in PERIODIC_KIND_LABELS or reference is None:
+            return "槽/平台待标定"
+        same_kind = (index - reference) % 2 == 0
+        return kind if same_kind else ("平台" if kind == "槽" else "槽")
+
+    def periodic_interval_at_canvas(self, canvas_x: float, canvas_y: float) -> int | None:
+        """Return the real interval number under the cursor inside the periodic ROI."""
+        if not self.periodic_preview_visible_var.get() or not self.periodic_bands:
+            return None
+        if self.auto_line_mode_var.get() != AUTO_MODE_PERIODIC:
+            return None
+        scale = self.display_scale
+        if not scale or not math.isfinite(scale):
+            return None
+        offset_x, offset_y = self.periodic_origin_px
+        top = min(band.roi_bounds_px[1] for band in self.periodic_bands)
+        bottom = max(band.roi_bounds_px[3] for band in self.periodic_bands)
+        left = min(band.left_half_px for band in self.periodic_bands)
+        right = max(band.right_half_px for band in self.periodic_bands)
+        x, y = canvas_x / scale, canvas_y / scale
+        if not (left + offset_x <= x <= right + offset_x and top + offset_y <= y <= bottom + offset_y):
+            return None
+        # Band centres are local to the ROI: compare in the same image coordinate system.
+        for index, (first, second) in enumerate(zip(self.periodic_bands, self.periodic_bands[1:]), start=1):
+            if first.center_x_px + offset_x <= x <= second.center_x_px + offset_x:
+                return index
+        return None
+
+    def periodic_hover_motion(self, event: tk.Event) -> None:
+        """Motion add-on: only fills in the status bar, never intercepts other handlers.
+
+        Sample ROI tags are asked first, the periodic interval numbers are the fallback.
+        """
+        if self.update_era_roi_hover_status(event):
+            return
+        self.update_periodic_hover_status(event)
+
+    def era_roi_at_canvas(self, canvas_x: float, canvas_y: float) -> tuple[int, str, tuple[int, int, int, int]] | None:
+        """Return ``(sample index, "L"/"R", bounds)`` of the sample ROI under the cursor.
+
+        Canvas coordinates are divided by ``display_scale`` and compared directly with the stored
+        global ROI bounds: sample ROIs are already in image coordinates, so no ``periodic_origin``
+        is added. Overlapping ROIs go to the nearest reference-band centre, else ROI centre, with
+        the active sample breaking ties.
+        """
+        if not self.show_era_rois:
+            return None
+        scale = self.display_scale
+        if not scale or not math.isfinite(scale):
+            return None
+        x, y = canvas_x / scale, canvas_y / scale
+        hits = []
+        for index, sample in enumerate(self.era_line_samples):
+            for side, bounds, reference in (
+                ("L", sample.left_roi_bounds_px, sample.left_reference_band_px),
+                ("R", sample.right_roi_bounds_px, sample.right_reference_band_px),
+            ):
+                if bounds is None:
+                    continue
+                left, top, right, bottom = bounds
+                if not (left <= x <= right and top <= y <= bottom):
+                    continue
+                center_x = ((reference[0] + reference[1]) / 2 if reference is not None
+                            else (left + right) / 2)
+                center_y = (top + bottom) / 2
+                distance = math.hypot(x - center_x, y - center_y)
+                hits.append((distance, 0 if index == self.era_active_sample_index else 1, index, side, tuple(bounds)))
+        if not hits:
+            return None
+        _, _, index, side, bounds = min(hits)
+        return index, side, bounds  # type: ignore[return-value]
+
+    def era_roi_hover_text(self, index: int, side: str) -> str:
+        sample = self.era_line_samples[index]
+        text = f"线{index + 1} {'左边选区' if side == 'L' else '右边选区'}"
+        if sample.edge_profile_kind == "bright_band":
+            kind = "槽" if sample.target_kind == "trench" else "平台"
+            interval = f"区{sample.interval_index}" if sample.interval_index is not None else "区号未知"
+            text += f"；{interval} {kind}"
+        return text
+
+    def update_era_roi_hover_status(self, event: tk.Event) -> bool:
+        """Show the full sample identity under the cursor; the tag itself may be omitted when dense."""
+        try:
+            canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        except (tk.TclError, TypeError, AttributeError):
+            return False
+        hit = self.era_roi_at_canvas(canvas_x, canvas_y)
+        if hit is None:
+            return False
+        index, side, _ = hit
+        self.status_var.set(self.era_roi_hover_text(index, side) + "（图顶仅显示线号，过密会自动避让/省略）")
+        return True
+
+    def update_periodic_hover_status(self, event: tk.Event) -> bool:
+        """Show the full real interval number under the cursor in the status bar."""
+        if not self.periodic_preview_visible_var.get() or not self.periodic_bands:
+            return False
+        if self.auto_line_mode_var.get() != AUTO_MODE_PERIODIC:
+            return False
+        canvas_x, canvas_y = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        index = self.periodic_interval_at_canvas(canvas_x, canvas_y)
+        if index is None:
+            return False
+        self.status_var.set(f"{self.periodic_interval_label(index)}（图顶数字仅显示区号，过密会自动避让/省略）")
+        return True
+
+    def periodic_label_bbox(self, item: int) -> tuple[float, float, float, float] | None:
+        try:
+            box = self.canvas.bbox(item)
+            if box:
+                return tuple(float(value) for value in box)  # type: ignore[return-value]
+        except (tk.TclError, TypeError, AttributeError):
+            pass
+        return None
+
     def draw_periodic_preview(self) -> None:
         self.canvas.delete("periodic_preview")
+        self.periodic_label_rows = {1: [], 2: []}
+        self.label_row_boxes = {1: [], 2: []}
         if not self.periodic_preview_visible_var.get() or not self.periodic_bands or self.auto_line_mode_var.get() != AUTO_MODE_PERIODIC:
             return
         scale = self.display_scale
         offset_x, offset_y = self.periodic_origin_px
+        top = min(band.roi_bounds_px[1] for band in self.periodic_bands) + offset_y
         for band in self.periodic_bands:
-            top, bottom = band.roi_bounds_px[1], band.roi_bounds_px[3]
             self.canvas.create_rectangle(
-                (band.left_half_px + offset_x) * scale, (top + offset_y) * scale,
-                (band.right_half_px + offset_x) * scale, (bottom + offset_y) * scale,
+                (band.left_half_px + offset_x) * scale, (band.roi_bounds_px[1] + offset_y) * scale,
+                (band.right_half_px + offset_x) * scale, (band.roi_bounds_px[3] + offset_y) * scale,
                 outline="#ffe066", width=1, dash=(3, 3), tags="periodic_preview",
             )
-        for index, (first, second) in enumerate(zip(self.periodic_bands, self.periodic_bands[1:]), start=1):
-            label = f"区{index}"
-            if self.periodic_reference_kind_var.get() in PERIODIC_KIND_LABELS:
-                try:
-                    same_kind = (index - int(self.periodic_reference_interval_var.get())) % 2 == 0
-                    kind = self.periodic_reference_kind_var.get()
-                    label += f" {kind if same_kind else '平台' if kind == '槽' else '槽'}"
-                except ValueError:
-                    pass
-            self.canvas.create_text(
-                ((first.center_x_px + second.center_x_px) / 2 + offset_x) * scale,
-                (offset_y + 14 + 16 * (index % 2)) * scale,
-                text=label, fill="#ffe066", font=("Helvetica", 10), tags="periodic_preview",
+        intervals = list(enumerate(zip(self.periodic_bands, self.periodic_bands[1:]), start=1))
+        if not intervals:
+            return
+        left = (min(band.left_half_px for band in self.periodic_bands) + offset_x) * scale
+        right = (max(band.right_half_px for band in self.periodic_bands) + offset_x) * scale
+        roi_top = top * scale
+        # Only an interval that exists may define the reference kind; a stale or
+        # out-of-range interval number must not fake a labeled reference.
+        reference = self.periodic_reference_index()
+        roi_bottom = (max(band.roi_bounds_px[3] for band in self.periodic_bands) + offset_y) * scale
+        bounds = (left, roi_top, right, roi_bottom)
+        # Layout-only anchors: two fixed screen-pixel rows just inside the ROI top, spacing
+        # never follows the zoom, so the labels stay visible whatever the ROI offset is.
+        anchors = {row: roi_top + PERIODIC_LABEL_ROW_INSET_PX + PERIODIC_LABEL_ROW_GAP_PX * (row - 1) for row in (1, 2)}
+        occupied = {row: [] for row in (1, 2)}
+        for with_suffix in (True, False):
+            for index, (first, second) in intervals:
+                if (index == reference) != with_suffix:
+                    continue
+                label = self.periodic_interval_label(index) if with_suffix else f"{index}"
+                desired_x = ((first.center_x_px + second.center_x_px) / 2 + offset_x) * scale
+                self.periodic_place_label(label, desired_x, anchors, occupied, bounds)
+
+    def periodic_label_width(self, label: str) -> float:
+        if not isinstance(getattr(self, "canvas", None), tk.Misc):
+            # No GUI (headless fixtures): conservative estimate, no extra Tk window.
+            return sum(abs(PERIODIC_LABEL_FONT_PX) if ord(char) > 127 else 0.62 * abs(PERIODIC_LABEL_FONT_PX) for char in label)
+        try:
+            return float(tkfont.Font(root=self.canvas, font=("Helvetica", PERIODIC_LABEL_FONT_PX)).measure(label))
+        except (tk.TclError, TypeError, AttributeError):
+            return sum(abs(PERIODIC_LABEL_FONT_PX) if ord(char) > 127 else 0.62 * abs(PERIODIC_LABEL_FONT_PX) for char in label)
+
+    def periodic_place_label(self, label: str, desired_x: float, anchors: dict, occupied: dict,
+                            bounds: tuple[float, float, float, float] | None = None,
+                            color: str | None = None, tags: tuple[str, ...] = ("periodic_preview",),
+                            background_tags: tuple[str, ...] | None = None, label_rows: dict | None = None) -> bool:
+        """Draw one label on the first fixed-screen row inside ``bounds`` that has room, else omit it.
+
+        ``bounds`` is the preview ROI rectangle in canvas pixels ``(left, top, right, bottom)``;
+        the label centre is clamped inside it and only the text moves, never the bands.
+        ``color``/``tags``/``background_tags``/``label_rows`` let the ERA sample ROI tags
+        ("1L"/"1R") reuse this exact layout instead of a second copy; the defaults keep the
+        periodic interval numbers unchanged. Returns whether the label was placed.
+        """
+        width = self.periodic_label_width(label) + 2 * PERIODIC_LABEL_PAD_PX
+        rows = self.periodic_label_rows if label_rows is None else label_rows
+        row_boxes = self.label_row_boxes
+        for row in (1, 2):
+            y = anchors.get(row)
+            if y is None:
+                # No fixed row available (too short a ROI): nothing to try on this row.
+                continue
+            half_height = abs(PERIODIC_LABEL_FONT_PX) / 2 + PERIODIC_LABEL_PAD_PX
+            if bounds is not None and (y - half_height < bounds[1] or y + half_height > bounds[3]):
+                # The row does not fit wholly inside the visible ROI: skip it.
+                continue
+            x = desired_x
+            if bounds is not None:
+                minimum_x = math.ceil(bounds[0] + width / 2)
+                maximum_x = math.floor(bounds[2] - width / 2)
+                if minimum_x > maximum_x:
+                    # The ROI itself is narrower than this label: omit it, the status bar still shows it.
+                    continue
+                x = min(max(x, minimum_x), maximum_x)
+            left, right = x - width / 2, x + width / 2
+            occupied_boxes = [box for boxes in row_boxes.values() for box in boxes]
+            if row_boxes_overlap((left, y - half_height, right, y + half_height),
+                                 occupied_boxes, PERIODIC_LABEL_PAD_PX):
+                continue
+            item = self.canvas.create_text(
+                x, y,
+                text=label, fill=color or PERIODIC_LABEL_COLOR, font=("Helvetica", PERIODIC_LABEL_FONT_PX), tags=tags,
             )
+            box = self.periodic_label_bbox(item)
+            if box is not None:
+                if bounds is not None and box[2] - box[0] <= bounds[2] - bounds[0]:
+                    shift = (math.ceil(bounds[0] - box[0]) if box[0] < bounds[0]
+                             else math.floor(bounds[2] - box[2]) if box[2] > bounds[2] else 0)
+                    if shift:
+                        self.canvas.move(item, shift, 0)
+                        x += shift
+                        box = self.periodic_label_bbox(item) or box
+                left, right = box[0], box[2]
+                if bounds is not None and (left < bounds[0] or right > bounds[2]
+                                           or box[1] < bounds[1] or box[3] > bounds[3]):
+                    # Real canvas bbox leaves the ROI rectangle (any side): drop and try the next row.
+                    self.canvas.delete(item)
+                    continue
+                if row_boxes_overlap(box, occupied_boxes, PERIODIC_LABEL_PAD_PX):
+                    # Real canvas bbox collides after creation: drop and try the next row.
+                    self.canvas.delete(item)
+                    continue
+            placed_box = self.periodic_place_label_background(item, box, (x, y, width, half_height),
+                                                              tags=background_tags)
+            row_boxes[row].append(placed_box or (left, y - half_height, right, y + half_height))
+            rows[row].append(item)
+            return True
+        return False
+
+    def periodic_place_label_background(self, item: int, box: tuple[float, float, float, float] | None,
+                                        estimate: tuple[float, float, float, float],
+                                        tags: tuple[str, ...] | None = None
+                                        ) -> tuple[float, float, float, float] | None:
+        """Put a dark snug plate under an accepted label so the text stays readable on bright bands.
+
+        ``box`` is the real canvas text bbox, ``estimate`` the headless ``(x, y, width, half_height)``
+        fallback used when the canvas cannot report a bbox. The plate carries ``periodic_preview`` so the
+        existing preview toggle/redraw clears it together with the text: no stale background survives.
+        ``tags`` overrides that owner for the ERA sample labels (``era_roi``), so turning the sample ROI
+        display off removes the plates too. Returns the plate bbox actually occupied.
+        """
+        if box is not None:
+            left, top, right, bottom = box[0], box[1], box[2], box[3]
+        else:
+            x, y, width, half_height = estimate
+            left, right = x - width / 2, x + width / 2
+            top, bottom = y - half_height, y + half_height
+        margin = PERIODIC_LABEL_BG_PAD_PX
+        try:
+            background = self.canvas.create_rectangle(
+                left - margin, top - margin, right + margin, bottom + margin,
+                fill=PERIODIC_LABEL_BG_FILL, outline="",
+                tags=(tags or ("periodic_preview",)) + ("periodic_label_background",),
+            )
+            self.canvas.tag_lower(background, item)
+        except (tk.TclError, TypeError, AttributeError):
+            return None
+        return left - margin, top - margin, right + margin, bottom + margin
+
+    def place_roi_label(self, label: str, desired_x: float, anchors: dict,
+                        bounds: tuple[float, float, float, float] | None = None,
+                        color: str | None = None) -> bool:
+        """One ERA sample ROI tag (``1L``/``1R``) through the periodic label layout.
+
+        Both families share the periodic placement rules and ``label_row_boxes``: real 2D text
+        bboxes per screen row, so a tag and an interval number drawn at different heights are
+        still kept apart by rectangle overlap instead of sharing one x-interval.
+        """
+        return self.periodic_place_label(
+            label, desired_x, anchors, self.era_roi_label_rows, bounds,
+            color=color, tags=ERA_LABEL_TAGS, background_tags=ERA_LABEL_BACKGROUND_TAGS,
+            label_rows=self.era_roi_label_rows,
+        )
 
     def recognize_era_lines(self, measure: bool = False) -> None:
         """Discover line pairs once, replacing the editable sample set without duplicates."""

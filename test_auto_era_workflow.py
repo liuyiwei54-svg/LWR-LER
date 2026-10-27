@@ -47,7 +47,8 @@ def headless_app(image):
         periodic_target_kind_var=Value("槽"), periodic_left_position_var=Value("亮带中心"),
         periodic_right_position_var=Value("亮带中心"), periodic_bands=[],
         periodic_origin_px=(0, 0), periodic_preview_signature=None, display_scale=1.0,
-        periodic_preview_visible_var=Value(True),
+        era_roi_label_rows={1: [], 2: []}, label_row_boxes={1: [], 2: []},
+        periodic_preview_visible_var=Value(True), periodic_label_rows={1: [], 2: []},
         status_var=Value(""), result_var=Value(""), recognition_duration_var=Value(""),
         canvas=Mock(), result=None, analysis_origin=None, bcp_result=None,
         annotations=[], show_era_rois=True, ler_lwr_roi_mode=False,
@@ -70,7 +71,13 @@ def headless_app(image):
         "draw_exported_era_edges",
         "automatic_line_region", "periodic_line_settings", "clear_periodic_preview",
         "periodic_options_changed", "preview_periodic_lines", "draw_periodic_preview",
-        "periodic_scope_changed",
+        "periodic_scope_changed", "periodic_reference_index", "periodic_interval_label",
+        "periodic_interval_kind_label", "periodic_interval_at_canvas", "periodic_hover_motion",
+        "update_periodic_hover_status", "periodic_label_width", "periodic_place_label",
+        "periodic_label_bbox", "periodic_place_label_background",
+        "draw_era_rois", "draw_era_roi_labels", "era_roi_label_entries", "era_label_precedence",
+        "era_label_row_anchors", "place_roi_label",
+        "era_roi_at_canvas", "era_roi_hover_text", "update_era_roi_hover_status",
     ):
         setattr(state, name, MethodType(getattr(app.LERLWRApp, name), state))
     return state
