@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 from auto_line_detection import detect_line_candidates
 from periodic_line_detection import BrightBandCandidate, bright_band_position, bright_band_search_bounds, detect_bright_bands, select_periodic_pairs
+from roughness_psd import RepeatScanSpectrum, RoughnessSpectrum, repeat_scan_spectrum, roughness_spectrum
 
 VENDOR_DIRECTORY = Path(__file__).with_name("vendor")
 if VENDOR_DIRECTORY.exists():
@@ -217,6 +218,16 @@ class AnalysisResult:
     canny_threshold_ratio: float
     canny_low_threshold: float
     canny_normalization_scale: float
+
+
+@dataclass(frozen=True)
+class RepeatScanMeasurement:
+    source: Path
+    image: np.ndarray
+    settings: tuple
+    row_origin: int
+    lines: dict[str, AnalysisResult]
+    line_methods: dict[str, tuple]
 
 
 @dataclass
@@ -553,6 +564,8 @@ def fft_line_chart_rgb(
     x_label: str,
     y_label: str,
     size: tuple[int, int] = FFT_COORDINATE_VIEW_SIZE,
+    full_range: bool = False,
+    marker_x: float | None = None,
 ) -> np.ndarray:
     """Draw a compact coordinate line chart using only Pillow."""
     view_width, view_height = size
@@ -562,7 +575,8 @@ def fft_line_chart_rgb(
     grid = "#4a4a4a"
     left, top, right, bottom = 43, 24, view_width - 12, view_height - 34
     all_values = np.concatenate([values.ravel() for values, _label, _color in series])
-    low, high = np.percentile(all_values[np.isfinite(all_values)], (1.0, 99.0))
+    percentiles = (0, 100) if full_range else (1, 99)
+    low, high = np.percentile(all_values[np.isfinite(all_values)], percentiles)
     if high <= low:
         high = low + 1.0
     x_low, x_high = float(x_values[0]), float(x_values[-1])
@@ -574,17 +588,29 @@ def fft_line_chart_rgb(
         draw.line((x, top, x, bottom), fill=grid)
         draw.line((left, y, right, y), fill=grid)
     draw.rectangle((left, top, right, bottom), outline=foreground)
+    if marker_x is not None and x_low <= marker_x <= x_high:
+        marker = round(left + (right - left) * (marker_x - x_low) / (x_high - x_low))
+        draw.line((marker, top, marker, bottom), fill="#ffb45e", width=2)
     for series_index, (values, label, color) in enumerate(series):
         points = []
         for index, value in enumerate(values):
+            if not np.isfinite(value):
+                if len(points) >= 2:
+                    draw.line(points, fill=color, width=2)
+                points = []
+                continue
             x = left + (float(x_values[index]) - x_low) * (right - left) / (x_high - x_low)
             y = bottom - (float(value) - low) * (bottom - top) / (high - low)
             points.append((round(x), round(np.clip(y, top, bottom))))
         if len(points) >= 2:
             draw.line(points, fill=color, width=2)
         draw.text((left + 5, top + 4 + series_index * 12), label, fill=color)
-    draw.text((right - 20, bottom + 3), x_label, fill=foreground)
-    draw.text((4, top - 1), y_label, fill=foreground)
+    if full_range:
+        draw.text(((left + right) // 2, bottom + 3), x_label, fill=foreground)
+        draw.text((left + 80, 5), y_label, fill=foreground)
+    else:
+        draw.text((right - 20, bottom + 3), x_label, fill=foreground)
+        draw.text((4, top - 1), y_label, fill=foreground)
     draw.text((left, bottom + 3), f"{x_values[0]:.2g}", fill="#aaaaaa")
     draw.text((right - 31, bottom + 3), f"{x_values[-1]:.2g}", fill="#aaaaaa")
     draw.text((left + 3, bottom - 10), f"{low:.2g}", fill="#aaaaaa")
@@ -2724,6 +2750,8 @@ class LERLWRApp(AppBase):
         file_menu.add_command(label="拟合线条样式", command=self.open_fit_line_style_dialog)
         file_menu.add_command(label="导出 CSV", command=self.export_csv)
         file_menu.add_command(label="导出标注/拟合图片", command=self.export_annotated_image)
+        file_menu.add_command(label="导出拟合图片并查看 PSD", command=lambda: self.export_annotated_image(show_psd=True))
+        file_menu.add_command(label="查看粗糙度 PSD", command=self.open_roughness_psd)
         ttk.Menubutton(controls, text="菜单 ▾", menu=file_menu).grid(row=0, column=0, padx=(0, 8))
         ttk.Label(controls, text="像素尺寸 (nm/pixel):").grid(row=0, column=1, sticky="e")
         ttk.Entry(controls, textvariable=self.pixel_size_var, width=10).grid(row=0, column=2, padx=(4, 12))
@@ -6101,14 +6129,17 @@ class LERLWRApp(AppBase):
 
         auto_controls = ttk.LabelFrame(content, text="自动多线测量", padding=10)
         auto_controls.pack(fill=tk.X, pady=(0, 10), before=roi_controls)
-        ttk.Label(auto_controls, text="周期亮边：先预览区号，指定一个槽/平台，再批量测量同类区域。大倾角请先旋转校正。", wraplength=390).pack(anchor="w")
         model_row = ttk.Frame(auto_controls)
-        model_row.pack(anchor="w", pady=(8, 0))
+        model_row.pack(anchor="w")
         ttk.Label(model_row, text="图像形貌：").pack(side=tk.LEFT)
         model_selector = ttk.Combobox(model_row, textvariable=self.auto_line_mode_var, state="readonly", values=(AUTO_MODE_PERIODIC, AUTO_MODE_SOLID), width=24)
         model_selector.pack(side=tk.LEFT)
         model_selector.bind("<<ComboboxSelected>>", self.periodic_options_changed)
-        periodic_row = ttk.Frame(auto_controls)
+        mode_controls = ttk.Frame(auto_controls)
+        mode_controls.pack(fill=tk.X, pady=(8, 0))
+        periodic_controls = ttk.Frame(mode_controls)
+        ttk.Label(periodic_controls, text="先预览区号，指定一个槽/平台，再批量测量同类区域。大倾角请先旋转校正。", wraplength=390).pack(anchor="w")
+        periodic_row = ttk.Frame(periodic_controls)
         periodic_row.pack(anchor="w", pady=(8, 0))
         ttk.Button(periodic_row, text="预览亮边 / 区号", command=self.preview_periodic_lines).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(periodic_row, text="参考区号：").pack(side=tk.LEFT)
@@ -6117,7 +6148,7 @@ class LERLWRApp(AppBase):
         reference_entry.bind("<FocusOut>", self.periodic_options_changed)
         reference_entry.bind("<Return>", self.periodic_options_changed)
         ttk.Checkbutton(
-            auto_controls, text="显示预览亮边 / 区号",
+            periodic_controls, text="显示预览亮边 / 区号",
             variable=self.periodic_preview_visible_var, command=self.draw_era_rois,
         ).pack(anchor="w", pady=(5, 0))
         for text, variable, values in (
@@ -6126,17 +6157,29 @@ class LERLWRApp(AppBase):
             ("左侧亮带取点：", self.periodic_left_position_var, tuple(PERIODIC_POSITION_LABELS)),
             ("右侧亮带取点：", self.periodic_right_position_var, tuple(PERIODIC_POSITION_LABELS)),
         ):
-            row = ttk.Frame(auto_controls)
+            row = ttk.Frame(periodic_controls)
             row.pack(anchor="w", pady=(5, 0))
             ttk.Label(row, text=text).pack(side=tk.LEFT)
             selector = ttk.Combobox(row, textvariable=variable, state="readonly", values=values, width=14)
             selector.pack(side=tk.LEFT)
             selector.bind("<<ComboboxSelected>>", self.periodic_options_changed)
-        ttk.Label(auto_controls, text="左/右按图像横坐标方向。两侧取各自半高位置；中心取两者中点。槽/平台必须由你标定，不能仅凭灰度确定。", wraplength=390, foreground="#666666").pack(anchor="w", pady=(5, 0))
-        auto_options = ttk.Frame(auto_controls)
-        auto_options.pack(anchor="w", pady=(8, 0))
-        ttk.Label(auto_options, text="原模式线条亮暗：").pack(side=tk.LEFT)
-        ttk.Combobox(auto_options, textvariable=self.auto_line_polarity_var, state="readonly", values=(AUTO_LINE_BRIGHT, AUTO_LINE_DARK), width=18).pack(side=tk.LEFT)
+        ttk.Label(periodic_controls, text="左/右按图像横坐标方向。两侧取各自半高位置；中心取两者中点。槽/平台必须由你标定，不能仅凭灰度确定。", wraplength=390, foreground="#666666").pack(anchor="w", pady=(5, 0))
+        solid_controls = ttk.Frame(mode_controls)
+        ttk.Label(solid_controls, text="线条亮暗：").pack(side=tk.LEFT)
+        ttk.Combobox(solid_controls, textvariable=self.auto_line_polarity_var, state="readonly", values=(AUTO_LINE_BRIGHT, AUTO_LINE_DARK), width=18).pack(side=tk.LEFT)
+
+        def show_mode_controls(*_trace_args: str) -> None:
+            if self.auto_line_mode_var.get() == AUTO_MODE_PERIODIC:
+                solid_controls.pack_forget()
+                periodic_controls.pack(fill=tk.X)
+            else:
+                periodic_controls.pack_forget()
+                solid_controls.pack(fill=tk.X)
+
+        show_mode_controls()
+        mode_trace = self.auto_line_mode_var.trace_add("write", show_mode_controls)
+        mode_controls.bind("<Destroy>", lambda _event: self.auto_line_mode_var.trace_remove("write", mode_trace))
+
         ttk.Checkbutton(auto_controls, text="仅在当前绿色 ROI 内找线", variable=self.auto_line_use_roi_var, command=self.periodic_scope_changed).pack(anchor="w", pady=(6, 0))
         auto_buttons = ttk.Frame(auto_controls)
         auto_buttons.pack(anchor="w", pady=(8, 0))
@@ -7407,7 +7450,362 @@ class LERLWRApp(AppBase):
             self.update_bcp_result_text()
         self.update_lcdu_summary_text()
 
-    def export_annotated_image(self) -> None:
+    def roughness_measurements(self) -> dict[str, list[AnalysisResult]]:
+        result = self.result
+        pixel_size = self.measurement_pixel_size()
+        if result is None or pixel_size is None or not math.isclose(pixel_size, result.pixel_size_nm, rel_tol=1e-12):
+            return {}
+        if result.edge_detector != EDGE_DETECTOR_ERA:
+            return {"当前线条": [result]}
+        if self.era_aggregate_result is None:
+            return {}
+        lines = {
+            f"线样本 {index}": [sample.paired_result]
+            for index, sample in enumerate(self.era_line_samples, start=1)
+            if sample.paired_result is not None
+        }
+        if len(lines) > 1:
+            return {"全部已测线条": [items[0] for items in lines.values()], **lines}
+        return lines
+
+    def repeat_scan_measurement(self, measurements: dict[str, list[AnalysisResult]]) -> RepeatScanMeasurement | None:
+        if self.image_path is None or self.raw_image is None or self.analysis_origin is None:
+            return None
+        lines = {name: results[0] for name, results in measurements.items() if len(results) == 1}
+        if not lines:
+            return None
+        methods = {
+            f"线样本 {index}": (
+                sample.edge_profile_kind, sample.left_position_definition, sample.right_position_definition,
+                tuple((edge.polarity, edge.polynomial_degree) for edge in (sample.left_edge, sample.right_edge) if edge),
+            )
+            for index, sample in enumerate(self.era_line_samples, start=1) if sample.paired_result is not None
+        }
+        if "当前线条" in lines:
+            line = lines["当前线条"]
+            methods["当前线条"] = (line.edge_detector, line.edge_kernel_size, line.edge_diagonal_weight, line.edge_axial_weight)
+        settings = (
+            self.rotation_degrees, self.normalize_var.get(), self.gaussian_denoise_var.get(),
+            self.blur_method_var.get(), self.gaussian_kernel_size_var.get(), self.gaussian_sigma_scale_var.get(),
+            self.outlier_level_var.get(),
+        )
+        return RepeatScanMeasurement(self.image_path.resolve(), self.raw_image, settings, self.analysis_origin[1], lines, methods)
+
+    def open_roughness_psd(self, fitted_image: Path | None = None) -> None:
+        measurements = self.roughness_measurements()
+        if not measurements:
+            messagebox.showinfo("暂无粗糙度结果", "请先完成一次有像素标定的 LER / LWR 测量。")
+            return
+
+        source = str(self.image_path) if self.image_path else ""
+        repeat_reference = self.repeat_scan_measurement(measurements)
+        pixel_size = next(iter(measurements.values()))[0].pixel_size_nm
+        metrics = {
+            "左边缘 LER": ("left_residual_nm", "ler_left"),
+            "右边缘 LER": ("right_residual_nm", "ler_right"),
+            "线宽 LWR": ("width_residual_nm", "lwr"),
+        }
+        dialog = tk.Toplevel(self)
+        dialog.title("粗糙度 PSD")
+        dialog.minsize(660, 500)
+        dialog.geometry(f"690x{min(650, max(500, self.winfo_screenheight() - 100))}")
+        tabs = ttk.Notebook(dialog)
+        tabs.pack(fill=tk.BOTH, expand=True)
+        content = ttk.Frame(tabs, padding=16)
+        tabs.add(content, text="单图 PSD")
+        label_path = fitted_image or self.image_path
+        if label_path is not None:
+            prefix = "对应拟合图" if fitted_image else "源图"
+            ttk.Label(content, text=f"{prefix}　{label_path.name}", wraplength=620).pack(anchor="w")
+
+        choices = ttk.Frame(content)
+        choices.pack(anchor="w", pady=(8, 0))
+        line_var = tk.StringVar(dialog, value=next(iter(measurements)))
+        metric_var = tk.StringVar(dialog, value=next(iter(metrics)))
+        line_selector = ttk.Combobox(choices, textvariable=line_var, values=tuple(measurements), state="readonly", width=17)
+        line_selector.pack(side=tk.LEFT, padx=(0, 8))
+        metric_selector = ttk.Combobox(choices, textvariable=metric_var, values=tuple(metrics), state="readonly", width=15)
+        metric_selector.pack(side=tk.LEFT)
+
+        band_controls = ttk.Frame(content)
+        band_controls.pack(anchor="w", pady=(8, 0))
+        ttk.Label(band_controls, text="尺度分界（nm，可留空）").pack(side=tk.LEFT, padx=(0, 6))
+        cutoff_entry = ttk.Entry(band_controls, width=9)
+        cutoff_entry.pack(side=tk.LEFT, padx=(0, 6))
+        chart = ttk.Label(content)
+        chart.pack(anchor="w", pady=(10, 0))
+        summary = ttk.Label(content, wraplength=620, justify=tk.LEFT)
+        summary.pack(anchor="w", pady=(8, 0))
+        ttk.Label(
+            content, text="频段 RMS 来自加窗频谱。分界用于比较尺度，频谱含测量噪声。",
+            wraplength=620,
+        ).pack(anchor="w", pady=(5, 0))
+
+        def render(_event: object = None) -> tuple[RoughnessSpectrum, float | None] | None:
+            selected = measurements[line_var.get()]
+            attribute, metric_code = metrics[metric_var.get()]
+            traces = [(result.rows_px, getattr(result, attribute)) for result in selected]
+            try:
+                spectrum = roughness_spectrum(traces, pixel_size)
+            except ValueError as exc:
+                chart.configure(image="")
+                chart.image = None
+                summary.configure(text=str(exc))
+                return None
+
+            frequencies = spectrum.frequency_per_nm
+            scale_text = cutoff_entry.get().strip()
+            cutoff = None
+            band_note = ""
+            if scale_text:
+                try:
+                    scale_nm = float(scale_text)
+                    if not math.isfinite(scale_nm) or not 1 / frequencies[-1] < scale_nm < 1 / frequencies[0]:
+                        raise ValueError
+                    cutoff = 1 / scale_nm
+                    long_rms, short_rms = spectrum.band_rms_nm(cutoff)
+                    band_note = f"长尺度（> {scale_nm:g} nm）{long_rms:.3g} nm　短尺度（≤ {scale_nm:g} nm）{short_rms:.3g} nm"
+                except ValueError:
+                    band_note = f"请输入 {1 / frequencies[-1]:.4g} 到 {1 / frequencies[0]:.4g} nm 之间的分界。"
+            power = spectrum.density_nm3
+            floor = max(float(power.max()) * 1e-12, np.finfo(float).tiny)
+            plot = fft_line_chart_rgb(
+                frequencies, ((np.log10(np.maximum(power, floor)), "", "#66d7ea"),),
+                title=metric_code.upper(), x_label="cycles/nm", y_label="log10 PSD",
+                size=(620, 285), full_range=True, marker_x=cutoff,
+            )
+            chart.image = ImageTk.PhotoImage(Image.fromarray(plot), master=dialog)
+            chart.configure(image=chart.image)
+            total_rms = math.sqrt(float(power.sum()) * spectrum.frequency_step_per_nm)
+            summary.configure(text="\n".join(filter(None, (
+                f"频谱总 RMS {total_rms:.3g} nm　PSD 单位 nm³　频率分辨率 {spectrum.frequency_step_per_nm:.4g} cycles/nm",
+                f"覆盖 {spectrum.contributing_lines}/{len(selected)} 根线、{spectrum.covered_rows}/{spectrum.total_rows} 个有效行点"
+                f"　每窗 {spectrum.segment_rows} 行，共 {spectrum.window_count} 个 Hann 窗",
+                band_note,
+            ))))
+            if scale_text and cutoff is None:
+                return None
+            return spectrum, cutoff
+
+        def export_psd() -> None:
+            displayed = render()
+            if displayed is None:
+                return
+            spectrum, cutoff = displayed
+            _, metric_code = metrics[metric_var.get()]
+            stem = label_path.stem if label_path else "sem"
+            target = filedialog.asksaveasfilename(
+                parent=dialog, title="保存粗糙度 PSD", defaultextension=".csv",
+                initialdir=str(fitted_image.parent) if fitted_image else None,
+                initialfile=f"{stem}_{metric_code}_psd.csv", filetypes=[("CSV 文件", "*.csv")],
+            )
+            if not target:
+                return
+            try:
+                with open(target, "w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerows([
+                        ("source", source), ("fitted_image", str(fitted_image) if fitted_image else ""),
+                        ("line_selection", line_var.get()), ("metric", metric_code), ("pixel_size_nm", pixel_size),
+                        ("method", "one_sided_hann_periodogram_average_weighted_mean_removed"),
+                        ("segment_rows", spectrum.segment_rows), ("window_count", spectrum.window_count),
+                        ("contributing_lines", spectrum.contributing_lines), ("covered_rows", spectrum.covered_rows),
+                        ("total_rows", spectrum.total_rows), ("frequency_step_cycles_per_nm", spectrum.frequency_step_per_nm),
+                    ])
+                    if cutoff is not None:
+                        long_rms, short_rms = spectrum.band_rms_nm(cutoff)
+                        writer.writerows([
+                            ("cutoff_cycles_per_nm", cutoff), ("cutoff_wavelength_nm", 1 / cutoff),
+                            ("long_scale_rms_nm", long_rms), ("short_scale_rms_nm", short_rms),
+                        ])
+                    writer.writerow([])
+                    writer.writerow(["frequency_cycles_per_nm", "psd_nm3"])
+                    writer.writerows(zip(spectrum.frequency_per_nm, spectrum.density_nm3))
+            except OSError as exc:
+                messagebox.showerror("导出失败", str(exc), parent=dialog)
+                return
+            self.status_var.set(f"已导出粗糙度 PSD：{target}")
+
+        line_selector.bind("<<ComboboxSelected>>", render)
+        metric_selector.bind("<<ComboboxSelected>>", render)
+        cutoff_entry.bind("<Return>", render)
+        ttk.Button(band_controls, text="应用分界", command=render).pack(side=tk.LEFT)
+        ttk.Button(band_controls, text="导出 PSD CSV", command=export_psd).pack(side=tk.LEFT, padx=(12, 0))
+        if repeat_reference is not None:
+            repeat_tab = ttk.Frame(tabs)
+            tabs.add(repeat_tab, text="双图噪声校正")
+
+            def open_repeat_tab(_event: tk.Event) -> None:
+                if tabs.select() != str(repeat_tab) or repeat_tab.winfo_children():
+                    return
+                self.build_repeat_scan_psd_tab(dialog, repeat_tab, repeat_reference, line_var.get(), metric_var.get())
+
+            tabs.bind("<<NotebookTabChanged>>", open_repeat_tab)
+        render()
+
+    def build_repeat_scan_psd_tab(
+        self, dialog: tk.Toplevel, tab: ttk.Frame,
+        first: RepeatScanMeasurement, first_line: str, initial_metric: str,
+    ) -> None:
+        scroll = VerticalScrollFrame(tab, padding=16)
+        scroll.pack(fill=tk.BOTH, expand=True)
+        content = scroll.content
+        second: RepeatScanMeasurement | None = None
+        ttk.Label(content, text=f"图 A　{first.source.name}", wraplength=620).pack(anchor="w")
+        ttk.Label(
+            content, text="保留此窗口。在主窗口打开并测量同一视野的第二次独立扫描，再载入为图 B。",
+            wraplength=620,
+        ).pack(anchor="w", pady=(4, 4))
+        second_label = ttk.Label(content, text="图 B　待载入", wraplength=620)
+        second_label.pack(anchor="w")
+        selectors = ttk.Frame(content)
+        selectors.pack(anchor="w", pady=5)
+        ttk.Label(selectors, text="A 中线条").pack(side=tk.LEFT, padx=(0, 4))
+        a_var = tk.StringVar(dialog, value=first_line if first_line in first.lines else next(iter(first.lines)))
+        ttk.Combobox(selectors, textvariable=a_var, values=tuple(first.lines), state="readonly", width=14).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(selectors, text="B 中同一根线").pack(side=tk.LEFT, padx=(0, 4))
+        b_var = tk.StringVar(dialog)
+        b_selector = ttk.Combobox(selectors, textvariable=b_var, state="readonly", width=14)
+        b_selector.pack(side=tk.LEFT)
+        metrics = {"左边缘 LER": "ler_left", "右边缘 LER": "ler_right", "线宽 LWR": "lwr"}
+        metric = tk.StringVar(dialog, value=initial_metric)
+        ttk.Combobox(selectors, textvariable=metric, values=tuple(metrics), state="readonly", width=14).pack(side=tk.LEFT, padx=(8, 0))
+        controls = ttk.Frame(content)
+        controls.pack(anchor="w", pady=(4, 2))
+        ttk.Label(controls, text="B 沿线移到 A（px）").pack(side=tk.LEFT, padx=(0, 4))
+        offset_var = tk.StringVar(dialog, value="0")
+        offset_entry = ttk.Entry(controls, textvariable=offset_var, width=6)
+        offset_entry.pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(content, text="B 中同一特征在 A 的上方时填正数，例如 B 第 100 行对应 A 第 103 行，填 +3。", wraplength=620).pack(anchor="w")
+        summary = ttk.Label(content, text="载入图 B 后，请确认两次测量覆盖同一根线和同一段位置。", wraplength=620, justify=tk.LEFT)
+        summary.pack(anchor="w", pady=5)
+        comparison_view = ttk.Label(content)
+        comparison_view.pack(anchor="w")
+
+        def clear_charts(*_args: str) -> None:
+            comparison_view.configure(image="")
+            comparison_view.image = None
+            summary.configure(text="请计算当前所选线条和行偏移。")
+
+        def load_second() -> None:
+            nonlocal second
+            candidate = self.repeat_scan_measurement(self.roughness_measurements())
+            if candidate is None:
+                messagebox.showinfo("暂无图 B 测量", "请先在主窗口打开并完成第二张图的 LER / LWR 测量。", parent=dialog)
+                return
+            if first.source == candidate.source or np.array_equal(first.image, candidate.image):
+                messagebox.showwarning("请选择独立扫描", "图 B 与图 A 是同一张图。请使用第二次独立扫描。", parent=dialog)
+                return
+            if first.settings != candidate.settings:
+                messagebox.showwarning("测量设置不同", "请用相同的图像旋转、预处理和异常点设置重新测量图 B。", parent=dialog)
+                return
+            second = candidate
+            b_selector.configure(values=tuple(candidate.lines))
+            b_var.set(next(iter(candidate.lines)))
+            second_label.configure(text=f"图 B　{candidate.source.name}")
+            clear_charts()
+
+        def render() -> RepeatScanSpectrum | None:
+            if second is None:
+                messagebox.showinfo("请载入图 B", "完成第二张图的测量后，点击“载入主窗口测量为 B”。", parent=dialog)
+                return None
+            a_name, b_name = a_var.get(), b_var.get()
+            a, b = first.lines[a_name], second.lines[b_name]
+            code = metrics[metric.get()]
+            try:
+                if not math.isclose(a.pixel_size_nm, b.pixel_size_nm, rel_tol=1e-9):
+                    raise ValueError("两张图的像素尺寸不同，请使用相同采样间距的重复扫描。")
+                if first.line_methods.get(a_name) != second.line_methods.get(b_name):
+                    raise ValueError("两根线使用的边缘定位方法或取点设置不同，请统一后重测。")
+                try:
+                    offset = int(offset_var.get())
+                except ValueError as exc:
+                    raise ValueError("沿线偏移请输入整数像素，例如 0 或 +3。") from exc
+                position_attr = {"ler_left": "left_px", "ler_right": "right_px"}
+                values = (
+                    tuple(item.right_px - item.left_px for item in (a, b)) if code == "lwr"
+                    else tuple(getattr(item, position_attr[code]) for item in (a, b))
+                )
+                comparison = repeat_scan_spectrum(
+                    a.rows_px + first.row_origin, values[0], b.rows_px + second.row_origin, values[1],
+                    a.pixel_size_nm, offset, remove_slope=code != "lwr",
+                )
+            except ValueError as exc:
+                clear_charts()
+                summary.configure(text=str(exc))
+                return None
+            measured, noise, corrected = comparison.rms_nm()
+            estimate = f"{corrected:.3g} nm" if corrected is not None else "未分辨出正的校正方差"
+            summary.configure(text=(
+                f"测得 RMS（A、B 平均方差）{measured:.3g} nm　单次扫描噪声 RMS {noise:.3g} nm\n"
+                f"校正 RMS {estimate}　覆盖 {comparison.measured.covered_rows}/{len(comparison.common_rows)} 行"
+                f"　{comparison.measured.window_count} 个 Hann 窗\n"
+                "请在上图检查 A、B 的起伏位置是否对齐。校正假设样品未变化且两次扫描误差独立。"
+            ))
+            rows = comparison.common_rows
+            cuts = np.flatnonzero(np.diff(rows) != 1) + 1
+            positions = np.insert(rows, cuts, rows[cuts] - 0.5)
+            overlay = fft_line_chart_rgb(
+                positions, (
+                    (np.insert(comparison.first_residual_nm, cuts, np.nan), "A", "#66d7ea"),
+                    (np.insert(comparison.second_residual_nm, cuts, np.nan), "B", "#ffb45e"),
+                ),
+                title="A / B", x_label="Image A row (px)", y_label="Residual (nm)", size=(620, 170), full_range=True,
+            )
+            measured_psd = comparison.measured
+            floor = max(float(measured_psd.density_nm3.max()) * 1e-12, np.finfo(float).tiny)
+            power_chart = fft_line_chart_rgb(
+                measured_psd.frequency_per_nm, (
+                    (np.log10(np.maximum(measured_psd.density_nm3, floor)), "Measured", "#66d7ea"),
+                    (np.log10(np.maximum(comparison.noise_density_nm3, floor)), "Noise", "#ffb45e"),
+                ),
+                title=code.upper(), x_label="cycles/nm", y_label="log10 PSD", size=(620, 220), full_range=True,
+            )
+            comparison_plot = Image.fromarray(np.vstack((overlay, power_chart)))
+            comparison_view.image = ImageTk.PhotoImage(comparison_plot, master=dialog)
+            comparison_view.configure(image=comparison_view.image)
+            return comparison
+
+        def export_comparison() -> None:
+            comparison = render()
+            if comparison is None or second is None:
+                return
+            target = filedialog.asksaveasfilename(
+                parent=dialog, title="保存双图噪声校正", defaultextension=".csv",
+                initialfile=f"{first.source.stem}_{metrics[metric.get()]}_repeat_scan_psd.csv",
+                filetypes=[("CSV 文件", "*.csv")],
+            )
+            if not target:
+                return
+            measured, noise, corrected = comparison.rms_nm()
+            spectrum = comparison.measured
+            try:
+                with open(target, "w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerows([
+                        ("source_a", first.source), ("source_b", second.source),
+                        ("line_a", a_var.get()), ("line_b", b_var.get()), ("metric", metrics[metric.get()]),
+                        ("b_row_offset_px", int(offset_var.get())), ("common_rows", len(comparison.common_rows)),
+                        ("covered_rows", spectrum.covered_rows), ("segment_rows", spectrum.segment_rows),
+                        ("window_count", spectrum.window_count), ("frequency_step_cycles_per_nm", spectrum.frequency_step_per_nm),
+                        ("measured_rms_nm", measured), ("noise_rms_nm", noise), ("corrected_rms_nm", corrected),
+                        (),
+                        ("frequency_cycles_per_nm", "measured_psd_nm3", "noise_psd_nm3", "corrected_psd_estimate_nm3"),
+                    ])
+                    writer.writerows(zip(spectrum.frequency_per_nm, spectrum.density_nm3,
+                                         comparison.noise_density_nm3, comparison.corrected_density_nm3))
+            except OSError as exc:
+                messagebox.showerror("导出失败", str(exc), parent=dialog)
+                return
+            self.status_var.set(f"已导出双图噪声校正：{target}")
+
+        for variable in (offset_var, a_var, b_var, metric):
+            variable.trace_add("write", clear_charts)
+        ttk.Button(controls, text="载入主窗口测量为 B", command=load_second).pack(side=tk.LEFT)
+        ttk.Button(controls, text="计算校正", command=render).pack(side=tk.LEFT, padx=6)
+        ttk.Button(controls, text="导出 CSV", command=export_comparison).pack(side=tk.LEFT)
+
+    def export_annotated_image(self, *, show_psd: bool = False) -> None:
         if self.original_image is None:
             messagebox.showinfo("暂无图像", "请先打开一张 SEM 图像。")
             return
@@ -7470,6 +7868,8 @@ class LERLWRApp(AppBase):
             messagebox.showerror("导出失败", str(exc))
             return
         self.status_var.set(f"已导出拟合图片：{target}")
+        if show_psd:
+            self.open_roughness_psd(Path(target))
 
     def draw_exported_analysis_edges(
         self,
