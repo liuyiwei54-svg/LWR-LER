@@ -41,7 +41,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-APP_VERSION = "4.0.1"
+APP_VERSION = "5.0.0"
 
 MAX_VIEW_WIDTH = 980
 MAX_VIEW_HEIGHT = 620

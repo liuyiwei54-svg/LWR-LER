@@ -1,14 +1,16 @@
 # SEM 测量工具（LER/LWR + BCP 点阵 + 尺寸标注）
 
-当前版本：**[v4.0.1](https://github.com/liuyiwei54-svg/LWR-LER/releases/tag/v4.0.1)**。版本变化及计量方法说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本：**[v5.0.0](https://github.com/liuyiwei54-svg/LWR-LER/releases/tag/v5.0.0)**。版本变化及计量方法说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## macOS 安装包
 
-发布版软件名为 **SEM measure**。Apple Silicon Mac（M1、M2、M3、M4）用户可从 GitHub Releases 下载 `SEM measure-macos-arm64.dmg`，双击打开后将 `SEM measure.app` 拖入“应用程序”文件夹。
+发布版软件名为 **SEM measure**。Apple Silicon Mac（M1、M2、M3、M4）用户可从 GitHub Releases 下载 v5.0.0 的 `SEM.measure-macos-arm64.zip`，解压后将 `SEM measure.app` 拖入“应用程序”文件夹。旧版本的 DMG 安装包保留在对应 Release 中。
 
 发布安装包不需要 Python。源码维护者可从项目根目录运行 `./build_macos_app.sh` 重新构建 macOS 应用；构建输出保存在 `release/`，不应提交到 Git。
 
-本版本仅提供 macOS Apple Silicon（arm64）安装包，采用本地 ad-hoc 签名，未进行 Developer ID 签名或 Apple 公证，下载后仍可能出现 Gatekeeper 提示。维护者可运行 `"release/SEM measure.app/Contents/MacOS/SEM measure" --self-test` 验证安装包的测量功能；该命令不会打开窗口或占用主程序的单实例锁。
+维护者可用环境变量 `SEM_MEASURE_SOURCE_DIRECTORY` 指定已经核对过的发布源码目录；不指定时使用脚本所在目录。此目录应包含应用源码、assets 和 vendor，避免把其他本地资源改动混入发布包。
+
+本版本仅提供 macOS Apple Silicon（arm64）ZIP 安装包，采用本地 ad-hoc 签名，未进行 Developer ID 签名或 Apple 公证，下载后仍可能出现 Gatekeeper 提示。维护者可运行 `"release/SEM measure.app/Contents/MacOS/SEM measure" --self-test` 验证安装包的测量功能；该命令不会打开窗口或占用主程序的单实例锁。
 
 运行：
 

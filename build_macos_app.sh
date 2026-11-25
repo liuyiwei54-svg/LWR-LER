@@ -3,6 +3,7 @@
 set -euo pipefail
 
 APP_DIRECTORY="$(cd -- "$(dirname -- "$0")" && pwd)"
+SOURCE_DIRECTORY="${SEM_MEASURE_SOURCE_DIRECTORY:-$APP_DIRECTORY}"
 if [[ "$(basename -- "$APP_DIRECTORY")" == "lwr:ler" ]]; then
   PROJECT_DIRECTORY="$(cd -- "$APP_DIRECTORY/.." && pwd)"
 else
@@ -20,9 +21,9 @@ if [[ ! -x "$RUNTIME" ]]; then
 fi
 
 mkdir -p "$BUILD_DIRECTORY"
-ln -sfn "$APP_DIRECTORY" "$SOURCE_LINK"
+ln -sfn "$SOURCE_DIRECTORY" "$SOURCE_LINK"
 
-"$RUNTIME" - "$APP_DIRECTORY/vendor" "$VENDOR_STAGE" <<'PY'
+"$RUNTIME" - "$SOURCE_DIRECTORY/vendor" "$VENDOR_STAGE" <<'PY'
 from pathlib import Path
 import shutil
 import sys
