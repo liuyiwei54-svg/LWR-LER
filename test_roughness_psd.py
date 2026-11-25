@@ -67,6 +67,8 @@ class PsdHandoffTests(unittest.TestCase):
         host.original_image = np.zeros((12, 12), dtype=np.uint8)
         host.analysis_origin = host.roi_canvas = host.result = host.image_path = None
         host.era_line_samples = []
+        host.image_export_roi_bounds.return_value = None
+        host.crop_exported_image.side_effect = lambda image: image
         with TemporaryDirectory() as folder:
             path = Path(folder) / "fit.png"
             host.open_roughness_psd.side_effect = lambda target: self.assertTrue(target.is_file())

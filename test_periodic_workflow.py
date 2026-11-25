@@ -24,6 +24,7 @@ def periodic_image(noise=0.0):
 
 def periodic_state(image=None):
     state = headless_app(periodic_image() if image is None else image)
+    state.edge_detector_var.set(app.EDGE_DETECTOR_HALF)
     state.auto_line_mode_var.set(app.AUTO_MODE_PERIODIC)
     state.preview_periodic_lines()
     state.periodic_reference_kind_var.set("槽")
@@ -414,7 +415,7 @@ class PeriodicWorkflowTests(unittest.TestCase):
     def test_relabeling_new_preview_cannot_reuse_old_region_samples(self):
         state = periodic_state()
         state.recognize_era_lines(measure=True)
-        state.auto_line_use_roi_var.set(True)
+        state.roi_canvas = (40, 0, state.processed_image.shape[1], state.processed_image.shape[0])
         state.selected_roi = lambda: (state.processed_image[:, 40:], 40, 0)
         state.preview_periodic_lines()
         state.periodic_reference_kind_var.set("槽")
@@ -499,7 +500,7 @@ class PeriodicWorkflowTests(unittest.TestCase):
         index = next(i for i, row in enumerate(rows) if row[:2] == ["era_line_index", "selection_source"])
         for row in rows[index + 1:index + 4]:
             self.assertEqual(row[6:8], ["bright_band", "trench"])
-            self.assertEqual(row[-2:], ["right", "left"])
+            self.assertEqual(row[15:17], ["right", "left"])
 
     def test_bad_roi_or_definition_is_not_silently_measured(self):
         image = periodic_image()

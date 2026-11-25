@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageColor, ImageDraw
 
 import ler_lwr_app as app
 
@@ -36,7 +36,7 @@ def stripe_image():
 
 def headless_app(image):
     state = SimpleNamespace(
-        processed_image=image, raw_image=image, image_path=None,
+        processed_image=image, raw_image=image, original_image=image, image_path=None,
         era_line_samples=[], era_aggregate_result=None, era_lcdu_cd_samples_nm=[],
         lcdu_cd_samples_nm=[], era_active_sample_index=None, era_pending_roi_target=None,
         pixel_size_var=Value("0.2"), era_polarity_var=Value(app.ERA_POLARITY_AUTO),
@@ -53,7 +53,7 @@ def headless_app(image):
         canvas=Mock(), result=None, analysis_origin=None, bcp_result=None,
         annotations=[], show_era_rois=True, ler_lwr_roi_mode=False,
         bcp_metrics_finalized=False, rotation_degrees=0, fit_left_color="#00e5ff",
-        fit_right_color="#ffb000", roi_canvas=None,
+        fit_right_color="#ffb000", roi_canvas=None, export_roi_bounds_px=None,
     )
     for name in (
         "refresh_era_sample_list", "update_lcdu_summary_text", "clear_auto_line_candidates",
@@ -65,11 +65,19 @@ def headless_app(image):
     state.outlier_threshold_px = lambda: 12.0
     state.measurement_pixel_size = lambda: float(state.pixel_size_var.get())
     state.fit_line_width = lambda: 2
+    state.gaussian_kernel_size = lambda: 3
+    state.gaussian_sigma_scale = lambda: 1.0
     for name in (
         "invalidate_era_results", "run_era_analysis", "recognize_era_lines",
         "active_lcdu_samples", "lcdu_sigma_nm", "update_era_result_text", "export_csv",
-        "draw_exported_era_edges",
+        "draw_exported_era_edges", "export_annotated_image",
+        "image_export_roi_bounds", "crop_exported_image", "hide_roi_after_successful_analysis", "clear_roi",
+        "apply_exported_bcp_grain_overlay", "apply_exported_bcp_centroid_layout_overlay",
+        "apply_exported_edge_detection_overlay", "draw_exported_annotations", "draw_exported_bcp",
         "automatic_line_region", "periodic_line_settings", "clear_periodic_preview",
+        "confirm_line_pitch_adjacency", "line_position_changed", "invalidate_line_parameters",
+        "edge_detector_parameters", "edge_kernel_size",
+        "clear_era_line_samples",
         "periodic_options_changed", "preview_periodic_lines", "draw_periodic_preview",
         "periodic_scope_changed", "periodic_reference_index", "periodic_interval_label",
         "periodic_interval_kind_label", "periodic_interval_at_canvas", "periodic_hover_motion",
@@ -127,7 +135,7 @@ class AutomaticEraWorkflowTests(unittest.TestCase):
             self.assertEqual(warning.call_count, 2)
 
     def test_roi_offsets_are_global_and_explicit(self):
-        self.state.auto_line_use_roi_var.set(True)
+        self.state.roi_canvas = (10, 15, 205, 165)
         region = self.image[15:165, 10:205]
         self.state.selected_roi = lambda: (region, 10, 15)
         self.state.recognize_era_lines(measure=True)
@@ -182,18 +190,21 @@ class AutomaticEraWorkflowTests(unittest.TestCase):
         state.gaussian_sigma_scale_var = Value(1.0)
         state.blur_method_var = Value(app.BLUR_METHOD_GAUSSIAN)
         state.rotation_var = Value("0.00")
+        state.export_roi_bounds_px = (20, 30, 160, 140)
         snapshot = app.LERLWRApp.snapshot_editor_state(state)
         state.undo_history = [snapshot]
         state.era_line_samples.clear()
         state.era_aggregate_result = None
         state.era_lcdu_cd_samples_nm.clear()
         state.rotation_degrees = 9.0
+        state.export_roi_bounds_px = None
         for name in ("update_gaussian_kernel_preview", "rebuild_working_images", "clear_fft_analysis", "update_result_text"):
             setattr(state, name, Mock())
         app.LERLWRApp.undo_last_action(state)
         self.assertEqual(len(state.era_line_samples), 3)
         self.assertEqual(len(state.era_lcdu_cd_samples_nm), 3)
         self.assertEqual(state.rotation_degrees, 0.0)
+        self.assertEqual(state.export_roi_bounds_px, (20, 30, 160, 140))
         self.assertAlmostEqual(state.era_aggregate_result.mean_width_nm, original_cd)
         self.assertIsNotNone(state.result)
 
@@ -221,6 +232,31 @@ class AutomaticEraWorkflowTests(unittest.TestCase):
         for call in mapping.call_args_list:
             self.assertEqual(call.args[1:], (-3.0, 220, 180))
         self.assertIsNotNone(output.getbbox())
+
+    def test_annotated_export_keeps_era_traces_without_roi_frames(self):
+        """Annotated export draws fitted edges but no left/right ERA selection rectangles."""
+        state = self.state
+        state.original_image = self.image
+        state.normalize_var = Value(False)
+        state.gaussian_denoise_var = Value(False)
+        state.blur_method_var = Value(app.BLUR_METHOD_GAUSSIAN)
+        state.detected_edge_mask = None
+        state.recognize_era_lines(measure=True)
+        height, width = self.image.shape
+        colors = (ImageColor.getrgb(app.DEFAULT_FIT_LEFT_COLOR), ImageColor.getrgb(app.DEFAULT_FIT_RIGHT_COLOR))
+        for rotation in (0.0, 3.0):
+            state.rotation_degrees = rotation
+            with TemporaryDirectory() as folder:
+                target = Path(folder) / "annotated.png"
+                with patch.object(app.filedialog, "asksaveasfilename", return_value=str(target)):
+                    state.export_annotated_image()
+                self.assertTrue(target.exists())
+                exported = np.asarray(Image.open(target).convert("RGB")).astype(int)
+            expected = Image.fromarray(self.image).convert("RGB")
+            state.draw_exported_era_edges(ImageDraw.Draw(expected), width, height)
+            np.testing.assert_array_equal(exported, np.asarray(expected))
+            for color in colors:
+                self.assertTrue(np.all(exported == color, axis=2).any())
 
 
 if __name__ == "__main__":
