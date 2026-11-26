@@ -13,9 +13,11 @@ import re
 import sys
 import tempfile
 import time
+from datetime import datetime
+from types import SimpleNamespace
 import tkinter as tk
 import tkinter.font as tkfont
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tkinter import colorchooser, filedialog, messagebox, scrolledtext, ttk
 
@@ -23,8 +25,31 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 from auto_line_detection import detect_line_candidates
+from line_diagnostics import (
+    DEFAULT_SOURCE_LABEL,
+    SourceSnapshot,
+    build_line_diagnostics_ui,
+    diagnostic_csv_rows,
+    live_still_same,
+    row_focus_region,
+)
+from line_localization import (
+    LocalizationStats,
+    PairLocalizationStats,
+    fit_additive_background,
+    localization_stats,
+    localize_bright_band_edge,
+    localize_transition_edge,
+    missing_row_indices,
+    pair_localization_stats,
+    transition_row_position,
+    valid_row_threshold,
+)
 from periodic_line_detection import BrightBandCandidate, bright_band_position, bright_band_search_bounds, detect_bright_bands, select_periodic_pairs
-from roughness_psd import RepeatScanSpectrum, RoughnessSpectrum, repeat_scan_spectrum, roughness_spectrum
+from roughness_psd import (
+    RepeatScanSpectrum, RoughnessSpectrum, fit_psd_model, repeat_scan_model_comparison,
+    repeat_scan_spectrum, roughness_spectrum,
+)
 
 VENDOR_DIRECTORY = Path(__file__).with_name("vendor")
 if VENDOR_DIRECTORY.exists():
@@ -41,7 +66,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-APP_VERSION = "5.0.0"
+APP_VERSION = "6.0.0"
 
 MAX_VIEW_WIDTH = 980
 MAX_VIEW_HEIGHT = 620
@@ -73,28 +98,50 @@ LOCK_PATH = Path(tempfile.gettempdir()) / "sem_ler_lwr_app.lock"
 INFO_BAR_SEARCH_START = 0.72
 INFO_BAR_MIN_HEIGHT_PX = 24
 GAUSSIAN_KERNEL_SIZES = (3, 4, 5, 7, 9, 11)
-FIRST_ORDER_KERNEL_SIZES = (3, 5, 7, 9, 11)
 GAUSSIAN_SIGMA_SCALE_MIN = 0.4
 GAUSSIAN_SIGMA_SCALE_MAX = 2.5
 BLUR_METHOD_GAUSSIAN = "高斯模糊（默认）"
 BLUR_METHOD_MEAN = "均值模糊"
-EDGE_DETECTOR_SCHARR = "Scharr"
-EDGE_DETECTOR_CANNY = "Canny（Sobel）"
-EDGE_DETECTOR_LAPLACIAN = "拉普拉斯"
+# 背景校正：默认关闭，一阶平面默认，可选二阶曲面；拟合区域本版固定全工作图。
+BACKGROUND_DEGREE_LABELS = {1: "一阶（平面）", 2: "二阶（曲面）"}
+BACKGROUND_DEGREE_OPTIONS = (1, 2)
+BACKGROUND_DEFAULT_DEGREE = 1
+# 统一灰度剖面定位：实体亮/暗线走 ERA 差分质心多项式半高，周期槽/平台走亮带两独立局部基线半高。
+# EDGE_DETECTOR_ERA 保留为旧容器字段兼容默认值；实际算法统一记为 LINE_LOCALIZATION_UNIFIED。
 EDGE_DETECTOR_ERA = "ERA 多项式拟合"
-EDGE_DETECTOR_HALF = "半高插值（亮带）"
+LINE_LOCALIZATION_UNIFIED = "统一灰度剖面定位"
 ERA_POLARITY_AUTO = "自动"
 ERA_POLARITY_RISING = "上升沿（暗→亮）"
 ERA_POLARITY_FALLING = "下降沿（亮→暗）"
 ERA_POLARITIES = (ERA_POLARITY_AUTO, ERA_POLARITY_RISING, ERA_POLARITY_FALLING)
 ERA_DEFAULT_POLYNOMIAL_DEGREE = 3
 ERA_DIFFERENCE_POWER = 4
+# Default polynomial degree for the unified localization core (bright-band flanks
+# and transition fits).  Matches ``line_localization.DEFAULT_BRIGHT_BAND_DEGREE``.
+DEFAULT_LOCALIZATION_DEGREE = 3
 AUTO_LINE_BRIGHT = "亮线（暗背景）"
 AUTO_LINE_DARK = "暗线（亮背景）"
 AUTO_MODE_PERIODIC = "周期亮边（槽 / 平台）"
 AUTO_MODE_SOLID = "实体亮线 / 暗线（原模式）"
 PERIODIC_KIND_LABELS = {"槽": "trench", "平台": "platform"}
 PERIODIC_POSITION_LABELS = {"亮带中心": "center", "亮带左侧": "left", "亮带右侧": "right"}
+
+
+class LocalizationFailure(ValueError):
+    """A single-edge localization that ran but could not reach the valid-row gate.
+
+    Carries the full ``line_localization.EdgeLocalization`` record so callers
+    (``run_era_analysis``) can keep the per-row primary/recovered/missing picture
+    even when the whole side is excluded from pooled statistics.  A plain
+    ``ValueError`` without a diagnostic record still signals an *early* input error
+    (bad ROI, unsupported method/degree) that never produced a per-row pass.
+    """
+
+    def __init__(self, message: str, diagnostics: object | None = None) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 # Interval number labels use fixed screen-pixel rows so dense previews stay legible.
 PERIODIC_LABEL_FONT_PX = -12
 PERIODIC_LABEL_ROW_GAP_PX = 22
@@ -110,8 +157,6 @@ PERIODIC_LABEL_COLOR = "#ffe066"
 # Owner tags: sample labels/plates follow the sample-ROI switch, interval numbers the preview switch.
 ERA_LABEL_TAGS = ("era_roi", "era_roi_label")
 ERA_LABEL_BACKGROUND_TAGS = ("era_roi", "era_roi_label_background")
-VERTICAL_EDGE_SUPPORT_WINDOW_PX = 41
-VERTICAL_EDGE_SUPPORT_MIN_POINTS = 24
 CD_RAY_STEP_PX = 0.25
 PITCH_DIRECTION_LABELS = ("水平（0°）", "+60°", "−60°")
 PITCH_DIRECTION_ANGLES = (0.0, 60.0, 120.0)
@@ -225,24 +270,399 @@ class AnalysisResult:
 
 
 def line_localization_signature(result: AnalysisResult) -> tuple:
-    """Comparable method identity for repeated scans, without unused NaN fields."""
-    method = result.localization_method or result.edge_detector
-    if method in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF):
-        return (method,)
-    return (method, result.edge_kernel_size, result.edge_diagonal_weight, result.edge_axial_weight,
-            (result.canny_high_threshold, result.canny_threshold_ratio) if method == EDGE_DETECTOR_CANNY else None,
-            result.localization_threshold_fraction if method == EDGE_DETECTOR_SCHARR else None,
-            result.localization_continuity_filter)
+    """Comparable method identity for repeated scans, without unused NaN fields.
+
+    统一灰度剖面定位后只有一种算法身份：实际方法（统一）或旧容器默认（ERA）。
+    """
+    return (result.localization_method or result.edge_detector,)
 
 
 @dataclass(frozen=True)
 class RepeatScanMeasurement:
+    """一次重复扫描测量的不可变快照。
+
+    除既有的 source/image/settings/row_origin/lines/line_methods 外，还连同
+    打开 PSD 窗口时的实际处理元数据一起固化，供双图页对 A/B 做标定/处理/定位
+    签名匹配，避免从 live 主窗口状态误取另一张图或另一种平滑的元数据。
+    新增字段都在末尾并带默认值，向后兼容旧构造（如隔离/历史测试）。
+    """
+
     source: Path
     image: np.ndarray
     settings: tuple
     row_origin: int
     lines: dict[str, AnalysisResult]
     line_methods: dict[str, tuple]
+    preprocessing_signature: str = ""
+    noise_context: str = "unknown"
+    calibration_nm: float = float("nan")
+
+
+@dataclass(frozen=True)
+class PsdWindowContext:
+    """`open_roughness_psd` 打开时刻捕获的不可变源/处理/标定上下文。
+
+    科学来源要求 PSD 窗口一旦打开即固化为「A 图」快照：source、拟合图路径、
+    处理签名、真实平滑 noise_context、像素标定与定位参数都不能随主窗口后续
+    载入 B 图或改动平滑而漂移。model/repeat/CSV/文件名/summary 只读此快照，
+    不得回到 live `self` 主窗口状态取值。
+    """
+
+    source_path: str
+    fitted_image_path: str
+    preprocessing_signature: str
+    noise_context: str
+    pixel_size_nm: float
+    localization_signature: tuple
+    line_localization_rows: tuple = ()
+
+
+def psd_noise_context_from(gaussian_denoise: bool, blur_method: str) -> str:
+    """纯函数：由实际平滑状态推导 PSD 模型噪声上下文（绝不硬设 white）。
+
+    从 `LERLWRApp.psd_noise_context` 抽出的可测版本：均值/高斯平滑都压高频
+    密度记为 smoothed，未启用平滑记为 unknown；白噪声只能由模型证据给出。
+    """
+    if gaussian_denoise:
+        return "smoothed"
+    return "unknown"
+
+
+@dataclass(frozen=True)
+class ProfileReviewContext:
+    """`open_profile_review_window` 打开时刻捕获的不可变对照上下文。
+
+    用于灰度/灰度差对照窗口。主窗口随后载入 B 图、改背景开关/阶数/极性/标定/异常
+    门槛都不会改写已打开窗口的数据、标签、边位置或来源：窗口只读此冻结点快照，
+    绝不回到 live ``self`` 取任何控件值或共享的可变列表。
+    """
+
+    source_label: str = ""
+    image: np.ndarray | None = None
+    samples: tuple = ()
+    pixel_size_nm: float | None = None
+    polarity: str = ERA_POLARITY_AUTO
+    polynomial_degree: int = ERA_DEFAULT_POLYNOMIAL_DEGREE
+    max_jump_px: float = 12.0
+    background_enabled: bool = False
+    background_degree: int = BACKGROUND_DEFAULT_DEGREE
+    # 开窗时刻的主窗口处理参数（与 ``preprocess_image`` 默认值一致）；两路图只读这些值。
+    normalize_enabled: bool = True
+    denoise_enabled: bool = True
+    kernel_size: int = 3
+    sigma_scale: float = 1.0
+    blur_method: str = BLUR_METHOD_GAUSSIAN
+
+
+@dataclass(frozen=True)
+class ProfileReviewSample:
+    """One sample's frozen geometry + identity for the review window (order-preserving).
+
+    Rules are captured value-copies at open time, so later lookups never touch the
+    live ``host.era_line_samples`` list or any shared list of images.
+    """
+
+    index: int
+    sample_id: int
+    edge_profile_kind: str
+    selection_source: str
+    left_roi_bounds_px: tuple[int, int, int, int] | None
+    right_roi_bounds_px: tuple[int, int, int, int] | None
+    left_reference_band_px: tuple[float, float] | None
+    right_reference_band_px: tuple[float, float] | None
+    left_position_definition: str
+    right_position_definition: str
+    line_polarity: str | None
+
+
+def profile_review_sample_snapshots(samples) -> tuple[ProfileReviewSample, ...]:
+    """Copy sample geometry/identity into an order-preserving frozen tuple."""
+    snapshots = []
+    for index, sample in enumerate(samples, start=1):
+        snapshots.append(ProfileReviewSample(
+            index=index,
+            sample_id=getattr(sample, "sample_id", index),
+            edge_profile_kind=getattr(sample, "edge_profile_kind", "transition"),
+            selection_source=getattr(sample, "selection_source", "manual"),
+            left_roi_bounds_px=getattr(sample, "left_roi_bounds_px", None),
+            right_roi_bounds_px=getattr(sample, "right_roi_bounds_px", None),
+            left_reference_band_px=getattr(sample, "left_reference_band_px", None),
+            right_reference_band_px=getattr(sample, "right_reference_band_px", None),
+            left_position_definition=getattr(sample, "left_position_definition", "center"),
+            right_position_definition=getattr(sample, "right_position_definition", "center"),
+            line_polarity=getattr(sample, "line_polarity", None),
+        ))
+    return tuple(snapshots)
+
+
+def profile_review_sample_row_span(snapshot: ProfileReviewSample, side: str) -> tuple[int, int] | None:
+    """The global row span that a sample's side ROI covers, or None if absent."""
+    bounds = getattr(snapshot, f"{side}_roi_bounds_px")
+    if bounds is None:
+        return None
+    _left, top, _right, bottom = bounds
+    return top, bottom
+
+
+def profile_review_marker_for_row(
+    row: int,
+    image: np.ndarray,
+    samples: list,
+    pixel_size: float | None,
+    *,
+    polarity: str = ERA_POLARITY_AUTO,
+    polynomial_degree: int = ERA_DEFAULT_POLYNOMIAL_DEGREE,
+    max_jump_px: float = 12.0,
+    selected_sample: int | None = None,
+    selected_side: str | None = None,
+) -> tuple[float | None, str]:
+    """Pure read-only edge localization for one scanline (both sides, real plot lines).
+
+    灰度对照窗口只读定位：按样本 index/side 遍历，仅当该行落在某个样本某侧的
+    ROI 全局行范围内时对该侧调用真实 ``analyze_sample_edge``；无样本时视为全图
+    ``row``（由调用方把 row 视为全图合法行）。返回 (工作图全局 x, 原因说明)，
+    失败/该行无有效定位时返回 None 并说明原因，绝不画虚假定位点。
+
+    ``selected_sample`` is the 0-based positional index into the ordered ``samples``
+    sequence and ``selected_side`` is "left"/"right".  When both are provided, only
+    that sample/side is localized (the chosen target), instead of the first sample
+    whose ROI happens to cover ``row`` — two stacked samples sharing a top row must
+    not collapse to the first.  When omitted, the historical first-match behaviour
+    is preserved for callers that do not select a target.
+
+    ``polynomial_degree``/``polarity``/``max_jump_px`` 是定位参数（快照冻结值），
+    ``pixel_size`` 可为 None（未标定）：此时不调用需要 nm 标定的 ``analyze_sample_edge``，
+    仅在无样本场景返回 None 并说明“未设置像素尺寸”，保留灰度的展示能力。
+    """
+    if image is None:
+        return None, "无图像"
+    if pixel_size is None:
+        # 未标定时不做 nm 语义定位，但允许只看灰度；明确告知原因，不伪造点。
+        return None, "未设置像素尺寸（仅可查看灰度）"
+    height = image.shape[0]
+    if not (0 <= row < height):
+        return None, f"扫描行 {row} 超出图像范围 0..{height - 1}"
+
+    def _localize_for(sample, side) -> tuple[float | None, str]:
+        index = getattr(sample, "sample_id", None)
+        bounds = getattr(sample, f"{side}_roi_bounds_px")
+        if bounds is None:
+            label = f"样本 {index} {'左' if side == 'left' else '右'}边" if index is not None else f"样本 {'左' if side == 'left' else '右'}边"
+            return None, f"{label}：该侧无 ROI"
+        left, top, right, bottom = bounds
+        side_label = "左" if side == "left" else "右"
+        try:
+            if getattr(sample, "edge_profile_kind", "transition") == "bright_band":
+                reference = getattr(sample, f"{side}_reference_band_px")
+                if reference is None:
+                    reference = reference_bright_band(image, bounds)
+                edge = analyze_sample_edge(
+                    image, bounds, pixel_size, LINE_LOCALIZATION_UNIFIED,
+                    bright_band=True, definition=getattr(sample, f"{side}_position_definition", "center"),
+                    max_jump=max_jump_px, reference_band=reference, degree=polynomial_degree,
+                )
+            else:
+                edge_polarity = polarity
+                line_polarity = getattr(sample, "line_polarity", None)
+                if line_polarity is not None:
+                    rising = (line_polarity == "bright") == (side == "left")
+                    edge_polarity = ERA_POLARITY_RISING if rising else ERA_POLARITY_FALLING
+                row_mask = (
+                    automatic_era_row_mask(image, bounds, edge_polarity)
+                    if getattr(sample, "selection_source", "manual") != "manual"
+                    else None
+                )
+                edge = analyze_sample_edge(
+                    image, bounds, pixel_size, LINE_LOCALIZATION_UNIFIED,
+                    degree=polynomial_degree, polarity=edge_polarity,
+                    max_jump=max_jump_px, row_mask=row_mask,
+                )
+            rows = np.asarray(edge.rows_px, dtype=float)
+            positions = np.asarray(edge.edge_px, dtype=float)
+            hit = np.where(rows == row)[0]
+            label = f"样本 {index} {side_label}边" if index is not None else f"样本 {side_label}边"
+            if len(hit) and np.isfinite(positions[hit[0]]):
+                return float(positions[hit[0]]), label
+            return None, f"{label}：该行无有效定位"
+        except ValueError as exc:
+            label = f"样本 {index} {side_label}边" if index is not None else f"样本 {side_label}边"
+            return None, f"{label}定位异常：{exc}"
+
+    # 目标选定路径：只对那个样本/侧别定位。
+    if selected_sample is not None and selected_side is not None:
+        if not (0 <= selected_sample < len(samples)):
+            return None, f"目标样本位置 {selected_sample} 越界（0..{len(samples) - 1}）"
+        return _localize_for(samples[selected_sample], selected_side)
+
+    # 无目标选定：保留按 index/side 遍历首条命中的历史行为。
+    for sample in samples:
+        for side in ("left", "right"):
+            bounds = getattr(sample, f"{side}_roi_bounds_px")
+            if bounds is None:
+                continue
+            left, top, right, bottom = bounds
+            if not (top <= row < bottom):
+                continue
+            return _localize_for(sample, side)
+    return None, "该行不在任何样本 ROI 内"
+
+
+def psd_preprocessing_signature_from(
+    normalize: bool,
+    gaussian_denoise: bool,
+    blur_method: str,
+    kernel_size: int,
+    sigma_scale: float,
+    background_degree: int | None = None,
+) -> str:
+    """纯函数：构造可扩展处理签名（当前：平滑 + 归一化 + 背景）。
+
+    从 `LERLWRApp.psd_preprocessing_signature` 抽出的可测版本，输入全为标量，
+    便于在 PSD 窗口打开时刻捕获后固化，而不依赖 live 主窗口控件状态。
+    ``background_degree`` 为 1/2 时记录 ``background=plane:degree=N``；None 记录
+    ``background=none``（历史占位语义，保持旧测试的 ``background=none`` 输出）。
+    """
+    parts = []
+    if normalize:
+        parts.append("normalize=on")
+    if gaussian_denoise:
+        method = "mean" if blur_method == BLUR_METHOD_MEAN else "gaussian"
+        parts.append(f"smooth={method}:{kernel_size}x{kernel_size}:sigma={sigma_scale:.2f}")
+    else:
+        parts.append("smooth=off")
+    if background_degree is None:
+        parts.append("background=none")
+    else:
+        parts.append(f"background=plane:degree={background_degree}")
+    return "; ".join(parts)
+
+
+# 模型定义常量：与 roughness_psd.fit_psd_model 的实际实现一致（A 非负、B 正、
+# C 非负；目标函数为拟合频段内线性 PSD 密度的残差平方和，无权重）。这里只做
+# 记录，不参与任何数值计算；用户输入的「拟合 fmin/fmax」是频段选择，不是模型约束。
+PSD_MODEL_CONSTRAINTS = "A>=0; B>0; C>=0"
+PSD_MODEL_OBJECTIVE = "sum_squared_residuals_linear_psd"
+
+
+def psd_export_stem(window_context: "PsdWindowContext") -> str:
+    """纯函数：PSD 导出默认文件名的 stem，优先拟合图路径、否则源图路径。
+
+    路径取自打开时刻固化的 `window_context` 快照（A 图），绝不回 live 主窗口
+    状态取当前图像路径，因此主窗口后续载入 B 图不会改变 PSD 导出默认名。
+    """
+    path = window_context.fitted_image_path or window_context.source_path
+    if path:
+        stem = Path(path).stem
+        if stem:
+            return stem
+    return "sem"
+
+
+def psd_localization_signature_text(window_context: "PsdWindowContext") -> str:
+    """纯函数：把不可变定位签名元组渲染成 CSV 可读字符串。"""
+    return ";".join(str(part) for part in window_context.localization_signature)
+
+
+def psd_line_localization_rows(
+    result: "AnalysisResult | None",
+    era_line_samples: list,
+) -> list:
+    """纯函数：PSD CSV 用的每线定位信息行（打开时刻固化，不回 live 取值）。
+
+    非 ERA（「当前线条」）仅记录统一定位方法；ERA 逐样本记录 profile 类型、
+    极性、左右位置定义、样本 id 与左右边缘的极性/多项式阶数，与主窗口每线
+    定位段一致，供三页 PSD CSV 追溯实际定位参数。仅提取必要字段，不逐行输出
+    轨迹。
+    """
+    if result is None:
+        return []
+    actual_method = result.localization_method or result.edge_detector
+    rows = []
+    if result.edge_detector != EDGE_DETECTOR_ERA:
+        rows.append(("当前线条", actual_method, "", "", "", "", "", "", "", "", ""))
+        return rows
+    for index, sample in enumerate(era_line_samples, start=1):
+        if sample.paired_result is None:
+            continue
+        left = sample.left_edge
+        right = sample.right_edge
+        rows.append(
+            (
+                f"线样本 {index}",
+                actual_method,
+                getattr(sample, "edge_profile_kind", ""),
+                sample.line_polarity or "",
+                sample.left_position_definition,
+                sample.right_position_definition,
+                getattr(sample, "sample_id", 0),
+                getattr(left, "polarity", None) if left is not None else None,
+                getattr(left, "polynomial_degree", None) if left is not None else None,
+                getattr(right, "polarity", None) if right is not None else None,
+                getattr(right, "polynomial_degree", None) if right is not None else None,
+            )
+        )
+    return rows
+
+
+_PSD_LINE_LOCALIZATION_HEADER = (
+    "line",
+    "localization_method",
+    "edge_profile_kind",
+    "line_polarity",
+    "left_position_definition",
+    "right_position_definition",
+    "sample_id",
+    "left_edge_polarity",
+    "left_edge_polynomial_degree",
+    "right_edge_polarity",
+    "right_edge_polynomial_degree",
+)
+
+
+def write_psd_localization_block(writer, window_context: "PsdWindowContext") -> None:
+    """纯辅助：三页 PSD CSV 共用的定位参数块（总体签名 + 每线定位信息）。"""
+    writer.writerow(["localization_signature", psd_localization_signature_text(window_context)])
+    rows = window_context.line_localization_rows
+    if rows:
+        writer.writerow([])
+        writer.writerow(_PSD_LINE_LOCALIZATION_HEADER)
+        writer.writerows(rows)
+
+
+def repeat_scan_alignment_preview_rgb(
+    common_rows: np.ndarray,
+    first_residual_nm: np.ndarray,
+    second_residual_nm: np.ndarray,
+    *,
+    offset: int = 0,
+) -> np.ndarray:
+    """纯函数：双图 A/B 残差随行轨迹的「图像逐行对齐」预览图（Pillow，不依赖
+    matplotlib/SciPy/OpenCV）。
+
+    与并入前的 `build_repeat_scan_psd_tab` 内联 A/B 覆盖一致：在共同行内按
+    不连续处断开，绘制 A、B 两条残差轨迹（nm），以 Image A 行号为横轴，
+    offset 仅进入标题，不参与拟合数据，也不改动 comparison/repeat 任何字段。
+    返回 uint8 RGB ndarray，供 `fft_line_chart_rgb` 输出送入 Tk Label 显示。
+    """
+    rows = np.asarray(common_rows)
+    first = np.asarray(first_residual_nm, dtype=float)
+    second = np.asarray(second_residual_nm, dtype=float)
+    cut_indices = np.flatnonzero(np.diff(rows) != 1) + 1
+    positions = np.insert(rows, cut_indices, rows[cut_indices] - 0.5)
+    first_broken = np.insert(first, cut_indices, np.nan)
+    second_broken = np.insert(second, cut_indices, np.nan)
+    return fft_line_chart_rgb(
+        positions,
+        (
+            (first_broken, "A", "#66d7ea"),
+            (second_broken, "B", "#ffb45e"),
+        ),
+        title=f"A / B（offset {offset:+d} px）",
+        x_label="Image A row (px)",
+        y_label="Residual (nm)",
+        size=(680, 170),
+        full_range=True,
+    )
 
 
 @dataclass
@@ -258,6 +678,47 @@ class SingleEdgeResult:
     polarity: str
     polynomial_degree: int
     normalization_scale: float = float("nan")
+    # Optional per-row localization diagnostics (``line_localization.EdgeLocalization``
+    # or None).  Present only when the caller requested diagnostics; the metrology in
+    # ``rows_px``/``edge_px``/``residual_nm`` is always built from the *valid* rows of
+    # this diagnostic record so the two never disagree.
+    diagnostics: object | None = None
+    # ``extra_metadata`` carries the actual method identity / requested degree for CSV
+    # text labels without disturbing the numeric metrology.  ``polynomial_degree`` is
+    # retained for the transition path only.
+    extra_metadata: dict = field(default_factory=dict)
+
+
+def profile_scanline_intensity(image: np.ndarray, row: int) -> np.ndarray:
+    """Extract one scanline's grayscale profile (float) for display.
+
+    纯数据函数：仅切片取行并转 float，不做任何归一化/平滑，供灰度曲线与
+    灰度差曲线两路共用，参数为工作图全局 row。
+    """
+    if image.ndim != 2:
+        raise ValueError("图像必须是二维灰度数组。")
+    height, width = image.shape
+    if not (0 <= row < height):
+        raise ValueError(f"扫描行 {row} 超出图像范围 0..{height - 1}。")
+    return image[row, :].astype(float)
+
+
+def profile_adjacent_difference(intensity: np.ndarray) -> np.ndarray:
+    """The forward pixel difference ΔI = I[x+1] - I[x], with x at x + 0.5.
+
+    纯数据函数：返回长度为 len(intensity) - 1 的数组；差值 x 轴坐标定义在
+    半像素 x + 0.5，距离原定义不变（工作图全局 px）。
+    """
+    values = np.asarray(intensity, dtype=float)
+    if values.ndim != 1 or len(values) < 2:
+        raise ValueError("灰度差至少需要两个像素。")
+    return np.diff(values)
+
+
+def profile_difference_x_axis(intensity: np.ndarray, origin_x: float = 0.0) -> np.ndarray:
+    """x 轴（半像素 x + 0.5）供灰度差曲线使用，工作图全局 px。"""
+    count = max(0, len(np.asarray(intensity, dtype=float)) - 1)
+    return np.arange(count, dtype=float) + 0.5 + origin_x
 
 
 @dataclass
@@ -285,6 +746,216 @@ class EraLineSample:
     right_reference_band_px: tuple[float, float] | None = None
     sample_id: int = 0
     pitch_next_id: int | None = None
+    # Optional per-side ``line_localization.EdgeLocalization`` records captured when a
+    # whole side failed to reach the valid-row threshold.  Storing them keeps the full
+    # per-row primary/recovered/missing picture queryable even for a failed side that
+    # never contributed to pooled statistics.  Cleared by invalidate_era_results and
+    # restored by undo alongside the matching sample.
+    left_diagnostics: object | None = None
+    right_diagnostics: object | None = None
+
+
+def profile_review_chart_rgb(
+    raw_intensity: np.ndarray,
+    corrected_intensity: np.ndarray,
+    *,
+    title: str = "",
+    size: tuple[int, int] = FFT_COORDINATE_VIEW_SIZE,
+    marker_x: float | None = None,
+    markers: list[tuple[float, str]] | None = None,
+) -> np.ndarray:
+    """灰度叠加对照图（Pillow，纯函数）。
+
+    上半张绘制未背景校正灰度曲线，下半张绘制背景校正灰度曲线（同一扫描行、
+    同一套归一化/平滑配置，唯一差别是背景与否）。``marker_x`` 为单一显示标记
+    （工作图全局 px，后向兼容）；``markers`` 为逐曲线标记列表 ``[(x, 颜色), ...]``，
+    分别标出未校正与校正两路的真实定位位置。两者都只做显示标记，不进任何统计。
+    返回 uint8 RGB ndarray。
+    """
+    view_width, view_height = size
+    canvas = Image.new("RGB", size, "#181818")
+    draw = ImageDraw.Draw(canvas)
+    foreground = "#d9d9d9"
+    grid = "#4a4a4a"
+    split_y = view_height // 2
+
+    raw = np.asarray(raw_intensity, dtype=float)
+    corrected = np.asarray(corrected_intensity, dtype=float)
+    raw_diff = profile_adjacent_difference(raw) if len(raw) >= 2 else np.array([], dtype=float)
+    corrected_diff = profile_adjacent_difference(corrected) if len(corrected) >= 2 else np.array([], dtype=float)
+
+    def render_pane(top: int, bottom: int, y_values, color, label, x_axis_values, y_label):
+        draw.rectangle((0, top, view_width, bottom), fill="#181818")
+        left, right = 46, view_width - 12
+        inner_top, inner_bottom = top + 20, bottom - 30
+        finite = y_values[np.isfinite(y_values)]
+        if len(finite):
+            low, high = np.percentile(finite, (1, 99))
+        else:
+            low, high = 0.0, 1.0
+        if high <= low:
+            high = low + 1.0
+        x_low, x_high = float(x_axis_values[0]), float(x_axis_values[-1])
+        if math.isclose(x_low, x_high):
+            x_high = x_low + 1.0
+        for fraction in (0.0, 0.5, 1.0):
+            gx = round(left + (right - left) * fraction)
+            gy = round(inner_top + (inner_bottom - inner_top) * fraction)
+            draw.line((gx, inner_top, gx, inner_bottom), fill=grid)
+            draw.line((left, gy, right, gy), fill=grid)
+        draw.rectangle((left, inner_top, right, inner_bottom), outline=foreground)
+        if marker_x is not None and x_low <= marker_x <= x_high:
+            m = round(left + (right - left) * (marker_x - x_low) / (x_high - x_low))
+            draw.line((m, inner_top, m, inner_bottom), fill="#ffb45e", width=2)
+        points = []
+        for idx, value in enumerate(y_values):
+            if not np.isfinite(value):
+                if len(points) >= 2:
+                    draw.line(points, fill=color, width=2)
+                points = []
+                continue
+            px = left + (float(x_axis_values[idx]) - x_low) * (right - left) / (x_high - x_low)
+            py = inner_bottom - (float(value) - low) * (inner_bottom - inner_top) / (high - low)
+            points.append((round(px), round(np.clip(py, inner_top, inner_bottom))))
+        if len(points) >= 2:
+            draw.line(points, fill=color, width=2)
+        draw.text((left + 5, top + 2), label, fill=color)
+        draw.text((4, inner_top - 1), y_label, fill=foreground)
+        draw.text((left, inner_bottom + 2), f"{low:.2g}", fill="#aaaaaa")
+        draw.text((left + 3, inner_top + 2), f"{high:.2g}", fill="#aaaaaa")
+        draw.text((left, inner_bottom + 14), f"{x_low:.2g}", fill="#aaaaaa")
+        draw.text((right - 30, inner_bottom + 14), f"{x_high:.2g}", fill="#aaaaaa")
+
+    # 逐曲线标记（未校正→上半蓝、校正→下半黄），与 marker_x 单一标记不冲突。
+    if markers:
+        for series_index, (series_marker_x, series_color) in enumerate(markers):
+            if series_marker_x is None:
+                continue
+            top = 0 if series_index == 0 else split_y
+            bottom = split_y if series_index == 0 else view_height
+            series_values = np.asarray(raw_intensity if series_index == 0 else corrected_intensity, dtype=float)
+            if not len(series_values):
+                continue
+            x_low2 = 0.0
+            x_high2 = float(len(series_values) - 1)
+            if x_high2 <= x_low2:
+                x_high2 = x_low2 + 1.0
+            if x_low2 <= series_marker_x <= x_high2:
+                left2, right2 = 46, view_width - 12
+                inner_top2 = top + 20
+                inner_bottom2 = bottom - 30
+                m = round(left2 + (right2 - left2) * (series_marker_x - x_low2) / (x_high2 - x_low2))
+                draw.line((m, inner_top2, m, inner_bottom2), fill=series_color, width=2)
+
+    if len(raw):
+        render_pane(0, split_y, raw, "#7fd4ff", "未校正灰度", np.arange(len(raw), dtype=float), "I")
+        render_pane(split_y, view_height, corrected, "#ffd27f", "背景校正后灰度", np.arange(len(corrected), dtype=float), "I")
+    if title:
+        draw.text((4, 2), title, fill=foreground)
+
+    # 灰度差曲线（ΔI）绘制为叠加在各自灰度图下方的第二张图，由调用方分别请求——
+    # 这里额外导出便捷函数，保持本函数输出单一灰度对照图。
+    return np.asarray(canvas, dtype=np.uint8)
+
+
+def profile_difference_chart_rgb(
+    raw_intensity: np.ndarray,
+    corrected_intensity: np.ndarray,
+    *,
+    title: str = "",
+    size: tuple[int, int] = FFT_COORDINATE_VIEW_SIZE,
+    marker_x: float | None = None,
+    markers: list[tuple[float, str]] | None = None,
+) -> np.ndarray:
+    """绘制两路邻像素差 ΔI = I[x+1] - I[x]（x 轴 x + 0.5），纯函数。
+
+    ``markers`` 为逐曲线标记列表 ``[(x, 颜色), ...]``（第 0 项未校正、第 1 项校正），
+    分别标出两路真实定位；``marker_x`` 为后向兼容的单一标记。
+    """
+    raw = np.asarray(raw_intensity, dtype=float)
+    corrected = np.asarray(corrected_intensity, dtype=float)
+    raw_diff = profile_adjacent_difference(raw) if len(raw) >= 2 else np.array([], dtype=float)
+    corrected_diff = profile_adjacent_difference(corrected) if len(corrected) >= 2 else np.array([], dtype=float)
+    raw_x = profile_difference_x_axis(raw)
+    corrected_x = profile_difference_x_axis(corrected)
+    x_values = raw_x if len(raw_x) >= len(corrected_x) else corrected_x
+    aligned = np.arange(len(x_values), dtype=float)
+    raw_aligned = np.full(len(aligned), np.nan)
+    corrected_aligned = np.full(len(aligned), np.nan)
+    raw_aligned[: len(raw_diff)] = raw_diff
+    corrected_aligned[: len(corrected_diff)] = corrected_diff
+    return _two_series_difference_chart_rgb(
+        aligned + 0.5, raw_aligned, corrected_aligned,
+        raw_label="未校正 ΔI", corrected_label="背景校正后 ΔI",
+        title=title, size=size, marker_x=marker_x, markers=markers,
+    )
+
+
+def _two_series_difference_chart_rgb(
+    x_values: np.ndarray,
+    raw_values: np.ndarray,
+    corrected_values: np.ndarray,
+    *,
+    raw_label: str,
+    corrected_label: str,
+    title: str,
+    size: tuple[int, int],
+    marker_x: float | None,
+    markers: list[tuple[float, str]] | None = None,
+) -> np.ndarray:
+    view_width, view_height = size
+    canvas = Image.new("RGB", size, "#181818")
+    draw = ImageDraw.Draw(canvas)
+    foreground = "#d9d9d9"
+    grid = "#4a4a4a"
+    left, right = 46, view_width - 12
+    top, bottom = 22, view_height - 34
+    all_values = np.concatenate([raw_values[np.isfinite(raw_values)], corrected_values[np.isfinite(corrected_values)]]) if len(x_values) else np.array([0.0])
+    low, high = np.percentile(all_values, (1, 99)) if len(all_values) else (0.0, 1.0)
+    if high <= low:
+        high = low + 1.0
+    x_low, x_high = float(x_values[0]), float(x_values[-1])
+    if math.isclose(x_low, x_high):
+        x_high = x_low + 1.0
+    for fraction in (0.0, 0.5, 1.0):
+        gx = round(left + (right - left) * fraction)
+        gy = round(top + (bottom - top) * fraction)
+        draw.line((gx, top, gx, bottom), fill=grid)
+        draw.line((left, gy, right, gy), fill=grid)
+    draw.rectangle((left, top, right, bottom), outline=foreground)
+    if marker_x is not None and x_low <= marker_x <= x_high:
+        m = round(left + (right - left) * (marker_x - x_low) / (x_high - x_low))
+        draw.line((m, top, m, bottom), fill="#ffb45e", width=2)
+    # 逐曲线标记（第 0 项未校正、第 1 项校正），与 marker_x 单一标记并存。
+    if markers:
+        for series_index, (series_marker_x, series_color) in enumerate(markers):
+            if series_marker_x is None:
+                continue
+            if x_low <= series_marker_x <= x_high:
+                m = round(left + (right - left) * (series_marker_x - x_low) / (x_high - x_low))
+                draw.line((m, top, m, bottom), fill=series_color, width=2)
+    for series_index, (values, label, color) in enumerate(((raw_values, raw_label, "#7fd4ff"), (corrected_values, corrected_label, "#ffd27f"))):
+        points = []
+        for idx, value in enumerate(values):
+            if not np.isfinite(value):
+                if len(points) >= 2:
+                    draw.line(points, fill=color, width=2)
+                points = []
+                continue
+            px = left + (float(x_values[idx]) - x_low) * (right - left) / (x_high - x_low)
+            py = bottom - (float(value) - low) * (bottom - top) / (high - low)
+            points.append((round(px), round(np.clip(py, top, bottom))))
+        if len(points) >= 2:
+            draw.line(points, fill=color, width=2)
+        draw.text((left + 5, top + 4 + series_index * 12), label, fill=color)
+    draw.text((right - 20, bottom + 3), "x (px)", fill=foreground)
+    draw.text((4, top - 1), "ΔI", fill=foreground)
+    draw.text((left, bottom + 3), f"{x_values[0]:.2g}", fill="#aaaaaa")
+    draw.text((right - 31, bottom + 3), f"{x_values[-1]:.2g}", fill="#aaaaaa")
+    draw.text((left + 3, bottom - 10), f"{low:.2g}", fill="#aaaaaa")
+    draw.text((left + 3, top + 2), f"{high:.2g}", fill="#aaaaaa")
+    draw.text((left, 5), title, fill=foreground)
+    return np.asarray(canvas, dtype=np.uint8)
 
 
 @dataclass
@@ -446,6 +1117,8 @@ class EditorState:
     show_era_rois: bool
     export_roi_bounds_px: tuple[int, int, int, int] | None = None
     line_parameters: tuple = ()
+    background_enabled: bool = False
+    background_degree: int = BACKGROUND_DEFAULT_DEGREE
 
 
 def read_sem_pixel_size_nm(image: Image.Image) -> float | None:
@@ -582,10 +1255,25 @@ def preprocess_image(
     gaussian_size: int = 3,
     gaussian_sigma_scale: float = 1.0,
     blur_method: str = BLUR_METHOD_GAUSSIAN,
+    *,
+    background_degree: int | None = None,
 ) -> np.ndarray:
-    """Build the selected display and measurement image from raw grayscale data."""
+    """Build the selected display and measurement image from raw grayscale data.
+
+    ``background_degree`` (1 or 2) enables the low-order additive background fit
+    before normalization; ``None`` (the default) disables it, preserving the
+    historical byte-identical ``preprocess_image`` behaviour for legacy callers.
+    The background is fitted once from the raw working pixels and never
+    accumulated onto a previously corrected image.
+    """
+    if background_degree is not None:
+        image = fit_additive_background(image, degree=background_degree).corrected_image
     processed = normalize_intensity(image) if normalize else image.copy()
     if not gaussian_denoise:
+        if background_degree is not None and processed.dtype != np.uint8:
+            # A background-corrected non-normalized image is still floating point;
+            # clip/downcast once so the final processed image is always uint8.
+            return np.clip(processed, 0, 255).astype(np.uint8)
         return processed
     if blur_method == BLUR_METHOD_MEAN:
         return mean_convolve(processed, gaussian_size)
@@ -595,7 +1283,6 @@ def preprocess_image(
 def normalize_and_denoise(image: np.ndarray) -> np.ndarray:
     """Keep the former public helper available with the new 3×3 default."""
     return preprocess_image(image, normalize=True, gaussian_denoise=True, gaussian_size=3)
-
 
 def fft_display_intensity(power: np.ndarray) -> np.ndarray:
     """Render a power spectrum for viewing without altering its saved values."""
@@ -930,18 +1617,6 @@ def show_already_running_message() -> None:
     root.destroy()
 
 
-def parabola_peak(values: np.ndarray, index: int) -> float:
-    """Return a subpixel peak location for a local maximum."""
-    if index <= 0 or index >= len(values) - 1:
-        return float(index)
-    left, center, right = values[index - 1 : index + 2]
-    denominator = left - 2.0 * center + right
-    if abs(denominator) < 1e-12:
-        return float(index)
-    offset = 0.5 * (left - right) / denominator
-    return float(index) + float(np.clip(offset, -0.5, 0.5))
-
-
 def rolling_median(trace: np.ndarray, window: int = 9) -> np.ndarray:
     """Return a short local-median baseline without an extra SciPy dependency."""
     radius = window // 2
@@ -963,256 +1638,20 @@ def replace_outliers(trace: np.ndarray, max_jump_px: float = 12.0) -> tuple[np.n
     return repaired, valid
 
 
-def convolve_kernel(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    """Apply a small odd square kernel without adding a SciPy dependency."""
-    radius = kernel.shape[0] // 2
-    padded = np.pad(image.astype(float), radius, mode="edge")
-    output = np.zeros(image.shape, dtype=float)
-    for row in range(kernel.shape[0]):
-        for column in range(kernel.shape[1]):
-            output += kernel[row, column] * padded[row : row + image.shape[0], column : column + image.shape[1]]
-    return output
-
-
-def first_order_kernels(
-    detector: str,
-    diagonal_weight: float,
-    axial_weight: float,
-    kernel_size: int = 3,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return an adjustable 3×3 or extended separable first-order kernel."""
-    if kernel_size not in FIRST_ORDER_KERNEL_SIZES:
-        raise ValueError("一阶边缘卷积核仅支持 3×3、5×5、7×7、9×9 或 11×11。")
-    if detector == EDGE_DETECTOR_CANNY:
-        diagonal_weight, axial_weight = max(diagonal_weight, 0.01), max(axial_weight, 0.01)
-    if kernel_size == 3:
-        kernel_x = np.array(
-            ((diagonal_weight, 0.0, -diagonal_weight), (axial_weight, 0.0, -axial_weight), (diagonal_weight, 0.0, -diagonal_weight)),
-            dtype=float,
-        )
-        return kernel_x, kernel_x.T
-
-    smoothing = np.array([math.comb(kernel_size - 1, index) for index in range(kernel_size)], dtype=float)
-    center_index = kernel_size // 2
-    smoothing *= diagonal_weight
-    smoothing[center_index] *= axial_weight / (2.0 * diagonal_weight) if diagonal_weight > 0 else axial_weight
-    derivative_base = np.array([math.comb(kernel_size - 3, index) for index in range(kernel_size - 2)], dtype=float)
-    derivative = np.convolve(np.array((1.0, 0.0, -1.0)), derivative_base)
-    kernel_x = np.outer(smoothing, derivative)
-    return kernel_x, kernel_x.T
-
-
-def non_maximum_suppression(magnitude: np.ndarray, gradient_x: np.ndarray, gradient_y: np.ndarray) -> np.ndarray:
-    """Keep only local gradient maxima along the quantized gradient direction."""
-    angle = (np.degrees(np.arctan2(gradient_y, gradient_x)) + 180.0) % 180.0
-    padded = np.pad(magnitude, 1, mode="constant")
-    output = np.zeros_like(magnitude)
-    for row in range(magnitude.shape[0]):
-        for column in range(magnitude.shape[1]):
-            value = magnitude[row, column]
-            direction = angle[row, column]
-            if direction < 22.5 or direction >= 157.5:
-                before, after = padded[row + 1, column], padded[row + 1, column + 2]
-            elif direction < 67.5:
-                before, after = padded[row, column + 2], padded[row + 2, column]
-            elif direction < 112.5:
-                before, after = padded[row, column + 1], padded[row + 2, column + 1]
-            else:
-                before, after = padded[row, column], padded[row + 2, column + 2]
-            if value >= before and value >= after:
-                output[row, column] = value
-    return output
-
-
-def vertically_supported_edge_mask(
-    edge_mask: np.ndarray,
-    window_px: int = VERTICAL_EDGE_SUPPORT_WINDOW_PX,
-    min_points: int = VERTICAL_EDGE_SUPPORT_MIN_POINTS,
-) -> np.ndarray:
-    """Keep existing edge pixels with sustained support along a near-vertical path."""
-    if window_px < 1 or window_px % 2 == 0:
-        raise ValueError("竖向边缘支持窗口必须是正奇数。")
-    if min_points < 1:
-        raise ValueError("竖向边缘支持点数必须为正数。")
-    horizontal_radius = 1
-    padded_columns = np.pad(edge_mask.astype(np.int16), ((0, 0), (horizontal_radius, horizontal_radius)))
-    local_columns = sum(
-        padded_columns[:, offset : offset + edge_mask.shape[1]]
-        for offset in range(horizontal_radius * 2 + 1)
-    )
-    vertical_radius = window_px // 2
-    padded_rows = np.pad(local_columns, ((vertical_radius, vertical_radius), (0, 0)))
-    cumulative = np.vstack((np.zeros((1, edge_mask.shape[1]), dtype=np.int32), np.cumsum(padded_rows, axis=0)))
-    support = cumulative[window_px:] - cumulative[:-window_px]
-    return edge_mask & (support >= min_points)
-
-
-def robust_normalize_response(response: np.ndarray) -> tuple[np.ndarray, float]:
-    """Scale edge responses by their positive 99th percentile, limiting outlier influence."""
-    positive = response[response > 0]
-    if not len(positive):
-        return np.zeros(response.shape, dtype=float), 0.0
-    scale = float(np.percentile(positive, 99))
-    return np.clip(response / max(scale, 1e-12), 0.0, 1.0), scale
-
-
-def hysteresis_edges(response: np.ndarray, high_threshold: float, threshold_ratio: float) -> tuple[np.ndarray, float, float]:
-    """Keep weak edges connected to strong edges after robust response normalization."""
-    normalized, scale = robust_normalize_response(response)
-    low_threshold = high_threshold / threshold_ratio
-    strong = normalized >= high_threshold
-    weak = normalized >= low_threshold
-    accepted = strong.copy()
-    stack = list(zip(*np.nonzero(strong)))
-    while stack:
-        row, column = stack.pop()
-        for next_row in range(max(0, row - 1), min(response.shape[0], row + 2)):
-            for next_column in range(max(0, column - 1), min(response.shape[1], column + 2)):
-                if weak[next_row, next_column] and not accepted[next_row, next_column]:
-                    accepted[next_row, next_column] = True
-                    stack.append((next_row, next_column))
-    return accepted, low_threshold, scale
-
-
-def edge_response(
-    image: np.ndarray,
-    detector: str,
-    diagonal_weight: float,
-    axial_weight: float,
-    kernel_size: int,
-    canny_high_threshold: float,
-    canny_threshold_ratio: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    """Build candidate and subpixel-refinement responses for a selected edge detector."""
-    if detector == EDGE_DETECTOR_LAPLACIAN:
-        center = -4.0 * axial_weight - 4.0 * diagonal_weight
-        kernel = np.array(((diagonal_weight, axial_weight, diagonal_weight), (axial_weight, center, axial_weight), (diagonal_weight, axial_weight, diagonal_weight)))
-        response = np.abs(convolve_kernel(image, kernel))
-        return response, response, response > 0, float("nan"), float("nan")
-    gradient_x, gradient_y = (
-        convolve_kernel(image, kernel)
-        for kernel in first_order_kernels(detector, diagonal_weight, axial_weight, kernel_size)
-    )
-    magnitude = np.hypot(gradient_x, gradient_y)
-    suppressed = non_maximum_suppression(magnitude, gradient_x, gradient_y)
-    if detector == EDGE_DETECTOR_CANNY:
-        connected, low_threshold, normalization_scale = hysteresis_edges(suppressed, canny_high_threshold, canny_threshold_ratio)
-        return suppressed * connected, magnitude, connected, normalization_scale, low_threshold
-    return suppressed, magnitude, suppressed > 0, float("nan"), float("nan")
-
-
-def detect_full_image_edges(
-    image: np.ndarray,
-    detector: str,
-    diagonal_weight: float,
-    axial_weight: float,
-    canny_high_threshold: float = 0.125,
-    canny_threshold_ratio: float = 2.5,
-    require_vertical_continuity: bool = False,
-    kernel_size: int = 3,
-) -> np.ndarray:
-    """Return edges for the supplied image region, with optional short-noise removal."""
-    if detector == EDGE_DETECTOR_LAPLACIAN:
-        raise ValueError("拉普拉斯使用单线 LER/LWR 分析，不提供单独的边缘叠加。")
-    response, _refinement, candidate_mask, _scale, _low = edge_response(
-        image,
-        detector,
-        diagonal_weight,
-        axial_weight,
-        kernel_size,
-        canny_high_threshold,
-        canny_threshold_ratio,
-    )
-    if detector == EDGE_DETECTOR_CANNY:
-        edge_mask = candidate_mask & (response > 0)
-    else:
-        positive = response[response > 0]
-        if not len(positive):
-            return np.zeros(image.shape, dtype=bool)
-        percentile = max(55, 75 - 5 * ((kernel_size - 3) // 2))
-        threshold = max(float(np.percentile(positive, percentile)), float(np.max(positive)) * 0.12)
-        edge_mask = response >= threshold
-    if require_vertical_continuity:
-        return vertically_supported_edge_mask(edge_mask)
-    return edge_mask.astype(bool)
-
-
-def locate_edges(
-    image: np.ndarray,
-    max_jump_px: float = 12.0,
-    detector: str = EDGE_DETECTOR_SCHARR,
-    diagonal_weight: float = 3.0,
-    axial_weight: float = 10.0,
-    canny_high_threshold: float = 0.125,
-    canny_threshold_ratio: float = 2.5,
-    kernel_size: int = 3,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
-    """Locate the two edges of one vertical line in a grayscale ROI.
-
-    The input ROI must contain one line and some background on both sides.
-    For every horizontal scanline, the largest gradient magnitude in its left and
-    right halves is refined by a three-point parabolic fit.
-    """
-    height, width = image.shape
-    margin = max(3, int(width * 0.05))
-    midpoint = width // 2
-    if midpoint - margin < 3 or width - midpoint - margin < 3:
-        raise ValueError("分析区域太窄；请框选一条线及其两侧背景。")
-
-    candidates, refinement, candidate_mask, normalization_scale, low_threshold = edge_response(
-        image,
-        detector,
-        diagonal_weight,
-        axial_weight,
-        kernel_size,
-        canny_high_threshold,
-        canny_threshold_ratio,
-    )
-    reference_profile = np.median(candidates, axis=0)
-    left_reference = margin + int(np.argmax(reference_profile[margin:midpoint]))
-    right_reference = midpoint + int(np.argmax(reference_profile[midpoint : width - margin]))
-    search_radius = max(12, min(30, int(width * 0.05)))
-    left = np.full(height, np.nan, dtype=float)
-    right = np.full(height, np.nan, dtype=float)
-
-    for row in range(height):
-        left_start = max(1, left_reference - search_radius)
-        left_end = min(width - 1, left_reference + search_radius + 1)
-        right_start = max(1, right_reference - search_radius)
-        right_end = min(width - 1, right_reference + search_radius + 1)
-        left_mask = candidate_mask[row, left_start:left_end]
-        right_mask = candidate_mask[row, right_start:right_end]
-        if left_mask.any():
-            left_values = np.where(left_mask, candidates[row, left_start:left_end], -np.inf)
-            left_index = left_start + int(np.argmax(left_values))
-            left[row] = parabola_peak(refinement[row], left_index)
-        if right_mask.any():
-            right_values = np.where(right_mask, candidates[row, right_start:right_end], -np.inf)
-            right_index = right_start + int(np.argmax(right_values))
-            right[row] = parabola_peak(refinement[row], right_index)
-
-    left, left_valid = replace_outliers(left, max_jump_px)
-    right, right_valid = replace_outliers(right, max_jump_px)
-    valid = left_valid & right_valid & (right > left)
-    return left, right, valid, normalization_scale, low_threshold
-
-
 def analyze_roi(
     image: np.ndarray,
     pixel_size_nm: float,
     max_jump_px: float = 12.0,
-    detector: str = EDGE_DETECTOR_SCHARR,
-    diagonal_weight: float = 3.0,
-    axial_weight: float = 10.0,
-    canny_high_threshold: float = 0.125,
-    canny_threshold_ratio: float = 2.5,
-    kernel_size: int = 3,
+    detector: str = EDGE_DETECTOR_ERA,
+    **_ignored: object,
 ) -> AnalysisResult:
-    """Calculate standard RMS LER and LWR for one vertical SEM line ROI.
+    """Calculate standard RMS LER and LWR for one vertical SEM line via unified localization.
 
-    A linear baseline is removed from each edge (LER), while only the average
-    width is removed from the width trace (LWR).  This follows the NIST/CD-SEM
-    convention: LER uses N-2 degrees of freedom and LWR uses N-1.
+    Discovery finds one physical line and its two single-edge ROIs automatically, then
+    each edge is fitted with the unified grayscale-profile (ERA) method and paired on
+    common global rows.  A linear baseline is removed from each edge (LER), while only
+    the average width is removed from the width trace (LWR).  This follows the
+    NIST/CD-SEM convention: LER uses N-2 degrees of freedom and LWR uses N-1.
     """
     if pixel_size_nm <= 0:
         raise ValueError("像素尺寸必须大于 0 nm/pixel。")
@@ -1220,64 +1659,28 @@ def analyze_roi(
     if width < MIN_ROI_WIDTH or height < MIN_ROI_HEIGHT:
         raise ValueError("分析区域过小；请至少包含 80 个沿线方向的像素。")
 
-    left, right, valid, canny_normalization_scale, canny_low_threshold = locate_edges(
-        image,
-        max_jump_px,
-        detector,
-        diagonal_weight,
-        axial_weight,
-        canny_high_threshold,
-        canny_threshold_ratio,
-        kernel_size,
+    sample = _discover_single_line_sample(image)
+    left_edge = analyze_single_edge_era(
+        image, sample.left_roi_bounds_px, pixel_size_nm,
+        ERA_DEFAULT_POLYNOMIAL_DEGREE, ERA_POLARITY_AUTO, max_jump_px,
     )
-    rows = np.arange(height, dtype=float)
-    if valid.sum() < max(30, height * 0.6):
-        raise ValueError("有效边缘点太少；请检查 ROI 是否只包含一条线。")
-
-    valid_rows = rows[valid]
-    valid_left = left[valid]
-    valid_right = right[valid]
-    left_fit = np.polyval(np.polyfit(valid_rows, valid_left, 1), valid_rows)
-    right_fit = np.polyval(np.polyfit(valid_rows, valid_right, 1), valid_rows)
-    left_residual_nm = (valid_left - left_fit) * pixel_size_nm
-    right_residual_nm = (valid_right - right_fit) * pixel_size_nm
-    width_nm = (valid_right - valid_left) * pixel_size_nm
-    width_residual_nm = width_nm - np.mean(width_nm)
-    sample_count = len(valid_rows)
-    ler_left_sigma_nm = math.sqrt(float(np.dot(left_residual_nm, left_residual_nm)) / (sample_count - 2))
-    ler_right_sigma_nm = math.sqrt(float(np.dot(right_residual_nm, right_residual_nm)) / (sample_count - 2))
-    lwr_sigma_nm = math.sqrt(float(np.dot(width_residual_nm, width_residual_nm)) / (sample_count - 1))
-    total_ler_sigma_nm = math.hypot(ler_left_sigma_nm, ler_right_sigma_nm)
-    if ler_left_sigma_nm > 0 and ler_right_sigma_nm > 0:
-        edge_correlation = float(np.corrcoef(left_residual_nm, right_residual_nm)[0, 1])
-    else:
-        edge_correlation = float("nan")
-
-    return AnalysisResult(
-        rows_px=valid_rows,
-        left_px=valid_left,
-        right_px=valid_right,
-        left_residual_nm=left_residual_nm,
-        right_residual_nm=right_residual_nm,
-        width_nm=width_nm,
-        width_residual_nm=width_residual_nm,
-        mean_width_nm=float(np.mean(width_nm)),
-        ler_left_sigma_nm=ler_left_sigma_nm,
-        ler_right_sigma_nm=ler_right_sigma_nm,
-        lwr_sigma_nm=lwr_sigma_nm,
-        total_ler_sigma_nm=total_ler_sigma_nm,
-        edge_correlation=edge_correlation,
-        pixel_size_nm=pixel_size_nm,
-        rejected_rows=int((~valid).sum()),
-        edge_detector=detector,
-        edge_kernel_size=kernel_size,
-        edge_diagonal_weight=diagonal_weight,
-        edge_axial_weight=axial_weight,
-        canny_high_threshold=canny_high_threshold,
-        canny_threshold_ratio=canny_threshold_ratio,
-        canny_low_threshold=canny_low_threshold,
-        canny_normalization_scale=canny_normalization_scale,
+    right_edge = analyze_single_edge_era(
+        image, sample.right_roi_bounds_px, pixel_size_nm,
+        ERA_DEFAULT_POLYNOMIAL_DEGREE, ERA_POLARITY_AUTO, max_jump_px,
     )
+    result = pair_single_edges(left_edge, right_edge, pixel_size_nm)
+    result.localization_method = LINE_LOCALIZATION_UNIFIED
+    return result
+
+
+def _discover_single_line_sample(image: np.ndarray) -> EraLineSample:
+    """Discover one bright or dark line and return its editable single-edge ROIs."""
+    samples = automatic_era_line_samples(image, bright_lines=True)
+    if not samples:
+        samples = automatic_era_line_samples(image, bright_lines=False)
+    if not samples:
+        raise ValueError("未识别到可分析的线条；请确认图像包含一条近竖直的亮/暗线。")
+    return samples[0]
 
 
 def automatic_era_line_samples(
@@ -1352,45 +1755,89 @@ def analyze_bright_band_edge(
     definition: str = "center",
     max_jump_px: float = 12.0,
     reference_band_px: tuple[float, float] | None = None,
+    degree: int | None = None,
 ) -> SingleEdgeResult:
-    """Measure a bright boundary at its left/right half-height or their midpoint."""
+    """Measure a bright boundary at its left/right half-height or their midpoint.
+
+    Final localization now goes through ``line_localization.localize_bright_band_edge``:
+    each flank is its own local-dark-baseline polynomial half-height (degree
+    2/3/4, default 3), with independent left/right/center definitions and the
+    bounded neighbor-guided recovery pass.  The legacy adjacent-pixel linear
+    ``bright_band_position`` is retained only as the coarse discovery/reference
+    helper, never as final localization.
+
+    ``degree`` is the user-selected 2/3/4 flank polynomial degree; when omitted,
+    ``degree`` falls back to the default (``era_polynomial_degree_default()``)
+    to keep direct legacy callers working unchanged.
+    """
     if not math.isfinite(pixel_size_nm) or pixel_size_nm <= 0:
         raise ValueError("像素尺寸必须为大于 0 的有限数值。")
     if definition not in PERIODIC_POSITION_LABELS.values():
         raise ValueError("亮带取点只能选择中心、左侧或右侧。")
+    if degree is None:
+        degree = era_polynomial_degree_default()
+    if int(degree) not in (2, 3, 4):
+        raise ValueError("统一拟合仅支持 2、3 或 4 次多项式。")
+    degree = int(degree)
     left, top, right, bottom = roi_bounds_px
     if not (0 <= left < right <= image.shape[1] and 0 <= top < bottom <= image.shape[0]):
         raise ValueError("亮带 ROI 超出图像范围。")
     region = image[top:bottom, left:right]
     if region.shape[0] < MIN_ERA_ROI_HEIGHT or region.shape[1] < MIN_BRIGHT_BAND_ROI_WIDTH:
         raise ValueError("亮带 ROI 至少需要 5 px 宽、80 px 高，并包含两侧局部暗背景。")
-    numeric_region = region.astype(float)
     if reference_band_px is None:
         reference_band_px = reference_bright_band(image, roi_bounds_px)
     reference_local = (reference_band_px[0] - left, reference_band_px[1] - left)
-    try:
-        search_start, search_stop = bright_band_search_bounds(region.shape[1], reference_local)
-    except ValueError as exc:
-        raise ValueError("亮带 ROI 未包含有效的预览亮边；请重新预览或调整选区。") from exc
-    flank = max(1, min(3, region.shape[1] // 5))
-    backgrounds = np.maximum(np.median(numeric_region[:, :flank], axis=1), np.median(numeric_region[:, -flank:], axis=1))
-    contrasts = np.max(numeric_region[:, search_start:search_stop], axis=1) - backgrounds
-    minimum_contrast = max(1e-9, 0.2 * float(np.percentile(contrasts, 75)))
-    trace = np.asarray([
-        bright_band_position(row, definition, reference_local) if contrast > minimum_contrast else np.nan
-        for row, contrast in zip(region, contrasts)
-    ], dtype=float)
-    repaired, valid = replace_outliers(trace, max_jump_px)
-    if np.count_nonzero(valid) < max(30, math.ceil(region.shape[0] * 0.6)):
-        raise ValueError("亮带有效行不足；请检查是否完整包含单条亮带及其两侧暗区。")
-    rows = np.arange(region.shape[0], dtype=float)[valid] + top
-    positions = repaired[valid] + left
+    diag = localize_bright_band_edge(
+        region, roi_bounds_px, definition, reference_local,
+        max_jump_px=max_jump_px, polynomial_degree=degree,
+    )
+    return _single_edge_result_from_diag(diag, left, top, pixel_size_nm, f"bright_band_{definition}")
+
+
+def era_polynomial_degree_default() -> int:
+    """Module-level default bright-band/transition degree used by the localization
+    core.  ``analyze_sample_edge`` still routes the user-selected degree through
+    its ``degree`` argument, so this is a fallback for direct callers."""
+    return DEFAULT_LOCALIZATION_DEGREE
+
+
+def _single_edge_result_from_diag(
+    diag: object,
+    left: int,
+    top: int,
+    pixel_size_nm: float,
+    polarity_label: str,
+) -> SingleEdgeResult:
+    """Build a ``SingleEdgeResult`` strictly from a localization diag's valid rows.
+
+    Global x is the local final position + ROI left, global y is the local row +
+    ROI top.  The valid-row gate (``valid_row_threshold``) is enforced here so a
+    side that falls short raises ``LocalizationFailure`` carrying the full diag
+    instead of silently producing a short metrology trace.
+    """
+    valid_local_rows = diag.valid_local_rows()
+    valid_positions = diag.valid_positions()
+    if len(valid_local_rows) < valid_row_threshold(diag.height):
+        raise LocalizationFailure(
+            "有效拟合点不足（首轮 + 恢复后仍低于门限）；请检查是否完整包含单条边及其过渡。",
+            diagnostics=diag,
+        )
+    rows = valid_local_rows + top
+    positions = valid_positions + left
     baseline = np.polyval(np.polyfit(rows, positions, 1), rows)
     residuals = (positions - baseline) * pixel_size_nm
     return SingleEdgeResult(
-        rows, positions, residuals,
-        math.sqrt(float(np.dot(residuals, residuals)) / (len(rows) - 2)),
-        int(np.count_nonzero(~valid)), roi_bounds_px, f"bright_band_{definition}", 0,
+        rows_px=rows,
+        edge_px=positions,
+        residual_nm=residuals,
+        ler_sigma_nm=math.sqrt(float(np.dot(residuals, residuals)) / (len(rows) - 2)),
+        rejected_rows=int(diag.height - len(valid_local_rows)),
+        roi_bounds_px=tuple(diag.roi_bounds_px),
+        polarity=polarity_label,
+        polynomial_degree=int(diag.fit_degree),
+        diagnostics=diag,
+        extra_metadata={"fit_degree": int(diag.fit_degree), "definition": diag.position_definition},
     )
 
 
@@ -1403,149 +1850,30 @@ def single_edge_segments(edge: SingleEdgeResult, split_missing_rows: bool = Fals
 
 def analyze_sample_edge(
     image: np.ndarray, bounds: tuple[int, int, int, int], pixel_size: float,
-    method: str, *, bright_band: bool = False, definition: str = "center",
+    method: str = EDGE_DETECTOR_ERA, *, bright_band: bool = False, definition: str = "center",
     reference_band: tuple[float, float] | None = None, degree: int = 3,
     polarity: str = ERA_POLARITY_AUTO, max_jump: float = 12.0,
-    row_mask: np.ndarray | None = None, diagonal: float = 3.0, axial: float = 10.0,
-    kernel_size: int = 3, high: float = 0.125, ratio: float = 2.5,
-    continuity: bool = False,
-    response_threshold_fraction: float = 0.12,
+    row_mask: np.ndarray | None = None, **_legacy: object,
 ) -> SingleEdgeResult:
     """Locate a directed trajectory strictly inside one confirmed edge rectangle.
 
-    Gradient methods use accepted NMS candidates, polarity and reference identity;
-    disconnected/ambiguous rows remain absent. A bright band always validates both
-    flanks before selecting its requested side or the midpoint of both sides.
+    统一灰度剖面定位：实体亮/暗线走 ERA 差分质心多项式半高（analyze_single_edge_era），
+    周期槽/平台走亮带两独立局部基线半高拟合（analyze_bright_band_edge）。旧检测器
+    （Scharr/Canny/拉普拉斯/独立半高插值）已移除，传入旧方法字符串一律拒绝。
     """
     if not math.isfinite(pixel_size) or pixel_size <= 0:
         raise ValueError("像素尺寸必须为大于 0 的有限数值。")
-    if method == EDGE_DETECTOR_ERA and degree not in (2, 3, 4):
-        raise ValueError("ERA 拟合仅支持 2、3 或 4 次多项式。")
+    if method not in (EDGE_DETECTOR_ERA, LINE_LOCALIZATION_UNIFIED):
+        raise ValueError("线条定位已统一为灰度剖面定位；不再支持 Scharr、Canny、拉普拉斯或独立半高插值。")
+    if degree not in (2, 3, 4):
+        raise ValueError("统一拟合仅支持 2、3 或 4 次多项式。")
     if bright_band and definition not in PERIODIC_POSITION_LABELS.values():
         raise ValueError("亮带取点只能选择中心、左侧或右侧。")
-    if not math.isfinite(response_threshold_fraction) or not 0 <= response_threshold_fraction <= 1:
-        raise ValueError("Scharr 相对阈值须为 0–1 的有限数值。")
-    if method == EDGE_DETECTOR_HALF:
-        if not bright_band:
-            raise ValueError("半高亮带插值需要周期亮带样本；单调过渡请选择 ERA、Scharr 或 Canny。")
-        return analyze_bright_band_edge(image, bounds, pixel_size, definition, max_jump, reference_band)
-    if method == EDGE_DETECTOR_ERA and not bright_band:
-        return analyze_single_edge_era(image, bounds, pixel_size, degree, polarity, max_jump, row_mask)
-    if method not in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY, EDGE_DETECTOR_LAPLACIAN):
-        raise ValueError("请选择有效的边缘定位方法。")
-    left, top, right, bottom = bounds
-    if not (0 <= left < right <= image.shape[1] and 0 <= top < bottom <= image.shape[0]):
-        raise ValueError("边缘框超出图像。")
-    region = image[top:bottom, left:right].astype(float)
-    height, width = region.shape
-    if height < MIN_ERA_ROI_HEIGHT or width < (5 if bright_band else 12):
-        raise ValueError("边缘框过小。")
     if bright_band:
-        reference_band = reference_band or reference_bright_band(image, bounds)
-        reference = tuple(v - left for v in reference_band)
-        # This shared validation rejects missing flanks, extra peaks and identity swaps.
-        validated = analyze_bright_band_edge(image, bounds, pixel_size, "center", max_jump, reference_band)
-        supported = set(validated.rows_px.astype(int) - top)
-        reference_x = sum(reference) / 2
-    else:
-        sign, polarity = era_polarity_sign(region, polarity)
-        reference_x = float(np.argmax(sign * np.diff(np.median(region, axis=0))) + 0.5)
-        supported = set(range(height))
-    if method != EDGE_DETECTOR_ERA:
-        candidates, refinement, mask, _scale, _low = edge_response(region, method, diagonal, axial, kernel_size, high, ratio)
-        if method == EDGE_DETECTOR_LAPLACIAN:
-            signed_laplacian = convolve_kernel(region, np.array(((diagonal, axial, diagonal),
-                (axial, -4 * (axial + diagonal), axial), (diagonal, axial, diagonal))))
-        if continuity and method != EDGE_DETECTOR_LAPLACIAN:
-            mask &= vertically_supported_edge_mask(mask & (candidates > 0))
-        # Reject texture below the regional accepted-response scale.
-        positive = candidates[candidates > 0]
-        floor = max(1e-12, float(np.percentile(positive, 75)) * response_threshold_fraction) if len(positive) else float("inf")
-        if method == EDGE_DETECTOR_CANNY:
-            floor = 1e-12  # Hysteresis is the only Canny amplitude threshold.
-    trace = np.full(height, np.nan)
-    for row, profile in enumerate(region):
-        if row not in supported or (row_mask is not None and not row_mask[row]):
-            continue
-        if bright_band:
-            lhalf = bright_band_position(profile, "left", reference)
-            rhalf = bright_band_position(profile, "right", reference)
-            if not np.isfinite(lhalf + rhalf):
-                continue
-            peak = int(np.argmax(profile[max(1, int(lhalf)):min(width - 1, math.ceil(rhalf) + 1)])) + max(1, int(lhalf))
-            searches = [(1, peak, lhalf, 1), (peak + 1, width - 1, rhalf, -1)]
-        else:
-            radius = max(2.0, min(12.0, width / 3))
-            searches = [(max(1, math.floor(reference_x - radius)), min(width - 1, math.ceil(reference_x + radius) + 1), reference_x, sign)]
-        positions = []
-        for start, stop, anchor, direction in searches:
-            if stop <= start:
-                break
-            if method == EDGE_DETECTOR_ERA:
-                # Each half-height target comes from its own validated local baseline.
-                # Restrict the polynomial to one flank, preserving the manual ERA code.
-                a, b = (0, peak + 1) if direction > 0 else (peak, width)
-                differences = np.maximum(direction * np.diff(profile[a:b]), 0.0)
-                if not len(differences) or np.max(differences) <= 0:
-                    break
-                weights = (differences / np.max(differences)) ** ERA_DIFFERENCE_POWER
-                center = float(np.dot(weights, np.arange(a, b - 1) + 0.5) / weights.sum())
-                fit_start, fit_stop = max(a, int(math.floor(center)) - 3), min(b, int(math.ceil(center)) + 4)
-                if fit_stop - fit_start <= degree:
-                    break
-                target = float(np.interp(anchor, np.arange(width), profile))
-                x = np.arange(fit_start, fit_stop, dtype=float) - anchor
-                coefficients = np.polyfit(x, profile[fit_start:fit_stop] - target, degree)
-                derivative = np.polyder(coefficients)
-                roots = [float(root.real) + anchor for root in np.roots(coefficients)
-                         if abs(root.imag) < 1e-7 and fit_start <= root.real + anchor <= fit_stop - 1
-                         and direction * np.polyval(derivative, root.real) > 0]
-                if not roots:
-                    break
-                value = min(roots, key=lambda v: abs(v - anchor))
-            elif method == EDGE_DETECTOR_LAPLACIAN:
-                response = signed_laplacian[row]
-                crossings = []
-                for index in range(start, min(stop, width - 1)):
-                    a, b = response[index:index + 2]
-                    if a * b <= 0 and a != b and direction * (b - a) < 0 and direction * (profile[index + 1] - profile[index]) > 0:
-                        crossings.append(index - a / (b - a))
-                if len(crossings) != 1:
-                    break
-                value = crossings[0]
-            else:
-                indices = np.arange(start, stop)
-                derivative = np.gradient(profile)
-                eligible = mask[row, indices] & (candidates[row, indices] > floor) & (direction * derivative[indices] > 0)
-                indices = indices[eligible]
-                # Collapse adjacent plateau pixels into one candidate, reject competing peaks.
-                groups = np.split(indices, np.flatnonzero(np.diff(indices) > 1) + 1) if len(indices) else []
-                peaks = [int(g[np.argmax(candidates[row, g])]) for g in groups if len(g)]
-                peaks = [p for p in peaks if abs(p - anchor) <= max(2.0, 0.75 * (reference[1] - reference[0]))] if bright_band else peaks
-                if not peaks:
-                    break
-                peaks.sort(key=lambda p: candidates[row, p], reverse=True)
-                if len(peaks) > 1 and candidates[row, peaks[1]] >= 0.5 * candidates[row, peaks[0]]:
-                    break
-                value = parabola_peak(refinement[row], peaks[0])
-                if not start - 0.5 <= value <= stop - 0.5:
-                    break
-            if not math.isfinite(value):
-                break
-            positions.append(value)
-        if len(positions) != len(searches):
-            continue
-        trace[row] = (positions[0] if definition == "left" else positions[1] if definition == "right" else np.mean(positions)) if bright_band else positions[0]
-    repaired, valid = replace_outliers(trace, max_jump)
-    if np.count_nonzero(valid) < max(30, math.ceil(height * 0.6)):
-        raise ValueError("有效轨迹行不足；请检查多重边缘、断点、过渡方向或定位参数。")
-    rows, positions = np.arange(height, dtype=float)[valid] + top, repaired[valid] + left
-    residual = (positions - np.polyval(np.polyfit(rows, positions, 1), rows)) * pixel_size
-    return SingleEdgeResult(rows, positions, residual, math.sqrt(float(residual @ residual) / (len(rows) - 2)),
-                            int(np.count_nonzero(~valid)), bounds,
-                            f"bright_band_{definition}" if bright_band else polarity,
-                            degree if method == EDGE_DETECTOR_ERA else 0,
-                            _scale if method != EDGE_DETECTOR_ERA else float("nan"))
+        return analyze_bright_band_edge(
+            image, bounds, pixel_size, definition, max_jump, reference_band, degree,
+        )
+    return analyze_single_edge_era(image, bounds, pixel_size, degree, polarity, max_jump, row_mask)
 
 
 def automatic_era_row_mask(
@@ -1583,42 +1911,18 @@ def era_edge_position(
     polarity_sign: int,
     polynomial_degree: int,
 ) -> float:
-    """Fit one scanline transition and return its normalized 0.5 crossing in pixels."""
-    width = len(profile)
-    difference = polarity_sign * np.diff(profile.astype(float))
-    half_search = max(5, min(30, width // 3))
-    start = max(0, int(math.floor(reference_x - half_search)))
-    end = min(width - 1, int(math.ceil(reference_x + half_search)))
-    local_difference = np.maximum(difference[start:end], 0.0)
-    if not len(local_difference) or float(np.max(local_difference)) <= 1e-12:
-        return float("nan")
-    normalized_difference = local_difference / float(np.max(local_difference))
-    weights = normalized_difference**ERA_DIFFERENCE_POWER
-    x_centers = np.arange(start, end, dtype=float) + 0.5
-    weighted_center = float(np.dot(weights, x_centers) / np.sum(weights))
-    peak_center = float(start + int(np.argmax(local_difference)) + 0.5)
-    half_fit = max(3, min(15, int(math.ceil(abs(peak_center - weighted_center))) + 3))
-    fit_start = max(0, int(math.floor(weighted_center - half_fit)))
-    fit_end = min(width, int(math.ceil(weighted_center + half_fit)) + 1)
-    x_values = np.arange(fit_start, fit_end, dtype=float)
-    values = profile[fit_start:fit_end].astype(float)
-    if len(x_values) <= polynomial_degree or float(np.ptp(values)) <= 1e-12:
-        return float("nan")
-    normalized_values = (values - float(np.min(values))) / float(np.ptp(values))
-    coefficients = np.polyfit(x_values, normalized_values, polynomial_degree)
-    roots = np.roots(np.array([*coefficients[:-1], coefficients[-1] - 0.5], dtype=float))
-    candidates = []
-    derivative = np.polyder(coefficients)
-    for root in roots:
-        if abs(float(root.imag)) > 1e-7:
-            continue
-        position = float(root.real)
-        slope = float(np.polyval(derivative, position))
-        if fit_start <= position <= fit_end - 1 and slope * polarity_sign > 0:
-            candidates.append(position)
-    if not candidates:
-        return float("nan")
-    return min(candidates, key=lambda position: abs(position - weighted_center))
+    """Fit one scanline transition and return its normalized 0.5 crossing in pixels.
+
+    Thin compatibility wrapper over the unified core
+    ``line_localization.transition_row_position`` so the legacy single-edge helper
+    shares the exact same gates (noise/low-contrast/ambiguous-double-step) and fit
+    as ``analyze_single_edge_era``.  Returns ``float("nan")`` for any non-ok reason,
+    preserving the old None-free scalar contract.
+    """
+    position, _reason = transition_row_position(
+        profile, reference_x, polarity_sign, polynomial_degree
+    )
+    return position
 
 
 def analyze_single_edge_era(
@@ -1653,28 +1957,11 @@ def analyze_single_edge_era(
     polarity_sign, resolved_polarity = era_polarity_sign(roi, polarity)
     reference_difference = polarity_sign * np.diff(np.median(roi[valid_rows_mask].astype(float), axis=0))
     reference_x = float(np.argmax(reference_difference) + 0.5)
-    trace = np.array(
-        [era_edge_position(roi[row], reference_x, polarity_sign, polynomial_degree) if valid_rows_mask[row] else np.nan for row in range(height)],
-        dtype=float,
+    diag = localize_transition_edge(
+        roi, roi_bounds_px, reference_x, polarity_sign, polynomial_degree,
+        resolved_polarity, max_jump_px=max_jump_px, row_mask=valid_rows_mask,
     )
-    repaired_trace, valid = replace_outliers(trace, max_jump_px)
-    if int(valid.sum()) < max(30, int(height * 0.6)):
-        raise ValueError("单边有效拟合点太少；请让 ROI 只覆盖一条边，并包含边缘两侧的灰度过渡。")
-    valid_rows_local = np.arange(height, dtype=float)[valid]
-    valid_trace_local = repaired_trace[valid]
-    baseline = np.polyval(np.polyfit(valid_rows_local, valid_trace_local, 1), valid_rows_local)
-    residual_nm = (valid_trace_local - baseline) * pixel_size_nm
-    ler_sigma_nm = math.sqrt(float(np.dot(residual_nm, residual_nm)) / (len(valid_rows_local) - 2))
-    return SingleEdgeResult(
-        rows_px=valid_rows_local + top,
-        edge_px=valid_trace_local + left,
-        residual_nm=residual_nm,
-        ler_sigma_nm=ler_sigma_nm,
-        rejected_rows=int((~valid).sum()),
-        roi_bounds_px=roi_bounds_px,
-        polarity=resolved_polarity,
-        polynomial_degree=polynomial_degree,
-    )
+    return _single_edge_result_from_diag(diag, left, top, pixel_size_nm, resolved_polarity)
 
 
 def pair_single_edges(left_edge: SingleEdgeResult, right_edge: SingleEdgeResult, pixel_size_nm: float) -> AnalysisResult:
@@ -2886,18 +3173,16 @@ class LERLWRApp(AppBase):
         self.periodic_target_kind_var = tk.StringVar(value="槽")
         self.periodic_left_position_var = tk.StringVar(value="亮带中心")
         self.periodic_right_position_var = tk.StringVar(value="亮带中心")
-        self.edge_kernel_size_var = tk.StringVar(value="3 × 3")
-        self.edge_diagonal_weight_var = tk.StringVar(value="3")
-        self.edge_axial_weight_var = tk.StringVar(value="10")
-        self.canny_high_threshold_var = tk.DoubleVar(value=0.125)
-        self.canny_threshold_ratio_var = tk.DoubleVar(value=2.5)
-        self.edge_use_vertical_continuity_filter_var = tk.BooleanVar(value=False)
-        self.line_gradient_threshold_var = tk.StringVar(value="0.12")
-        self.canny_high_threshold_text_var = tk.StringVar(value="0.125")
-        self.canny_threshold_ratio_text_var = tk.StringVar(value="2.50")
-        self.canny_low_threshold_text_var = tk.StringVar(value="0.050")
-        self.edge_kernel_preview_var = tk.StringVar(value="")
         self.bcp_use_dog_var = tk.BooleanVar(value=False)
+        self.background_enabled_var = tk.BooleanVar(value=False)
+        self.background_degree_var = tk.StringVar(value=str(BACKGROUND_DEFAULT_DEGREE))
+        # Last *applied* background configuration.  The Tk control variables
+        # change before the callback fires, so undo must snapshot the previous
+        # applied config (not the freshly-written flag) for it to restore the
+        # actual pre-change state.  Also captures the degree chosen while the
+        # switch is still off, so an off→on toggle applies that remembered
+        # degree rather than resetting to the "off" placeholder degree.
+        self._background_last_applied = (False, BACKGROUND_DEFAULT_DEGREE)
         self.fft_window_var = tk.StringVar(value=FFT_WINDOW_HANN)
         self.fft_query_var = tk.StringVar(value="尚未计算二维 FFT。")
         self.fft_delete_fx_var = tk.StringVar(value="")
@@ -2944,10 +3229,8 @@ class LERLWRApp(AppBase):
         self.centroid_layout_overlay_image: ImageTk.PhotoImage | None = None
 
         self._build_ui()
-        for variable in (self.edge_detector_var, self.edge_kernel_size_var, self.edge_diagonal_weight_var,
-                         self.edge_axial_weight_var, self.canny_high_threshold_var, self.canny_threshold_ratio_var,
-                         self.edge_use_vertical_continuity_filter_var, self.era_polarity_var, self.era_polynomial_degree_var,
-                         self.outlier_level_var, self.line_gradient_threshold_var):
+        for variable in (self.edge_detector_var, self.era_polarity_var, self.era_polynomial_degree_var,
+                         self.outlier_level_var):
             variable.trace_add("write", self.invalidate_line_parameters)
         self.bind("<FocusIn>", self.keep_ler_lwr_dialog_above_main, add="+")
         self.bind_all("<MouseWheel>", self.scroll_active_window, add="+")
@@ -3008,26 +3291,27 @@ class LERLWRApp(AppBase):
 
         self.image_processing_panel = ttk.LabelFrame(body, text="图像处理", padding=(10, 6))
         self.image_processing_panel_visible = False
-        alignment = ttk.Frame(self.image_processing_panel, padding=(0, 8, 0, 0))
-        alignment.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Label(alignment, text="倾角校正（先于找框）：").pack(side=tk.LEFT)
-        ttk.Button(alignment, text="估计倾角 / 预览微调", command=self.auto_align_roi).pack(side=tk.LEFT, padx=6)
-        ttk.Button(alignment, text="恢复原始角度", command=self.reset_rotation).pack(side=tk.LEFT)
-        ttk.Label(alignment, text="有绿色框时仅用框内估计；应用旋转后重新找框。", foreground="#666666").pack(side=tk.LEFT, padx=8)
+
+        # 预处理行：归一化/平滑/模糊方法与核/σ/BCP DoG/权重矩阵整行独立全宽。
+        # 之前的这些控件直接 pack 到 image_processing_panel 的 LEFT，被排在同 parent
+        # 的 TOP（背景行）与 BOTTOM（倾角校正行）之后，只剩狭窄 cavity，可能整行裁掉。
+        # 现在全部移入这条 TOP fillX 的 preprocessing_row，作为独立一行。
+        preprocessing_row = ttk.Frame(self.image_processing_panel)
+        preprocessing_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
         ttk.Checkbutton(
-            self.image_processing_panel,
+            preprocessing_row,
             text="归一化（1%–99%）",
             variable=self.normalize_var,
             command=self.refresh_image_preprocessing,
         ).pack(side=tk.LEFT, padx=(0, 14))
         ttk.Checkbutton(
-            self.image_processing_panel,
+            preprocessing_row,
             text="启用平滑",
             variable=self.gaussian_denoise_var,
             command=self.refresh_image_preprocessing,
         ).pack(side=tk.LEFT, padx=(0, 5))
         blur_selector = ttk.Combobox(
-            self.image_processing_panel,
+            preprocessing_row,
             textvariable=self.blur_method_var,
             state="readonly",
             values=(BLUR_METHOD_GAUSSIAN, BLUR_METHOD_MEAN),
@@ -3036,7 +3320,7 @@ class LERLWRApp(AppBase):
         blur_selector.pack(side=tk.LEFT, padx=(0, 5))
         blur_selector.bind("<<ComboboxSelected>>", self.refresh_image_preprocessing)
         kernel_selector = ttk.Combobox(
-            self.image_processing_panel,
+            preprocessing_row,
             textvariable=self.gaussian_kernel_size_var,
             state="readonly",
             values=tuple(f"{size} × {size}" for size in GAUSSIAN_KERNEL_SIZES),
@@ -3044,7 +3328,7 @@ class LERLWRApp(AppBase):
         )
         kernel_selector.pack(side=tk.LEFT, padx=(0, 18))
         kernel_selector.bind("<<ComboboxSelected>>", self.refresh_image_preprocessing)
-        sigma_controls = ttk.Frame(self.image_processing_panel)
+        sigma_controls = ttk.Frame(preprocessing_row)
         sigma_controls.pack(side=tk.LEFT, padx=(0, 18))
         ttk.Label(sigma_controls, text="σ（相对默认）：").pack(side=tk.LEFT)
         ttk.Scale(
@@ -3058,22 +3342,69 @@ class LERLWRApp(AppBase):
         ).pack(side=tk.LEFT, padx=(3, 5))
         ttk.Label(sigma_controls, textvariable=self.gaussian_sigma_text_var, width=10).pack(side=tk.LEFT)
         ttk.Checkbutton(
-            self.image_processing_panel,
+            preprocessing_row,
             text="BCP DoG 对比增强（显示/识别）",
             variable=self.bcp_use_dog_var,
             command=self.refresh_bcp_contrast,
         ).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Label(
-            self.image_processing_panel,
+            preprocessing_row,
             text="默认关闭；DoG 过强时可取消勾选，改以原始亮暗强度分割。",
             foreground="#666666",
         ).pack(side=tk.LEFT)
         ttk.Label(
-            self.image_processing_panel,
+            preprocessing_row,
             textvariable=self.gaussian_kernel_preview_var,
             justify=tk.LEFT,
             font=("Menlo", 9),
         ).pack(side=tk.RIGHT, padx=(18, 0))
+
+        # 背景校正：独立一行（TOP fillX），默认关闭，一阶平面默认，可选二阶曲面。
+        background_row = ttk.Frame(self.image_processing_panel)
+        background_row.pack(side=tk.TOP, fill=tk.X, pady=(4, 0))
+        ttk.Checkbutton(
+            background_row,
+            text="全图低阶背景校正",
+            variable=self.background_enabled_var,
+            command=self.background_config_changed,
+        ).pack(side=tk.LEFT)
+        degree_selector = ttk.Combobox(
+            background_row,
+            textvariable=self.background_degree_var,
+            state="readonly",
+            values=tuple(str(degree) for degree in BACKGROUND_DEGREE_OPTIONS),
+            width=3,
+        )
+        degree_selector.pack(side=tk.LEFT, padx=(4, 2))
+        degree_selector.bind("<<ComboboxSelected>>", self.background_config_changed)
+        ttk.Label(
+            background_row,
+            text="阶（平面 / 曲面）",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(2, 10))
+        ttk.Button(
+            background_row,
+            text="查看灰度 / 灰度差对照",
+            command=self.open_profile_review_window,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            background_row,
+            text="逐行定位诊断",
+            command=self.open_line_diagnostics_window,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Label(
+            background_row,
+            text="背景作用范围：线条 / FFT / BCP 共用同一处理后图像（DoG 仍仅 BCP）。",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(10, 0))
+
+        # 倾角校正底行（BOTTOM fillX），与预处理行 / 背景行互不挤压。
+        alignment = ttk.Frame(self.image_processing_panel, padding=(0, 8, 0, 0))
+        alignment.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(alignment, text="倾角校正（先于找框）：").pack(side=tk.LEFT)
+        ttk.Button(alignment, text="估计倾角 / 预览微调", command=self.auto_align_roi).pack(side=tk.LEFT, padx=6)
+        ttk.Button(alignment, text="恢复原始角度", command=self.reset_rotation).pack(side=tk.LEFT)
+        ttk.Label(alignment, text="有绿色框时仅用框内估计；应用旋转后重新找框。", foreground="#666666").pack(side=tk.LEFT, padx=8)
 
         self.analysis_tools_panel = ttk.LabelFrame(body, text="分析功能", padding=(10, 6))
         self.analysis_tools_panel_visible = False
@@ -3264,6 +3595,10 @@ class LERLWRApp(AppBase):
         self.pending_undo_state = None
         self.rotation_degrees = 0.0
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        if hasattr(self, "_background_last_applied"):
+            # 载入新图后，背景控件与上次实际应用配置重新对齐（载入不触发
+            # record_undo_state，直接同步缓存即可）。
+            self._background_last_applied = (self.background_enabled(), self._background_degree_selected())
         self.reset_zoom_control()
         self.rebuild_working_images()
         if metadata_pixel_size is None:
@@ -3319,9 +3654,10 @@ class LERLWRApp(AppBase):
             self.show_era_rois,
             getattr(self, "export_roi_bounds_px", None),
             tuple((name, getattr(self, name).get()) for name in (
-                "edge_detector_var", "edge_kernel_size_var", "edge_diagonal_weight_var", "edge_axial_weight_var",
-                "canny_high_threshold_var", "canny_threshold_ratio_var", "edge_use_vertical_continuity_filter_var",
-                "era_polarity_var", "era_polynomial_degree_var", "line_gradient_threshold_var", "outlier_level_var") if hasattr(self, name)),
+                "edge_detector_var",
+                "era_polarity_var", "era_polynomial_degree_var", "outlier_level_var") if hasattr(self, name)),
+            background_enabled=self.background_enabled(),
+            background_degree=self._background_degree_selected(),
         )
 
     def record_undo_state(self) -> None:
@@ -3357,6 +3693,14 @@ class LERLWRApp(AppBase):
         self.gaussian_sigma_scale_var.set(state.gaussian_sigma_scale)
         self.blur_method_var.set(state.blur_method)
         self.bcp_use_dog_var.set(state.bcp_dog_enabled)
+        if hasattr(self, "background_enabled_var"):
+            self.background_enabled_var.set(state.background_enabled)
+        if hasattr(self, "background_degree_var"):
+            self.background_degree_var.set(str(state.background_degree))
+        if hasattr(self, "_background_last_applied"):
+            # 撤销后以快照里保存的（改变前）实际配置为准，供下一次背景切换
+            # 判断是否真是变化，以及作为再撤销时的上一配置。
+            self._background_last_applied = (state.background_enabled, state.background_degree)
         self.update_gaussian_kernel_preview()
         self._restoring_line_parameters = True
         for name, value in state.line_parameters:
@@ -3411,6 +3755,7 @@ class LERLWRApp(AppBase):
             self.gaussian_kernel_size(),
             self.gaussian_sigma_scale(),
             self.blur_method_var.get(),
+            background_degree=self.background_degree(),
         )
         self.rebuild_bcp_preview()
 
@@ -3500,6 +3845,8 @@ class LERLWRApp(AppBase):
         self.record_undo_state()
         self.rotation_degrees = 0.0
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        if hasattr(self, "_background_last_applied"):
+            self._background_last_applied = (self.background_enabled(), self._background_degree_selected())
         self.reset_zoom_control()
         self.rebuild_working_images()
         self.result = None
@@ -3542,6 +3889,10 @@ class LERLWRApp(AppBase):
         view_center = self.current_view_center()
         self.rotation_degrees = angle_degrees
         self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        if hasattr(self, "_background_last_applied"):
+            # 旋转不改变背景开关/阶数本身，只重建工作图；对齐缓存以保持
+            # 后续背景切换的上一配置判断一致。
+            self._background_last_applied = (self.background_enabled(), self._background_degree_selected())
         self.rebuild_working_images()
         self.result = None
         self.analysis_origin = None
@@ -4416,6 +4767,47 @@ class LERLWRApp(AppBase):
     def gaussian_sigma_scale(self) -> float:
         return float(np.clip(self.gaussian_sigma_scale_var.get(), GAUSSIAN_SIGMA_SCALE_MIN, GAUSSIAN_SIGMA_SCALE_MAX))
 
+    def background_enabled(self) -> bool:
+        """Whether the low-order additive background correction is active."""
+        var = getattr(self, "background_enabled_var", None)
+        return bool(var.get()) if var is not None else False
+
+    def background_degree(self) -> int | None:
+        """Resolve the current background fit degree, or None when disabled.
+
+        Uses ``getattr`` so headless/mock states without the background widgets
+        default to disabled (never mis-read as enabled by an auto-attribute).
+        """
+        var = getattr(self, "background_enabled_var", None)
+        if var is None or not var.get():
+            return None
+        degree_var = getattr(self, "background_degree_var", None)
+        if degree_var is None:
+            return BACKGROUND_DEFAULT_DEGREE
+        try:
+            degree = int(degree_var.get())
+        except (ValueError, TypeError):
+            return BACKGROUND_DEFAULT_DEGREE
+        return degree if degree in BACKGROUND_DEGREE_OPTIONS else BACKGROUND_DEFAULT_DEGREE
+
+    def _background_degree_selected(self) -> int:
+        """The background degree the user *selected*, even when disabled.
+
+        ``background_degree()`` returns ``None`` when the switch is off; undo
+        snapshots must instead remember the degree chosen in that disabled state
+        (not collapse it to the placeholder default), so re-enabling applies the
+        remembered degree.  Falls back to the default only on a truly invalid /
+        missing selection.
+        """
+        degree_var = getattr(self, "background_degree_var", None)
+        if degree_var is None:
+            return BACKGROUND_DEFAULT_DEGREE
+        try:
+            degree = int(degree_var.get())
+        except (ValueError, TypeError):
+            return BACKGROUND_DEFAULT_DEGREE
+        return degree if degree in BACKGROUND_DEGREE_OPTIONS else BACKGROUND_DEFAULT_DEGREE
+
     def update_gaussian_kernel_preview(self) -> None:
         sigma_scale = self.gaussian_sigma_scale()
         sigma_text = "1.00（标准）" if math.isclose(sigma_scale, 1.0, abs_tol=0.005) else f"{sigma_scale:.2f}"
@@ -4425,6 +4817,9 @@ class LERLWRApp(AppBase):
 
     def preprocessing_description(self) -> str:
         parts = []
+        if self.background_enabled():
+            # 只有真正应用时才声明；关闭状态下只保留候选阶数，不冒充已启用。
+            parts.append(f"背景校正（{self._background_degree_selected()} 阶）")
         if self.normalize_var.get():
             parts.append("归一化")
         if self.gaussian_denoise_var.get():
@@ -4451,6 +4846,70 @@ class LERLWRApp(AppBase):
         self.rebuild_working_images()
         self.draw_image()
         self.result_var.set("处理方式已切换；请重新开始分析。")
+        self.status_var.set(f"当前使用：{self.preprocessing_description()}")
+
+    def _background_config_resolved(self) -> tuple[bool, int]:
+        """Resolve the *current* background switch + degree the user has selected.
+
+        开关关闭时仍返回用户上次在这个关闭状态下选定的 degree（而非丢弃成
+        占位 degree），这样再次打开开关时会应用记住的阶数；关闭状态下调整
+        预览阶数只改变这个候选，不会把现有测量伪装成另一背景的产物。
+        """
+        enabled = self.background_enabled()
+        degree = self._background_degree_selected()
+        return enabled, degree
+
+    def background_config_changed(self, _event: object = None) -> None:
+        """背景开关 / 阶数切换：清全部缓存结果但保留几何样本，支持撤销。
+
+        与 normalize/blur 的 ``refresh_image_preprocessing`` 不同——那条路径清空
+        几何样本；背景校正只改变平滑/归一化之前的低阶可加背景拟合，切换背景
+        必须真正保留 ``EraLineSample`` 的几何、样本 ID、左右 ROI、参考亮带、
+        位置定义、overall export crop 以及周期参考关系，只清 edge/paired/error/
+        聚合/LCDU/BCP/FFT 缓存并重建 ``processed_image``。切换背景前先记录撤销，
+        且记录的是*改变前*的实际配置（``_background_last_applied``），不是刚写入
+        的新 flag。
+        """
+        if self.raw_image is None:
+            self.update_gaussian_kernel_preview()
+            return
+        new_config = self._background_config_resolved()
+        previous_enabled, previous_degree = self._background_last_applied
+        new_enabled, new_degree = new_config
+        # 实际应用的处理只有在“开关状态改变”，或“开启且阶数改变”时才变化。
+        # 关闭状态下仅改动候选 degree 不改变 processed_image（background_degree()
+        # 在 off 时返回 None），因此必须既不清结果、也不记录撤销，否则会把现有
+        # 测量伪装成另一个背景的产物。此时只记住新的候选阶数即可。
+        applied_changed = (new_enabled != previous_enabled) or (new_enabled and new_degree != previous_degree)
+        if not applied_changed:
+            self._background_last_applied = new_config  # 记住 off 状态下的候选阶数
+            self.update_gaussian_kernel_preview()
+            return
+        # 用改变前的配置做撤销快照：短暂把控件置回旧值，快照后再还原控件，
+        # 使 record_undo_state 捕获的是旧配置而非刚写入的新 flag。
+        saved_enabled = self.background_enabled_var.get()
+        saved_degree = self.background_degree_var.get()
+        self.background_enabled_var.set(previous_enabled)
+        self.background_degree_var.set(str(previous_degree))
+        try:
+            self.record_undo_state()
+        finally:
+            self.background_enabled_var.set(saved_enabled)
+            self.background_degree_var.set(saved_degree)
+        # 提交改变后的配置。
+        self._background_last_applied = new_config
+        self.update_gaussian_kernel_preview()
+        # 保留几何样本，只清全部缓存结果。
+        self.invalidate_era_results()
+        self.result = None
+        self.analysis_origin = None
+        self.bcp_result = None
+        self.clear_fft_analysis(clear_roi=True)
+        self.clear_bcp_completion_selection(redraw=False)
+        self.clear_auto_line_candidates(redraw=False)
+        self.rebuild_working_images()
+        self.draw_image()
+        self.result_var.set("背景校正已切换；线样本几何保留，请重新测量。")
         self.status_var.set(f"当前使用：{self.preprocessing_description()}")
 
     def refresh_bcp_contrast(self) -> None:
@@ -5551,7 +6010,8 @@ class LERLWRApp(AppBase):
         """Hide stale ERA traces whenever its editable sample set changes."""
         self.era_aggregate_result = None
         self.era_lcdu_cd_samples_nm.clear()
-        self.era_line_samples = [replace(sample, left_edge=None, right_edge=None, paired_result=None, measurement_error=None)
+        self.era_line_samples = [replace(sample, left_edge=None, right_edge=None, paired_result=None,
+                                         measurement_error=None, left_diagnostics=None, right_diagnostics=None)
                                  for sample in self.era_line_samples]
         self.result = None
         self.analysis_origin = None
@@ -6163,7 +6623,6 @@ class LERLWRApp(AppBase):
             self.clear_detected_edges(redraw=False)
             self.bcp_result = None
             self.clear_bcp_completion_selection(redraw=False)
-            self.update_edge_kernel_preview()
             self.refresh_era_sample_list()
             self.result_var.set(f"已生成 {len(samples)} 根线的左右框。\n请检查、调整样本，选择边缘定位方法，再点击底部统一计算。")
             self.status_var.set(f"自动找线完成：{len(samples)} 根；重复识别会刷新样本，Command+Z 可撤销。")
@@ -6204,27 +6663,20 @@ class LERLWRApp(AppBase):
                 if self.auto_line_mode_var.get() != AUTO_MODE_SOLID or sample.line_polarity != ("bright" if self.auto_line_polarity_var.get() == AUTO_LINE_BRIGHT else "dark"):
                     self.invalidate_era_results()
                     raise ValueError("线条形貌或亮暗已变化；请重新生成左右框。")
-        method = self.edge_detector_var.get()
-        degree = self.era_polynomial_degree() if method == EDGE_DETECTOR_ERA else 0
-        diagonal, axial, kernel_size, high, ratio = 3.0, 10.0, 3, 0.125, 2.5
-        if method not in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF):
-            _, diagonal, axial, kernel_size, high, ratio = self.edge_detector_parameters()
-        response_fraction = 0.12
-        if method == EDGE_DETECTOR_SCHARR and hasattr(self, "line_gradient_threshold_var"):
-            response_fraction = float(self.line_gradient_threshold_var.get())
-            if not math.isfinite(response_fraction) or not 0 <= response_fraction <= 1:
-                raise ValueError("Scharr 相对阈值须为 0–1 的有限数值。")
+        method = LINE_LOCALIZATION_UNIFIED
+        degree = self.era_polynomial_degree()
         complete_results = []
         measured_samples = []
         self.invalidate_era_results()
         for original in self.era_line_samples:
             sample = replace(original, left_edge=None, right_edge=None, paired_result=None, measurement_error=None)
             measured_samples.append(sample)
-            try:
-                for side in ("left", "right"):
-                    bounds = getattr(sample, f"{side}_roi_bounds_px")
-                    if bounds is None:
-                        continue
+            side_errors: list[str] = []
+            for side in ("left", "right"):
+                bounds = getattr(sample, f"{side}_roi_bounds_px")
+                if bounds is None:
+                    continue
+                try:
                     if sample.edge_profile_kind == "bright_band":
                         reference = getattr(sample, f"{side}_reference_band_px")
                         if reference is None:
@@ -6234,42 +6686,41 @@ class LERLWRApp(AppBase):
                             self.processed_image, bounds, pixel_size, method,
                             bright_band=True, definition=getattr(sample, f"{side}_position_definition"),
                             max_jump=self.outlier_threshold_px(), reference_band=reference, degree=degree,
-                            diagonal=diagonal, axial=axial, kernel_size=kernel_size, high=high, ratio=ratio,
-                            response_threshold_fraction=response_fraction,
-                            continuity=self.edge_use_vertical_continuity_filter_var.get() if hasattr(self, "edge_use_vertical_continuity_filter_var") else False,
                         )
-                        setattr(sample, f"{side}_edge", edge)
-                        continue
-                    polarity = self.era_polarity_var.get()
-                    if sample.line_polarity is not None:
-                        rising = (sample.line_polarity == "bright") == (side == "left")
-                        polarity = ERA_POLARITY_RISING if rising else ERA_POLARITY_FALLING
-                    row_mask = automatic_era_row_mask(self.processed_image, bounds, polarity) if sample.selection_source != "manual" else None
-                    edge = analyze_sample_edge(
-                        self.processed_image, bounds, pixel_size, method, degree=degree, polarity=polarity,
-                        max_jump=self.outlier_threshold_px(), row_mask=row_mask,
-                        diagonal=diagonal, axial=axial, kernel_size=kernel_size, high=high, ratio=ratio,
-                        response_threshold_fraction=response_fraction,
-                        continuity=self.edge_use_vertical_continuity_filter_var.get() if hasattr(self, "edge_use_vertical_continuity_filter_var") else False,
-                    )
+                    else:
+                        polarity = self.era_polarity_var.get()
+                        if sample.line_polarity is not None:
+                            rising = (sample.line_polarity == "bright") == (side == "left")
+                            polarity = ERA_POLARITY_RISING if rising else ERA_POLARITY_FALLING
+                        row_mask = automatic_era_row_mask(self.processed_image, bounds, polarity) if sample.selection_source != "manual" else None
+                        edge = analyze_sample_edge(
+                            self.processed_image, bounds, pixel_size, method, degree=degree, polarity=polarity,
+                            max_jump=self.outlier_threshold_px(), row_mask=row_mask,
+                        )
                     setattr(sample, f"{side}_edge", edge)
-                if sample.left_edge is not None and sample.right_edge is not None:
-                    sample.paired_result = pair_single_edges(sample.left_edge, sample.right_edge, pixel_size)
-                    sample.paired_result.localization_method = method
-                    sample.paired_result.localization_threshold_fraction = response_fraction
-                    sample.paired_result.localization_continuity_filter = (
-                        self.edge_use_vertical_continuity_filter_var.get() if hasattr(self, "edge_use_vertical_continuity_filter_var") else False)
-                    if method not in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF):
-                        sample.paired_result.edge_kernel_size = kernel_size
-                        sample.paired_result.edge_diagonal_weight = diagonal
-                        sample.paired_result.edge_axial_weight = axial
-                        sample.paired_result.canny_high_threshold = high
-                        sample.paired_result.canny_threshold_ratio = ratio
-                        sample.paired_result.canny_low_threshold = high / ratio
-                    complete_results.append(sample.paired_result)
-            except ValueError as exc:
-                sample.left_edge = sample.right_edge = None
-                sample.measurement_error = str(exc)
+                except ValueError as exc:
+                    side_errors.append(f"{'左' if side == 'left' else '右'}边：{exc}")
+                    # Keep the full per-row diagnostic record for a failed side so it
+                    # remains queryable (primary/recovered/missing) even though the side
+                    # never contributes to pooled statistics.  Early input errors carry no
+                    # diagnostic record and are silently left None.
+                    if isinstance(exc, LocalizationFailure) and exc.diagnostics is not None:
+                        setattr(sample, f"{side}_diagnostics", exc.diagnostics)
+            if sample.left_edge is not None and sample.right_edge is not None:
+                # Both sides localized on their own, but pairing can still fail (e.g. the
+                # two ROIs' valid rows do not overlap vertically, or right <= left).  That
+                # is THIS sample's failure only: keep both sides' diagnostics, never
+                # fabricate points/zeros to force a pair, and keep analysing the rest.
+                try:
+                    paired = pair_single_edges(sample.left_edge, sample.right_edge, pixel_size)
+                except ValueError as exc:
+                    side_errors.append(f"左右配对：{exc}")
+                else:
+                    paired.localization_method = LINE_LOCALIZATION_UNIFIED
+                    sample.paired_result = paired
+                    complete_results.append(paired)
+            if sample.paired_result is None and side_errors:
+                sample.measurement_error = "；".join(side_errors)
         self.era_line_samples = measured_samples
         self.refresh_era_sample_list()
         if preview and any(s.left_edge is not None or s.right_edge is not None for s in measured_samples):
@@ -6314,7 +6765,7 @@ class LERLWRApp(AppBase):
         periodic_samples = [sample for sample in self.era_line_samples if sample.edge_profile_kind == "bright_band"]
         mode = "自动多线测量" if automatic_count else "线条测量"
         method = self.result.localization_method or self.edge_detector_var.get()
-        if method == EDGE_DETECTOR_ERA:
+        if not periodic_samples:
             method += f"，{self.era_polynomial_degree()} 次"
         failed_count = sum(sample.measurement_error is not None for sample in self.era_line_samples)
         lines = [
@@ -6443,70 +6894,16 @@ class LERLWRApp(AppBase):
 
     def run_analysis(self) -> None:
         try:
-            detector, diagonal, axial, kernel_size, high_threshold, threshold_ratio = self.edge_detector_parameters()
             started_at = time.perf_counter()
-            if self.era_line_samples or detector in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF):
-                self.run_era_analysis()
-                self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
-                self.bcp_result = None
-                self.clear_bcp_completion_selection(redraw=False)
-                self.draw_image()
-                if any(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples):
-                    self.status_var.set("线条测量完成；已保留槽/平台及左右取点定义。")
-                else:
-                    self.status_var.set("线条测量完成；左右边仅按样本内已确认的 ROI 配对。")
-                return
-            analysis_image, left_offset, top_offset, uses_roi = self.selected_ler_lwr_region()
-            region_name = "ROI 内" if uses_roi else "整图"
-            if detector == EDGE_DETECTOR_LAPLACIAN:
-                pixel_size = float(self.pixel_size_var.get())
-                self.clear_auto_line_candidates(redraw=False)
-                self.result = analyze_roi(
-                    analysis_image,
-                    pixel_size,
-                    self.outlier_threshold_px(),
-                    detector,
-                    diagonal,
-                    axial,
-                    high_threshold,
-                    threshold_ratio,
-                    kernel_size=kernel_size,
-                )
-                self.analysis_origin = (left_offset, top_offset)
-            else:
-                self.result = None
-                self.analysis_origin = None
-                self.clear_detected_edges(redraw=False)
-                self.detected_edge_mask = detect_full_image_edges(
-                    analysis_image,
-                    detector,
-                    diagonal,
-                    axial,
-                    high_threshold,
-                    threshold_ratio,
-                    self.edge_use_vertical_continuity_filter_var.get(),
-                    kernel_size=kernel_size,
-                )
-                self.detected_edge_origin = (left_offset, top_offset)
-                edge_count = int(np.count_nonzero(self.detected_edge_mask))
-                if edge_count == 0:
-                    raise ValueError("未识别到边缘；可调整检测器参数或图像处理设置。")
-                continuity_note = "已启用局部连续性筛除。" if self.edge_use_vertical_continuity_filter_var.get() else "未启用局部连续性筛除。"
-                self.result_var.set(
-                    f"{region_name}边缘识别：{edge_count} 个边缘像素\n"
-                    f"{continuity_note}\n\n"
-                    "当前只显示检测到的边缘，未配对为线条，\n"
-                    "因此尚未计算 CD、LER 或 LWR。"
-                )
-                self.status_var.set(f"{region_name}边缘识别完成：已显示 {edge_count} 个边缘像素；{continuity_note}")
+            self.run_era_analysis()
             self.recognition_duration_var.set(f"识别耗时：{time.perf_counter() - started_at:.2f} 秒")
             self.bcp_result = None
             self.clear_bcp_completion_selection(redraw=False)
-            self.hide_roi_after_successful_analysis()
             self.draw_image()
-            if detector == EDGE_DETECTOR_LAPLACIAN:
-                self.update_result_text()
-                self.status_var.set(f"拉普拉斯{region_name}分析完成。可调整 σ 倍数，或导出轨迹和结果。")
+            if any(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples):
+                self.status_var.set("线条测量完成；已保留槽/平台及左右取点定义。")
+            else:
+                self.status_var.set("线条测量完成；左右边仅按样本内已确认的 ROI 配对。")
         except ValueError as exc:
             messagebox.showwarning("无法分析", str(exc))
 
@@ -6526,10 +6923,10 @@ class LERLWRApp(AppBase):
         window.protocol("WM_DELETE_WINDOW", self.close_ler_lwr_dialog)
         footer = ttk.Frame(window, padding=12)
         footer.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Label(footer, text="4. 统一计算", font=("Helvetica", 12, "bold")).pack(anchor="w")
         actions = ttk.Frame(footer)
         actions.pack(fill=tk.X, pady=(6, 0))
-        ttk.Button(actions, text="统一计算 CD / LER / LWR / LCDU / Pitch", command=self.run_analysis).pack(side=tk.LEFT)
+        ttk.Button(actions, text="预览轨迹", command=self.preview_line_trajectories).pack(side=tk.LEFT)
+        ttk.Button(actions, text="计算", command=self.run_analysis).pack(side=tk.LEFT, padx=8)
         ttk.Label(footer, textvariable=self.recognition_duration_var).pack(anchor="w", pady=(5, 0))
         self.ler_lwr_dialog_scroll = VerticalScrollFrame(window, padding=14)
         self.ler_lwr_dialog_scroll.pack(fill=tk.BOTH, expand=True)
@@ -6586,7 +6983,7 @@ class LERLWRApp(AppBase):
         show_mode()
         mode_trace = self.auto_line_mode_var.trace_add("write", show_mode)
         periodic.bind("<Destroy>", lambda event: self.auto_line_mode_var.trace_remove("write", mode_trace) if event.widget == periodic else None)
-        ttk.Button(scope, text="生成左右框（保留所选定位方法）", command=self.recognize_era_lines).pack(anchor="w", pady=(8, 0))
+        ttk.Button(scope, text="生成左右框", command=self.recognize_era_lines).pack(anchor="w", pady=(8, 0))
 
         samples = ttk.LabelFrame(content, text="2. 线条样本与左右边缘", padding=10)
         samples.pack(fill=tk.X, pady=10)
@@ -6609,24 +7006,21 @@ class LERLWRApp(AppBase):
         ttk.Checkbutton(samples, text="已核对相邻同类线之间无漏线（允许计算 Pitch）",
                         variable=self.pitch_confirm_var, command=self.confirm_line_pitch_adjacency).pack(anchor="w", pady=4)
 
-        method_frame = ttk.LabelFrame(content, text="3. 边缘定位方法", padding=10)
+        method_frame = ttk.LabelFrame(content, text="3. 精定位", padding=10)
         method_frame.pack(fill=tk.X)
-        box = ttk.Combobox(method_frame, textvariable=self.edge_detector_var, state="readonly",
-                          values=(EDGE_DETECTOR_ERA, EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY,
-                                  EDGE_DETECTOR_HALF, EDGE_DETECTOR_LAPLACIAN), width=26)
-        box.pack(anchor="w")
-        box.bind("<<ComboboxSelected>>", self.change_edge_detector)
-        parameters = ttk.Frame(method_frame)
-        parameters.pack(fill=tk.X, pady=8)
-        era = ttk.Frame(parameters)
-        row = ttk.Frame(era)
+        row = ttk.Frame(method_frame)
         row.pack(anchor="w")
         ttk.Label(row, text="拟合阶数：").pack(side=tk.LEFT)
         ttk.Combobox(row, textvariable=self.era_polynomial_degree_var, values=("2", "3", "4"), state="readonly", width=4).pack(side=tk.LEFT)
-        polarity = ttk.Frame(parameters)
-        ttk.Label(polarity, text="手动过渡方向：").pack(side=tk.LEFT)
-        ttk.Combobox(polarity, textvariable=self.era_polarity_var, values=ERA_POLARITIES, state="readonly", width=19).pack(side=tk.LEFT)
-        band_positions = ttk.Frame(parameters)
+        ttk.Label(method_frame, text="实体亮/暗线按所选阶数拟合半高；周期槽/平台用亮带两侧局部基线半高。",
+                  foreground="#666666", wraplength=490).pack(anchor="w", pady=4)
+        polarity_row = ttk.Frame(method_frame)
+        polarity_row.pack(anchor="w", pady=3)
+        ttk.Label(polarity_row, text="手动过渡方向：").pack(side=tk.LEFT)
+        ttk.Combobox(polarity_row, textvariable=self.era_polarity_var, values=ERA_POLARITIES, state="readonly", width=19).pack(side=tk.LEFT)
+        ttk.Label(method_frame, text="自动识别样本按线条亮暗自动判定方向；手动样本使用上方方向。",
+                  foreground="#666666", wraplength=490).pack(anchor="w", pady=2)
+        band_positions = ttk.Frame(method_frame)
         for label, variable in (("左亮带取点：", self.periodic_left_position_var), ("右亮带取点：", self.periodic_right_position_var)):
             row = ttk.Frame(band_positions)
             row.pack(anchor="w", pady=3)
@@ -6635,68 +7029,15 @@ class LERLWRApp(AppBase):
             box.pack(side=tk.LEFT)
             box.bind("<<ComboboxSelected>>", self.line_position_changed)
         ttk.Label(band_positions, text="左右按图像 x 方向；中心为两侧位置的中点。", foreground="#666666").pack(anchor="w")
-        convolution = ttk.Frame(parameters)
-        row = ttk.Frame(convolution)
-        row.pack(anchor="w")
-        ttk.Label(row, text="核尺寸：").pack(side=tk.LEFT)
-        box = ttk.Combobox(row, textvariable=self.edge_kernel_size_var, values=tuple(f"{s} × {s}" for s in FIRST_ORDER_KERNEL_SIZES), state="readonly", width=8)
-        box.pack(side=tk.LEFT)
-        box.bind("<<ComboboxSelected>>", self.change_edge_kernel_size)
-        weights = ttk.Frame(parameters)
-        for label, variable in (("斜向权重：", self.edge_diagonal_weight_var), ("轴向权重：", self.edge_axial_weight_var)):
-            ttk.Label(weights, text=label).pack(side=tk.LEFT)
-            entry = ttk.Entry(weights, textvariable=variable, width=6)
-            entry.pack(side=tk.LEFT, padx=(0, 10))
-            entry.bind("<FocusOut>", self.update_edge_kernel_preview)
-            entry.bind("<Return>", self.update_edge_kernel_preview)
-        scharr_threshold = ttk.Frame(parameters)
-        ttk.Label(scharr_threshold, text="Scharr 响应阈值（相对框内 P75）：").pack(side=tk.LEFT)
-        ttk.Entry(scharr_threshold, textvariable=self.line_gradient_threshold_var, width=7).pack(side=tk.LEFT)
-        canny = ttk.Frame(parameters)
-        for label, variable in (("高阈值 highTh：", self.canny_high_threshold_var), ("高低阈值比 Rio：", self.canny_threshold_ratio_var)):
-            row = ttk.Frame(canny)
-            row.pack(anchor="w", pady=3)
-            ttk.Label(row, text=label).pack(side=tk.LEFT)
-            entry = ttk.Entry(row, textvariable=variable, width=8)
-            entry.pack(side=tk.LEFT)
-            entry.bind("<FocusOut>", lambda _event: self.update_canny_thresholds())
-            entry.bind("<Return>", lambda _event: self.update_canny_thresholds())
-        noise = ttk.Frame(parameters)
-        ttk.Checkbutton(noise, text="去除孤立短噪声（41 × 3 px 邻域，至少 24 点）",
-                        variable=self.edge_use_vertical_continuity_filter_var).pack(anchor="w")
-        ttk.Button(method_frame, text="预览框内左右轨迹", command=self.preview_line_trajectories).pack(anchor="w", pady=4)
-        advanced = ttk.Frame(method_frame)
-        def toggle_advanced():
-            if advanced.winfo_manager():
-                advanced.pack_forget()
-            else:
-                advanced.pack(fill=tk.X, pady=6)
-        ttk.Button(method_frame, text="高级：核矩阵 / 算法说明 ▸", command=toggle_advanced).pack(anchor="w")
-        ttk.Label(advanced, textvariable=self.edge_kernel_preview_var, font=("Menlo", 9), justify=tk.LEFT).pack(anchor="w")
 
-        def show_method(*_args):
-            method = self.edge_detector_var.get()
-            for frame in (era, polarity, band_positions, convolution, weights, canny, noise, scharr_threshold):
-                frame.pack_forget()
-            if method == EDGE_DETECTOR_ERA:
-                era.pack(anchor="w", pady=3)
-            if method != EDGE_DETECTOR_HALF:
-                polarity.pack(anchor="w", pady=3)
+        def show_band_positions(*_args):
             if self.auto_line_mode_var.get() == AUTO_MODE_PERIODIC or any(s.edge_profile_kind == "bright_band" for s in self.era_line_samples):
                 band_positions.pack(fill=tk.X, pady=3)
-            if method in (EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY):
-                convolution.pack(anchor="w", pady=3)
-                noise.pack(anchor="w", pady=3)
-            if method in (EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY, EDGE_DETECTOR_LAPLACIAN):
-                weights.pack(anchor="w", pady=3)
-            if method == EDGE_DETECTOR_CANNY:
-                canny.pack(anchor="w", pady=3)
-            if method == EDGE_DETECTOR_SCHARR:
-                scharr_threshold.pack(anchor="w", pady=3)
-        show_method()
-        traces = [(var, var.trace_add("write", show_method)) for var in (self.edge_detector_var, self.auto_line_mode_var)]
-        parameters.bind("<Destroy>", lambda event: [var.trace_remove("write", token) for var, token in traces] if event.widget == parameters else None)
-        self.update_edge_kernel_preview()
+            else:
+                band_positions.pack_forget()
+        show_band_positions()
+        band_trace = self.auto_line_mode_var.trace_add("write", show_band_positions)
+        band_positions.bind("<Destroy>", lambda event: self.auto_line_mode_var.trace_remove("write", band_trace) if event.widget == band_positions else None)
 
     def keep_ler_lwr_dialog_above_main(self, _event: tk.Event | None = None) -> None:
         """Keep the non-modal measurement controls visible while the main canvas has focus."""
@@ -6726,99 +7067,6 @@ class LERLWRApp(AppBase):
         self.active_annotation_index = None
         self.status_var.set("LER/LWR ROI 框选已启用：请在主图像上拖动选择识别区域。")
         self.canvas.configure(cursor="crosshair")
-
-    def change_edge_detector(self, _event: tk.Event | None = None) -> None:
-        defaults = {
-            EDGE_DETECTOR_SCHARR: ("3", "10"),
-            EDGE_DETECTOR_CANNY: ("1", "2"),
-            EDGE_DETECTOR_LAPLACIAN: ("0", "1"),
-            EDGE_DETECTOR_ERA: ("0", "1"),
-            EDGE_DETECTOR_HALF: ("0", "1"),
-        }
-        diagonal, axial = defaults[self.edge_detector_var.get()]
-        self.edge_diagonal_weight_var.set(diagonal)
-        self.edge_axial_weight_var.set(axial)
-        self.update_edge_kernel_preview()
-        self.result = None
-        self.analysis_origin = None
-        self.clear_auto_line_candidates(redraw=False)
-        self.draw_image()
-
-    def edge_kernel_size(self) -> int:
-        return int(self.edge_kernel_size_var.get().split()[0])
-
-    def change_edge_kernel_size(self, _event: tk.Event | None = None) -> None:
-        self.update_edge_kernel_preview()
-        self.result = None
-        self.analysis_origin = None
-        self.clear_auto_line_candidates(redraw=False)
-        self.draw_image()
-
-    def update_canny_thresholds(self) -> None:
-        try:
-            high = float(self.canny_high_threshold_var.get())
-            ratio = float(self.canny_threshold_ratio_var.get())
-            if not math.isfinite(high + ratio) or not 0 < high <= 1 or ratio <= 1:
-                raise ValueError
-        except (ValueError, tk.TclError):
-            self.canny_low_threshold_text_var.set("无效")
-            self.edge_kernel_preview_var.set("Canny 参数须满足 0 < highTh ≤ 1，Rio > 1。")
-            return
-        low = high / ratio
-        self.canny_high_threshold_text_var.set(f"{high:.3f}")
-        self.canny_threshold_ratio_text_var.set(f"{ratio:.2f}")
-        self.canny_low_threshold_text_var.set(f"{low:.3f}")
-        self.update_edge_kernel_preview()
-
-    def edge_detector_parameters(self) -> tuple[str, float, float, int, float, float]:
-        method = self.edge_detector_var.get()
-        if method in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF):
-            return method, 0.0, 1.0, 3, 0.125, 2.5
-        try:
-            diagonal = float(self.edge_diagonal_weight_var.get())
-            axial = float(self.edge_axial_weight_var.get())
-            high = float(self.canny_high_threshold_var.get()) if method == EDGE_DETECTOR_CANNY else 0.125
-            ratio = float(self.canny_threshold_ratio_var.get()) if method == EDGE_DETECTOR_CANNY else 2.5
-        except (ValueError, tk.TclError) as exc:
-            raise ValueError("边缘检测权重、Canny highTh 和 Rio 必须为数字。") from exc
-        if not all(math.isfinite(v) for v in (diagonal, axial, high, ratio)) or diagonal < 0 or axial <= 0:
-            raise ValueError("卷积核权重必须满足：斜向权重 ≥ 0，轴向权重 > 0。")
-        kernel_size = self.edge_kernel_size() if method in (EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY) else 3
-        if kernel_size not in FIRST_ORDER_KERNEL_SIZES:
-            raise ValueError("一阶卷积核尺寸无效。")
-        if not 0 < high <= 1 or ratio <= 1:
-            raise ValueError("Canny 参数必须满足：0 < highTh ≤ 1，Rio > 1。")
-        return self.edge_detector_var.get(), diagonal, axial, kernel_size, high, ratio
-
-    def update_edge_kernel_preview(self, _event: tk.Event | None = None) -> None:
-        try:
-            detector, diagonal, axial, kernel_size, high, ratio = self.edge_detector_parameters()
-        except ValueError:
-            self.edge_kernel_preview_var.set("请输入有效的卷积核权重与 Canny 阈值。")
-            return
-        if detector == EDGE_DETECTOR_LAPLACIAN:
-            center = -4 * axial - 4 * diagonal
-            rows = ((diagonal, axial, diagonal), (axial, center, axial), (diagonal, axial, diagonal))
-            self.edge_kernel_preview_var.set("拉普拉斯核\n" + "\n".join("  ".join(f"{value:g}" for value in row) for row in rows))
-            return
-        if detector == EDGE_DETECTOR_ERA:
-            self.edge_kernel_preview_var.set(
-                "ERA 单边拟合\n"
-                "不使用 Scharr/Sobel/Laplacian 卷积核，也不执行额外空间滤波。\n"
-                "每行在用户框选的单边 ROI 内：导数重心 → 多项式拟合 → 0.5 交点。"
-            )
-            return
-        if detector == EDGE_DETECTOR_HALF:
-            self.edge_kernel_preview_var.set("亮带两侧各用局部暗基线的半高交点；线性插值。\n中心为左右半高交点的算术平均，不使用多项式或额外滤波。")
-            return
-        kernel_x, kernel_y = first_order_kernels(detector, diagonal, axial, kernel_size)
-        label = "Scharr" if detector == EDGE_DETECTOR_SCHARR else "Canny 的 Sobel"
-        format_kernel = lambda kernel: "\n".join("  ".join(f"{value:g}" for value in row) for row in kernel)
-        threshold_note = f"\nhighTh / Rio / lowTh：{high:.3f} / {ratio:.2f} / {high / ratio:.3f}" if detector == EDGE_DETECTOR_CANNY else ""
-        self.edge_kernel_preview_var.set(
-            f"{label} {kernel_size}×{kernel_size} Gx\n{format_kernel(kernel_x)}\nGy\n{format_kernel(kernel_y)}"
-            f"{threshold_note}\nROI / 整图识别：无角度限制；短噪声筛除可选"
-        )
 
     def build_lcdu_controls(self, parent: tk.Misc) -> None:
         ttk.Label(parent, textvariable=self.lcdu_summary_var, justify=tk.LEFT).pack(anchor="w", fill=tk.X)
@@ -7820,7 +8068,7 @@ class LERLWRApp(AppBase):
             f"有效点数  {len(result.rows_px)}\n"
             f"剔除点数  {result.rejected_rows}\n"
             f"剔除阈值  {self.outlier_threshold_px():.0f} px\n"
-            f"边缘检测  {result.edge_detector}（{result.edge_kernel_size}×{result.edge_kernel_size}）"
+            f"定位方法  {result.localization_method or result.edge_detector}"
         )
 
     def update_bcp_result_text(self) -> None:
@@ -7930,7 +8178,567 @@ class LERLWRApp(AppBase):
             self.blur_method_var.get(), self.gaussian_kernel_size_var.get(), self.gaussian_sigma_scale_var.get(),
             self.outlier_level_var.get(),
         )
-        return RepeatScanMeasurement(self.image_path.resolve(), self.raw_image, settings, self.analysis_origin[1], lines, methods)
+        # 打开时刻固化实际处理/标定元数据：双图页据此对 A/B 匹配，不再从 live 控件取。
+        pixel_size = self.measurement_pixel_size()
+        return RepeatScanMeasurement(
+            self.image_path.resolve(), self.raw_image, settings, self.analysis_origin[1], lines, methods,
+            preprocessing_signature=self.psd_preprocessing_signature(),
+            noise_context=self.psd_noise_context(),
+            calibration_nm=pixel_size if pixel_size is not None else float("nan"),
+        )
+
+    def psd_noise_context(self) -> str:
+        """实际 PSD 模型噪声上下文：只反映真正使用的图像平滑状态，绝不硬设 white。
+
+        均值/高斯平滑都会压低高频密度，均记为 smoothed；未启用平滑时无法先验判定
+        噪声相关性，记为 unknown。白噪声仅当显式存在可靠平谱证据时才可由模型结果给出，
+        本入口绝不代为声明。背景校正算法尚未接入（后续批次），此处理签名只做可扩展占位。
+        """
+        return psd_noise_context_from(
+            self.gaussian_denoise_var.get(), self.blur_method_var.get(),
+        )
+
+    def psd_preprocessing_signature(self) -> str:
+        """可扩展的处理签名（当前：平滑 + 归一化；背景按当前实际设置记录）。"""
+        return psd_preprocessing_signature_from(
+            self.normalize_var.get(),
+            self.gaussian_denoise_var.get(),
+            self.blur_method_var.get(),
+            self.gaussian_kernel_size(),
+            self.gaussian_sigma_scale(),
+            self.background_degree(),
+        )
+
+    def profile_review_images(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (uncorrected, candidate-corrected) processed images.
+
+        未校正路由 ``background_degree=None`` 现算；候选校正路由 raw + 选定阶数
+        （即使开关关闭也独立构造）现算，二者共用同一套归一化/平滑配置。候选校正
+        只用于对照显示，绝不应用到 ``self.processed_image``、不修改主窗口任何状态、
+        不写 undo。开关关闭时候选校正不再等于未校正图本身，从而真正预览“若启用
+        背景校正”的效果。
+        """
+        uncorrected = preprocess_image(
+            self.raw_image,
+            self.normalize_var.get(),
+            self.gaussian_denoise_var.get(),
+            self.gaussian_kernel_size(),
+            self.gaussian_sigma_scale(),
+            self.blur_method_var.get(),
+            background_degree=None,
+        )
+        candidate_degree = self._background_degree_selected()
+        corrected = preprocess_image(
+            self.raw_image,
+            self.normalize_var.get(),
+            self.gaussian_denoise_var.get(),
+            self.gaussian_kernel_size(),
+            self.gaussian_sigma_scale(),
+            self.blur_method_var.get(),
+            background_degree=candidate_degree,
+        )
+        return uncorrected, corrected
+
+    def profile_review_active_route_label(self) -> str:
+        """当前实际用于测量的那一路（取决于背景开关是否真正应用）。"""
+        return "背景校正后" if self.background_enabled() else "未背景校正"
+
+    def profile_review_edge_marker(
+        self,
+        row: int,
+        image: np.ndarray,
+        samples: object | None = None,
+        pixel_size: float | None = None,
+    ) -> tuple[float | None, str]:
+        """Locate the edge position actually used for measurement on one scanline.
+
+        按样本 index/side 选择，只在其 ROI 覆盖的全局行范围内求定位；无样本时看
+        全图 row。两路（未校正/候选校正）都各自求位置与原因，不伪造假点。只读，
+        绝不改动主窗口状态。``samples``/``pixel_size`` 缺省取当前主窗口值（供旧
+        调用链），冻结窗口调用方须显式传入冻结点快照与标定。
+        """
+        if samples is None:
+            samples = self.era_line_samples
+        if pixel_size is None:
+            pixel_size = self.measurement_pixel_size()
+        return profile_review_marker_for_row(
+            row, image, list(samples), pixel_size,
+            polarity=self.era_polarity_var.get(),
+            polynomial_degree=self.era_polynomial_degree(),
+            max_jump_px=self.outlier_threshold_px(),
+        )
+
+    def _profile_review_context(self) -> ProfileReviewContext:
+        """Capture the frozen review context at window-open time (never re-read live)."""
+        pixel_size = self.measurement_pixel_size()
+        return ProfileReviewContext(
+            source_label=str(self.image_path) if self.image_path else "",
+            image=self.raw_image.copy() if self.raw_image is not None else None,
+            samples=profile_review_sample_snapshots(self.era_line_samples),
+            pixel_size_nm=pixel_size,
+            polarity=self.era_polarity_var.get(),
+            polynomial_degree=self.era_polynomial_degree(),
+            max_jump_px=self.outlier_threshold_px(),
+            background_enabled=self.background_enabled(),
+            background_degree=self._background_degree_selected(),
+            normalize_enabled=bool(self.normalize_var.get()),
+            denoise_enabled=bool(self.gaussian_denoise_var.get()),
+            kernel_size=self.gaussian_kernel_size(),
+            sigma_scale=self.gaussian_sigma_scale(),
+            blur_method=self.blur_method_var.get(),
+        )
+
+    def open_profile_review_window(
+        self,
+        preset_sample_index: int | None = None,
+        preset_side: str | None = None,
+        preset_row: int | None = None,
+        context: ProfileReviewContext | None = None,
+    ) -> None:
+        """独立可滚动的「灰度 / 灰度差对照」窗口（非 transient，跨显示器可用）。
+
+        打开瞬间捕获不可变 ``ProfileReviewContext``：复制图像、按样本序号冻结
+        ROI 几何/样本 id/参考亮带/取点定义/来源，固化标定、极性、多项式阶、异常
+        门槛与背景开关/阶数。此后主窗口载入 B 图、改背景开关/阶数/极性/标定/异常
+        门槛，本窗口的标签、边位置、数据与来源都保持不变（只读该冻结点快照），
+        窗口内图片引用存各自 dialog 局部列表，绝不多个窗口共享同一主窗口列表。
+
+        两张全尺寸图：一张「灰度叠加图」（上半未校正、下半校正），一张「差值叠加
+        图」（两路 ΔI = I[x+1]-I[x]，差值 x 轴在 x+0.5 全局面像素）；各自分别显示
+        未校正与校正两路的真实定位标记。本窗口只读，绝不改原图/开关/样本/结果/undo。
+
+        ``context``：诊断窗回调传入的开窗时刻冻结上下文。提供时完全只用该上下文
+        （不再读 live ``self.raw_image``/``self.processed_image``），从而主图切 B/清空
+        后从旧诊断窗点「对照」仍呈现原 A 图、原参数、原样本与所选行；不提供时按
+        历史行为在开窗时刻现场捕获一次。
+        """
+        if context is None:
+            if self.raw_image is None or self.processed_image is None:
+                messagebox.showinfo("暂无图像", "请先打开一张 SEM 图像。")
+                return
+            context = self._profile_review_context()
+        if context.image is None:
+            messagebox.showinfo("暂无图像", "请先打开一张 SEM 图像。")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("灰度 / 灰度差对照")
+        dialog.transient()
+        dialog.minsize(760, 560)
+        dialog.geometry(f"860x{min(760, max(560, self.winfo_screenheight() - 120))}")
+
+        root = ttk.Frame(dialog, padding=12)
+        root.pack(fill=tk.BOTH, expand=True)
+
+        # 顶部说明 + 行选择 + 来源/参数/当前测量路说明。
+        source = context.source_label or "（未命名）"
+        ttk.Label(
+            root,
+            text=(
+                "灰度/灰度差对照（打开时快照，主窗口后续改动不影响此窗）。"
+                f"来源：{source}　标定：{('1 px（未标定，仅供看灰度）' if context.pixel_size_nm is None else f'{context.pixel_size_nm:.6g} nm/px')}",
+            ),
+            foreground="#666666",
+            wraplength=820,
+        ).pack(anchor="w")
+
+        control_row = ttk.Frame(root)
+        control_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(control_row, text="扫描行（工作图全局 px）").pack(side=tk.LEFT)
+        row_var = tk.StringVar(dialog, value="0")
+        row_entry = ttk.Entry(control_row, textvariable=row_var, width=8)
+        row_entry.pack(side=tk.LEFT, padx=(6, 4))
+
+        # 样本侧别下拉：有样本时可按样本/左/右边选行；否则看全图某扫描行。
+        # 结构化目标：每个下拉项对应 (0-based 样本位置, side) 的不变身份，绝不
+        # 用 top 行反查（多个 ROI 同 top 不同 bottom 会错）。下拉 label 的「样本 N」
+        # 用 N = 位置 + 1（1-based 展示），定位目标始终用 0-based 位置。
+        sample_values: list[str] = []
+        # sample_targets[i] == (0-based positional index into context.samples, side)
+        sample_targets: list[tuple[int, str]] = []
+        sample_spans: list[tuple[int, int]] = []
+        for position, snapshot in enumerate(context.samples):
+            for side in ("left", "right"):
+                span = profile_review_sample_row_span(snapshot, side)
+                if span is not None:
+                    top, bottom = span
+                    label = f"样本 {snapshot.index} {('左' if side == 'left' else '右')}边（行 {top}…{bottom - 1}）"
+                    sample_values.append(label)
+                    sample_targets.append((position, side))
+                    sample_spans.append((top, bottom))
+        sample_selector = None
+        if sample_values:
+            sample_selector = ttk.Combobox(control_row, values=sample_values, state="readonly", width=36)
+            sample_selector.pack(side=tk.LEFT, padx=(4, 0))
+
+        dynamic_config = {
+            "row_var": row_var, "sample_selector": sample_selector,
+            "sample_targets": sample_targets, "sample_spans": sample_spans,
+        }
+
+        # 每窗口独立图片引用列表；永不写入主窗口共享属性。
+        photos: list[ImageTk.PhotoImage] = []
+
+        # 可滚动内容区（两轴）。
+        scroll = VerticalScrollFrame(root, padding=8)
+        scroll.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        content = scroll.content
+
+        # 当前选中目标（0-based 位置, side）；由 apply 流程更新，refresh 据此定位该侧。
+        selection = {"sample": None, "side": None}
+
+        def _refresh_for(row: int, sample: int | None, side: str | None) -> None:
+            self._refresh_profile_review_content(
+                dialog, content, photos, context, row,
+                selected_sample=sample, selected_side=side,
+            )
+
+        def apply_row() -> None:
+            try:
+                row = int(row_var.get())
+            except ValueError:
+                messagebox.showwarning("行号无效", "请输入整数扫描行号。", parent=dialog)
+                return
+            height = context.image.shape[0]
+            if not (0 <= row < height):
+                messagebox.showwarning("行号越界", f"扫描行须在 0..{height - 1} 之间。", parent=dialog)
+                return
+            selected_sample = selection["sample"]
+            selected_side = selection["side"]
+            # 若选中样本侧别，行须落在该侧 ROI 真实行范围（用结构化目标的 span，
+            # 不是按 top 反查）内。
+            if selected_sample is not None and selected_side is not None:
+                span = profile_review_sample_row_span(
+                    context.samples[selected_sample], selected_side,
+                )
+                if span is not None:
+                    span_top, span_bottom = span
+                    if not (span_top <= row < span_bottom):
+                        messagebox.showwarning(
+                            "行号越界",
+                            f"该样本边的行范围是 {span_top}..{span_bottom - 1}，请选范围内行。",
+                            parent=dialog,
+                        )
+                        return
+            _refresh_for(row, selected_sample, selected_side)
+
+        row_entry.bind("<Return>", lambda _e: apply_row())
+        ttk.Button(control_row, text="查看", command=apply_row).pack(side=tk.LEFT, padx=(0, 12))
+
+        if sample_selector is not None:
+            def apply_sample(_event=None) -> None:
+                index = sample_selector.current()
+                if index < 0 or index >= len(sample_targets):
+                    return
+                sample, side = sample_targets[index]
+                selection["sample"] = sample
+                selection["side"] = side
+                span_top, span_bottom = sample_spans[index]
+                row_var.set(str(span_top))
+                _refresh_for(span_top, sample, side)
+
+            sample_selector.bind("<<ComboboxSelected>>", apply_sample)
+
+        # 当前实际用于测量的那一路与候选对照路由，均取自冻结快照。
+        active_text = "背景校正后" if context.background_enabled else "未背景校正"
+        candidate_text = "背景校正后" if context.background_degree is not None or context.background_enabled else "未背景校正"
+        build_text = context.background_enabled
+        ttk.Label(
+            control_row,
+            text=f"当前实际用于测量：{active_text}（候选对照：{candidate_text}）",
+            foreground="#0a7d3c",
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        _ = build_text  # 候选对照图总是用选定阶数构造，开关只决定“当前实际用于测量”标签。
+
+        self._refresh_profile_review_content(dialog, content, photos, context, 0)
+
+        # Optional preset from the diagnostics review callback: select the sample/side
+        # dropdown (if present) and jump to the requested global row, using the
+        # structured (0-based sample position, side) target directly — no Chinese
+        # "左/右" label substring matching against English "left/right".
+        preset_resolved_row = None
+        if preset_sample_index is not None and preset_side is not None and sample_selector is not None:
+            for idx, (sample, side) in enumerate(sample_targets):
+                if sample == preset_sample_index and side == preset_side:
+                    sample_selector.current(idx)
+                    selection["sample"] = sample
+                    selection["side"] = side
+                    if preset_row is not None:
+                        preset_resolved_row = int(preset_row)
+                    else:
+                        preset_resolved_row = sample_spans[idx][0]
+                    break
+            else:
+                # 目标样本/侧别未命中（例如该侧未拟合无 ROI）：显式提示，不误弹 0 行。
+                if preset_row is not None:
+                    preset_resolved_row = int(preset_row)
+        # 先按最终目标行呈现（选定目标 + 实际行），绝不先在无关 0 行上弹错误提示。
+        if preset_sample_index is not None and preset_side is not None and sample_selector is not None:
+            row_var.set(str(preset_resolved_row if preset_resolved_row is not None else 0))
+            _refresh_for(
+                preset_resolved_row if preset_resolved_row is not None else 0,
+                selection["sample"], selection["side"],
+            )
+        elif preset_row is not None:
+            row_var.set(str(int(preset_row)))
+            apply_row()
+
+    def _refresh_profile_review_content(
+        self, dialog, content, photos, context: ProfileReviewContext, row: int,
+        selected_sample: int | None = None,
+        selected_side: str | None = None,
+    ) -> None:
+        """只用冻结 ``context`` 重绘对照内容；绝不读 live 主窗口状态或共享图片列表。
+
+        ``selected_sample``/``selected_side`` 是 (0-based 样本位置, side) 的结构化
+        选中目标，缺省时保持历史“首条命中”行为。
+        """
+        height = context.image.shape[0]
+        row = min(max(0, row), height - 1)
+        for child in content.winfo_children():
+            child.destroy()
+        # 只清本窗口传入的图片引用列表（dialog 局部 list），绝不触碰宿主全局/其他窗口列表。
+        photos.clear()
+
+        # 独立构造两路图像（候选校正即使开关 off 也用选定 degree 构造，不触碰宿主状态）。
+        uncorrected, corrected = self._review_context_images(context)
+
+        raw_profile = profile_scanline_intensity(uncorrected, row)
+        corrected_profile = profile_scanline_intensity(corrected, row)
+
+        # 两路都求真实位置标记与原因（不能只画校正后一条，失败要说明原因不画假点）。
+        raw_marker, raw_note = profile_review_marker_for_row(
+            row, uncorrected, list(context.samples), context.pixel_size_nm,
+            polarity=context.polarity, polynomial_degree=context.polynomial_degree,
+            max_jump_px=context.max_jump_px,
+            selected_sample=selected_sample, selected_side=selected_side,
+        )
+        corrected_marker, corrected_note = profile_review_marker_for_row(
+            row, corrected, list(context.samples), context.pixel_size_nm,
+            polarity=context.polarity, polynomial_degree=context.polynomial_degree,
+            max_jump_px=context.max_jump_px,
+            selected_sample=selected_sample, selected_side=selected_side,
+        )
+
+        active_text = "背景校正后" if context.background_enabled else "未背景校正"
+
+        header = ttk.Frame(content)
+        header.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(
+            header,
+            text=f"扫描行 {row}　当前实际用于测量：{active_text}",
+        ).pack(anchor="w")
+        raw_note_text = raw_note if raw_note else "无"
+        corr_note_text = corrected_note if corrected_note else "无"
+        ttk.Label(
+            header,
+            text=f"未校正路定位：{raw_note_text}　|　背景校正路定位：{corr_note_text}",
+            foreground="#444444",
+        ).pack(anchor="w")
+
+        # 灰度叠加图：上半未校正、下半校正，各自带定位标记（颜色区分）。
+        intensity_chart = profile_review_chart_rgb(
+            raw_profile, corrected_profile,
+            title="灰度叠加（上：未校正　下：背景校正）",
+            size=(760, 340),
+            markers=[(raw_marker, "#7fd4ff"), (corrected_marker, "#ffb45e")],
+        )
+        difference_chart = profile_difference_chart_rgb(
+            raw_profile, corrected_profile,
+            title="灰度差 ΔI = I[x+1] - I[x]（x 轴 x + 0.5，工作图全局 px）",
+            size=(760, 340),
+            markers=[(raw_marker, "#7fd4ff"), (corrected_marker, "#ffb45e")],
+        )
+
+        # 两路整图小缩略图（复制的显示副本，不改变原 array / 测量结果）。
+        thumbs = ttk.Frame(content)
+        thumbs.pack(anchor="w", pady=(6, 0))
+        route_specs = (
+            ("未校正", uncorrected, not context.background_enabled),
+            ("候选背景校正", corrected, context.background_enabled),
+        )
+        for route_title, route_image, is_active in route_specs:
+            cell = ttk.Frame(thumbs)
+            cell.pack(side=tk.LEFT, padx=(0, 12), anchor="n")
+            tag = "［active route：当前测量］" if is_active else "［对照］"
+            thumb_image = Image.fromarray(route_image).convert("RGB")
+            thumb_image.thumbnail((220, 220))
+            thumb_photo = ImageTk.PhotoImage(thumb_image)
+            photos.append(thumb_photo)
+            ttk.Label(
+                cell,
+                text=f"{route_title}{tag}",
+                foreground="#0a7d3c" if is_active else "#666666",
+            ).pack(anchor="w")
+            ttk.Label(cell, image=thumb_photo).pack(anchor="w")
+
+        for title_text, chart in (("灰度叠加图", intensity_chart), ("差值叠加图", difference_chart)):
+            chart_photo = ImageTk.PhotoImage(Image.fromarray(chart))
+            photos.append(chart_photo)
+            ttk.Label(content, text=title_text).pack(anchor="w", pady=(6, 0))
+            ttk.Label(content, image=chart_photo).pack(anchor="w")
+
+    def _review_context_images(self, context: ProfileReviewContext) -> tuple[np.ndarray, np.ndarray]:
+        """从冻结上下文里独立构造两路处理图（候选校正用冻结的选定阶数）。"""
+        if context.background_degree is not None:
+            # 只用开窗时刻固化的归一化/平滑配置（绝不读 live self.*），阶数也用冻结值
+            # （off 也构造候选）；宿主后续改参数不会改写本窗口的任何一路。
+            uncorrected = preprocess_image(
+                context.image,
+                context.normalize_enabled,
+                context.denoise_enabled,
+                context.kernel_size,
+                context.sigma_scale,
+                context.blur_method,
+                background_degree=None,
+            )
+            corrected = preprocess_image(
+                context.image,
+                context.normalize_enabled,
+                context.denoise_enabled,
+                context.kernel_size,
+                context.sigma_scale,
+                context.blur_method,
+                background_degree=context.background_degree,
+            )
+        else:
+            uncorrected = context.image
+            corrected = context.image
+        return uncorrected, corrected
+    def _sample_side_diagnostics(self, sample: EraLineSample, side: str) -> object | None:
+        """Resolve one side's localization diagnostics from its stored record.
+
+        Prefer the failed-side diagnostic captured by ``run_era_analysis``; fall back
+        to a successful edge's embedded ``diagnostics``.  Returns None when the side
+        has no per-row record (never fitted).
+        """
+        diag = getattr(sample, f"{side}_diagnostics", None)
+        if diag is not None:
+            return diag
+        edge = getattr(sample, f"{side}_edge", None)
+        if edge is not None and edge.diagnostics is not None:
+            return edge.diagnostics
+        return None
+
+    def line_diagnostics_source_info(self) -> dict:
+        """Freeze the real source/preprocessing/calibration/rotation metadata now.
+
+        Called once when the diagnostic window opens; the window and its CSV read only
+        these frozen strings, so later main-image changes never rewrite report A.
+        """
+        path = self.image_path if self.image_path is not None else None
+        processed = self.processed_image
+        size = ""
+        if processed is not None:
+            size = f"{int(processed.shape[1])}x{int(processed.shape[0])}"
+        try:
+            preprocessing = self.psd_preprocessing_signature()
+        except Exception:  # 控件缺失时不伪造签名
+            preprocessing = ""
+        try:
+            noise_context = self.psd_noise_context()
+        except Exception:
+            noise_context = ""
+        pixel_size = ""
+        try:
+            pixel_size = f"{float(self.pixel_size_var.get()):g} nm/px"
+        except Exception:
+            pixel_size = ""
+        smoothing = ""
+        try:
+            smoothing = (
+                f"smooth={'on' if self.gaussian_denoise_var.get() else 'off'}; "
+                f"method={self.blur_method_var.get()}; kernel={self.gaussian_kernel_size()}; "
+                f"sigma={self.gaussian_sigma_scale():g}; normalize={'on' if self.normalize_var.get() else 'off'}"
+            )
+        except Exception:
+            smoothing = ""
+        calibration_parts = [part for part in (pixel_size, f"显示倍数 {getattr(self, 'display_scale', 1.0):g}") if part]
+        rotation = f"{getattr(self, 'rotation_degrees', 0.0):g}°"
+        return {
+            "source_path": str(path) if path is not None else "",
+            "source_name": path.name if path is not None else DEFAULT_SOURCE_LABEL,
+            "source_id": f"{path.resolve() if path is not None else ''}",
+            "source_identity": id(self.processed_image) if self.processed_image is not None else None,
+            "preprocessing": preprocessing,
+            "calibration": "; ".join(calibration_parts),
+            "rotation": rotation,
+            "image_size": size,
+            "processing": smoothing,
+            "method": LINE_LOCALIZATION_UNIFIED,
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "noise_context": noise_context,
+        }
+
+    def is_same_live_source(self, capture: dict) -> bool:
+        """True only while the main view still shows the SAME processed image object.
+
+        A, B are processed arrays; a new load/reprocessing replaces the object.  The
+        path is compared too so re-processing the same file is also treated as change.
+        """
+        if self.processed_image is None:
+            return False
+        identity = capture.get("source_identity")
+        if identity is not None and id(self.processed_image) != identity:
+            return False
+        frozen_path = capture.get("source_path") or ""
+        live_path = str(self.image_path) if self.image_path is not None else ""
+        return live_path == frozen_path
+
+    def open_line_diagnostics_window(self) -> None:
+        """独立只读「逐行定位诊断」窗口（非 transient，跨显示器可用）。
+
+        打开瞬间捕获不可变来源快照（当前处理后图像 + 样本拷贝 + 真实来源/处理/
+        标定/旋转字段）。此后主图 A 切到 B：旧窗口只读快照，选行时先验证 live 仍是
+        同一图/同处理，变更则不平移 B、只给简短提示。绝不改 ROI/采样/统计/undo。
+        """
+        if self.processed_image is None:
+            messagebox.showinfo("暂无图像", "请先打开一张 SEM 图像。")
+            return
+        info = self.line_diagnostics_source_info()
+        live = SimpleNamespace(is_same_live_source=self.is_same_live_source)
+        snapshot = SourceSnapshot(
+            image=self.processed_image.copy(),
+            samples=tuple(replace(sample) for sample in self.era_line_samples),
+            live=live,
+            **{key: info[key] for key in (
+                "source_path", "source_name", "source_id", "source_identity",
+                "preprocessing", "calibration", "rotation", "image_size",
+                "processing", "method", "captured_at", "noise_context",
+            )},
+        )
+        # Freeze the profile-review context ONCE at diagnostic-window open time, so a
+        # later review click still shows original image A (raw + params + samples), even
+        # after the main view loaded B or was cleared.
+        frozen_review_context = self._profile_review_context()
+
+        def draw_helper(image: np.ndarray, global_row: int, bounds) -> np.ndarray:
+            left, top, right, bottom = bounds
+            if not (top <= global_row < bottom) or not (0 <= global_row < image.shape[0]):
+                return np.array([], dtype=float)
+            return image[global_row, left:right].astype(float)
+
+        def on_focus(left: int, top: int, right: int, bottom: int) -> None:
+            # Safe read-only jump: recenter the main canvas on the requested region only.
+            self.restore_view_center(((left + right) / 2.0, (top + bottom) / 2.0))
+
+        def on_review(sample_index: int, side: str, global_row: int | None) -> None:
+            # Open the frozen profile-review window and preset it to this sample/side row.
+            # Pass the ProfileReviewContext captured at diagnostic-window open so the
+            # review window reads ONLY that frozen A snapshot — never live B after the
+            # main image has been switched/cleared, and never rebuilds rawA from
+            # processedA.
+            self.open_profile_review_window(
+                preset_sample_index=sample_index, preset_side=side,
+                preset_row=global_row, context=frozen_review_context,
+            )
+
+        return build_line_diagnostics_ui(
+            self, source_snapshot=snapshot, draw_helper=draw_helper, on_focus=on_focus,
+            live_getter=lambda: live,
+            scroll_factory=VerticalScrollFrame,
+            on_review=on_review,
+        )
 
     def open_roughness_psd(self, fitted_image: Path | None = None) -> None:
         measurements = self.roughness_measurements()
@@ -7941,6 +8749,21 @@ class LERLWRApp(AppBase):
         source = str(self.image_path) if self.image_path else ""
         repeat_reference = self.repeat_scan_measurement(measurements)
         pixel_size = next(iter(measurements.values()))[0].pixel_size_nm
+        # 打开时刻捕获不可变上下文：后续主窗口载入 B 图或改平滑不得改写 A 的来源。
+        first_result = next(iter(measurements.values()))[0] if measurements else None
+        window_context = PsdWindowContext(
+            source_path=source,
+            fitted_image_path=str(fitted_image) if fitted_image else "",
+            preprocessing_signature=self.psd_preprocessing_signature(),
+            noise_context=self.psd_noise_context(),
+            pixel_size_nm=pixel_size,
+            localization_signature=(
+                line_localization_signature(first_result) if first_result is not None else ()
+            ),
+            line_localization_rows=tuple(
+                psd_line_localization_rows(first_result, self.era_line_samples)
+            ),
+        )
         metrics = {
             "左边缘 LER": ("left_residual_nm", "ler_left"),
             "右边缘 LER": ("right_residual_nm", "ler_right"),
@@ -7948,16 +8771,22 @@ class LERLWRApp(AppBase):
         }
         dialog = tk.Toplevel(self)
         dialog.title("粗糙度 PSD")
-        dialog.minsize(660, 500)
-        dialog.geometry(f"690x{min(650, max(500, self.winfo_screenheight() - 100))}")
+        dialog.minsize(720, 560)
+        dialog.geometry(f"760x{min(700, max(540, self.winfo_screenheight() - 100))}")
         tabs = ttk.Notebook(dialog)
         tabs.pack(fill=tk.BOTH, expand=True)
-        content = ttk.Frame(tabs, padding=16)
-        tabs.add(content, text="单图 PSD")
+
         label_path = fitted_image or self.image_path
+        source_label = ""
         if label_path is not None:
             prefix = "对应拟合图" if fitted_image else "源图"
-            ttk.Label(content, text=f"{prefix}　{label_path.name}", wraplength=620).pack(anchor="w")
+            source_label = f"{prefix}　{label_path.name}"
+
+        # ---- Tab 1: 测得 PSD (measured spectrum, kept from original) ----
+        content = ttk.Frame(tabs, padding=16)
+        tabs.add(content, text="测得 PSD")
+        if source_label:
+            ttk.Label(content, text=source_label, wraplength=680).pack(anchor="w")
 
         choices = ttk.Frame(content)
         choices.pack(anchor="w", pady=(8, 0))
@@ -7973,27 +8802,35 @@ class LERLWRApp(AppBase):
         ttk.Label(band_controls, text="尺度分界（nm，可留空）").pack(side=tk.LEFT, padx=(0, 6))
         cutoff_entry = ttk.Entry(band_controls, width=9)
         cutoff_entry.pack(side=tk.LEFT, padx=(0, 6))
-        chart = ttk.Label(content)
-        chart.pack(anchor="w", pady=(10, 0))
-        summary = ttk.Label(content, wraplength=620, justify=tk.LEFT)
-        summary.pack(anchor="w", pady=(8, 0))
+        measured_chart = ttk.Label(content)
+        measured_chart.pack(anchor="w", pady=(10, 0))
+        measured_summary = ttk.Label(content, wraplength=680, justify=tk.LEFT)
+        measured_summary.pack(anchor="w", pady=(8, 0))
         ttk.Label(
             content, text="频段 RMS 来自加窗频谱。分界用于比较尺度，频谱含测量噪声。",
-            wraplength=620,
+            wraplength=680,
         ).pack(anchor="w", pady=(5, 0))
 
-        def render(_event: object = None) -> tuple[RoughnessSpectrum, float | None] | None:
-            selected = measurements[line_var.get()]
-            attribute, metric_code = metrics[metric_var.get()]
-            traces = [(result.rows_px, getattr(result, attribute)) for result in selected]
+        current_measured_spectrum: dict = {}
+
+        def build_traces(selection_name: str) -> list[tuple[np.ndarray, np.ndarray]]:
+            selected = measurements[selection_name]
+            attribute, _ = metrics[metric_var.get()]
+            return [(result.rows_px, getattr(result, attribute)) for result in selected]
+
+        def render_measured(_event: object = None) -> RoughnessSpectrum | None:
+            traces = build_traces(line_var.get())
             try:
                 spectrum = roughness_spectrum(traces, pixel_size)
             except ValueError as exc:
-                chart.configure(image="")
-                chart.image = None
-                summary.configure(text=str(exc))
+                measured_chart.configure(image="")
+                measured_chart.image = None
+                measured_summary.configure(text=str(exc))
                 return None
-
+            current_measured_spectrum["spectrum"] = spectrum
+            current_measured_spectrum["traces"] = traces
+            current_measured_spectrum["line"] = line_var.get()
+            current_measured_spectrum["metric"] = metric_var.get()
             frequencies = spectrum.frequency_per_nm
             scale_text = cutoff_entry.get().strip()
             cutoff = None
@@ -8012,27 +8849,24 @@ class LERLWRApp(AppBase):
             floor = max(float(power.max()) * 1e-12, np.finfo(float).tiny)
             plot = fft_line_chart_rgb(
                 frequencies, ((np.log10(np.maximum(power, floor)), "", "#66d7ea"),),
-                title=metric_code.upper(), x_label="cycles/nm", y_label="log10 PSD",
-                size=(620, 285), full_range=True, marker_x=cutoff,
+                title=metrics[metric_var.get()][1].upper(), x_label="cycles/nm", y_label="log10 PSD",
+                size=(680, 300), full_range=True, marker_x=cutoff,
             )
-            chart.image = ImageTk.PhotoImage(Image.fromarray(plot), master=dialog)
-            chart.configure(image=chart.image)
+            measured_chart.image = ImageTk.PhotoImage(Image.fromarray(plot), master=dialog)
+            measured_chart.configure(image=measured_chart.image)
             total_rms = math.sqrt(float(power.sum()) * spectrum.frequency_step_per_nm)
-            summary.configure(text="\n".join(filter(None, (
+            measured_summary.configure(text="\n".join(filter(None, (
                 f"频谱总 RMS {total_rms:.3g} nm　PSD 单位 nm³　频率分辨率 {spectrum.frequency_step_per_nm:.4g} cycles/nm",
-                f"覆盖 {spectrum.contributing_lines}/{len(selected)} 根线、{spectrum.covered_rows}/{spectrum.total_rows} 个有效行点"
+                f"覆盖 {spectrum.contributing_lines}/{len(measurements[line_var.get()])} 根线、{spectrum.covered_rows}/{spectrum.total_rows} 个有效行点"
                 f"　每窗 {spectrum.segment_rows} 行，共 {spectrum.window_count} 个 Hann 窗",
                 band_note,
             ))))
-            if scale_text and cutoff is None:
-                return None
-            return spectrum, cutoff
+            return spectrum
 
-        def export_psd() -> None:
-            displayed = render()
-            if displayed is None:
+        def export_measured_psd() -> None:
+            spectrum = render_measured()
+            if spectrum is None:
                 return
-            spectrum, cutoff = displayed
             _, metric_code = metrics[metric_var.get()]
             stem = label_path.stem if label_path else "sem"
             target = filedialog.asksaveasfilename(
@@ -8042,17 +8876,28 @@ class LERLWRApp(AppBase):
             )
             if not target:
                 return
+            cutoff = None
+            scale_text = cutoff_entry.get().strip()
+            if scale_text:
+                try:
+                    scale_nm = float(scale_text)
+                    if math.isfinite(scale_nm) and 1 / spectrum.frequency_per_nm[-1] < scale_nm < 1 / spectrum.frequency_per_nm[0]:
+                        cutoff = 1 / scale_nm
+                except ValueError:
+                    pass
             try:
                 with open(target, "w", newline="", encoding="utf-8-sig") as handle:
                     writer = csv.writer(handle)
                     writer.writerows([
-                        ("source", source), ("fitted_image", str(fitted_image) if fitted_image else ""),
+                        ("source", window_context.source_path), ("fitted_image", window_context.fitted_image_path),
                         ("line_selection", line_var.get()), ("metric", metric_code), ("pixel_size_nm", pixel_size),
+                        ("preprocessing_signature", window_context.preprocessing_signature),
                         ("method", "one_sided_hann_periodogram_average_weighted_mean_removed"),
                         ("segment_rows", spectrum.segment_rows), ("window_count", spectrum.window_count),
                         ("contributing_lines", spectrum.contributing_lines), ("covered_rows", spectrum.covered_rows),
                         ("total_rows", spectrum.total_rows), ("frequency_step_cycles_per_nm", spectrum.frequency_step_per_nm),
                     ])
+                    write_psd_localization_block(writer, window_context)
                     if cutoff is not None:
                         long_rms, short_rms = spectrum.band_rms_nm(cutoff)
                         writer.writerows([
@@ -8067,37 +8912,318 @@ class LERLWRApp(AppBase):
                 return
             self.status_var.set(f"已导出粗糙度 PSD：{target}")
 
-        line_selector.bind("<<ComboboxSelected>>", render)
-        metric_selector.bind("<<ComboboxSelected>>", render)
-        cutoff_entry.bind("<Return>", render)
-        ttk.Button(band_controls, text="应用分界", command=render).pack(side=tk.LEFT)
-        ttk.Button(band_controls, text="导出 PSD CSV", command=export_psd).pack(side=tk.LEFT, padx=(12, 0))
+        def refresh_measured_from_shared_var(_name: str, _index: str, _op: str = "") -> None:
+            """共享 line/metric StringVar 的写事件：任一页（含单图模型页）改选都刷新测得谱。
+
+            测得页与单图模型页共用同一对 StringVar；另一页的 Combobox 不会触发本页
+            控件的 <<ComboboxSelected>>，只听共享变量的 write 才能覆盖全部改选入口。
+            trace_add 回调实参为 (变量名, 空串, 'write')，故三参签名并忽略事件。
+            """
+            render_measured()
+
+        # 不再绑定自身两个 Combobox 的 <<ComboboxSelected>>：选中即写 StringVar，
+        # 重复绑定会算两次。导出按钮已显式重算，保持更快照语义。
+        line_var.trace_add("write", refresh_measured_from_shared_var)
+        metric_var.trace_add("write", refresh_measured_from_shared_var)
+        cutoff_entry.bind("<Return>", render_measured)
+        ttk.Button(band_controls, text="应用分界", command=render_measured).pack(side=tk.LEFT)
+        ttk.Button(band_controls, text="导出 PSD CSV", command=export_measured_psd).pack(side=tk.LEFT, padx=(12, 0))
+
+        # ---- Tab 2: 单图模型估计 (single-image PSD model) ----
+        model_tab = ttk.Frame(tabs, padding=16)
+        tabs.add(model_tab, text="单图模型估计")
+        self.build_single_psd_model_tab(
+            dialog, model_tab, measurements, metrics, pixel_size, source_label,
+            metric_var, line_var, fitted_image, window_context,
+        )
+
+        # ---- Tab 3: 双图差分对照 (repeat-scan model comparison) ----
         if repeat_reference is not None:
             repeat_tab = ttk.Frame(tabs)
-            tabs.add(repeat_tab, text="双图噪声校正")
+            tabs.add(repeat_tab, text="双图差分对照")
 
             def open_repeat_tab(_event: tk.Event) -> None:
                 if tabs.select() != str(repeat_tab) or repeat_tab.winfo_children():
                     return
-                self.build_repeat_scan_psd_tab(dialog, repeat_tab, repeat_reference, line_var.get(), metric_var.get())
+                self.build_repeat_scan_psd_tab(
+                    dialog, repeat_tab, repeat_reference, line_var.get(), metric_var.get(),
+                    window_context,
+                )
 
             tabs.bind("<<NotebookTabChanged>>", open_repeat_tab)
-        render()
+        # 首次渲染只调用一次（不以回调形式绑定 trace，避免重复计算）；导出按钮显式重算。
+        render_measured()
+
+    def build_single_psd_model_tab(
+        self, dialog: tk.Toplevel, content: ttk.Frame, measurements: dict,
+        metrics: dict, pixel_size: float, source_label: str,
+        trigger_metric_var: tk.StringVar, trigger_line_var: tk.StringVar,
+        fitted_image: Path | None,
+        window_context: PsdWindowContext,
+    ) -> None:
+        """单图 PSD 模型估计页：auto/Gaussian/Lorentzian，拟合与积分频段可显式指定。
+
+        corrected_rms 仅在可靠且方差为正时显示为正式值；不可靠时显示缺失原因，
+        候选值折叠到诊断区并明确标记为非可靠结果。
+        """
+        scroll = VerticalScrollFrame(content, padding=4)
+        scroll.pack(fill=tk.BOTH, expand=True)
+        frame = scroll.content
+        if source_label:
+            ttk.Label(frame, text=source_label, wraplength=680).pack(anchor="w")
+
+        sel = ttk.Frame(frame)
+        sel.pack(anchor="w", pady=(8, 0))
+        line_var = trigger_line_var
+        metric_var = trigger_metric_var
+        ttk.Label(sel, text="线号").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(sel, textvariable=line_var, values=tuple(measurements), state="readonly", width=16).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(sel, text="量").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(sel, textvariable=metric_var, values=tuple(metrics), state="readonly", width=14).pack(side=tk.LEFT)
+
+        model_controls = ttk.Frame(frame)
+        model_controls.pack(anchor="w", pady=(8, 0))
+        ttk.Label(model_controls, text="模型").pack(side=tk.LEFT, padx=(0, 4))
+        model_var = tk.StringVar(dialog, value="auto")
+        ttk.Combobox(model_controls, textvariable=model_var, values=("auto", "Gaussian", "Lorentzian"), state="readonly", width=12).pack(side=tk.LEFT)
+
+        band_frame = ttk.Frame(frame)
+        band_frame.pack(anchor="w", pady=(6, 0))
+        ttk.Label(band_frame, text="拟合 fmin/fmax 与积分 fmin/fmax（cycles/nm，可空自动）").pack(anchor="w")
+        entry_row = ttk.Frame(frame)
+        entry_row.pack(anchor="w", pady=(4, 0))
+        labels = ("拟合 fmin", "拟合 fmax", "积分 fmin", "积分 fmax")
+        entries: dict[str, ttk.Entry] = {}
+        entry_vars: dict[str, tk.StringVar] = {}
+        for text in labels:
+            box = ttk.Frame(entry_row)
+            box.pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Label(box, text=text).pack(side=tk.LEFT)
+            var = tk.StringVar(dialog)
+            entry_vars[text] = var
+            entry = ttk.Entry(box, textvariable=var, width=9)
+            entry.pack(side=tk.LEFT, padx=(3, 0))
+            entries[text] = entry
+
+        def parse_band(text: str, what: str) -> float | None:
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                value = float(text)
+            except ValueError:
+                raise ValueError(f"{what} 请输入数字（cycles/nm）或留空。")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{what} 必须是正数。")
+            return value
+
+        model_chart = ttk.Label(frame)
+        model_chart.pack(anchor="w", pady=(10, 0))
+        model_diag = ttk.Label(frame, wraplength=680, justify=tk.LEFT)
+        model_diag.pack(anchor="w", pady=(8, 0))
+
+        current_model_result: dict = {}
+
+        def invalidate_model(*_args: str) -> None:
+            """任何与结果相关设置的写变更都立即清空缓存与显示，避免旧结果混新标签。"""
+            current_model_result.clear()
+            model_chart.configure(image="")
+            model_chart.image = None
+            model_diag.configure(text="")
+
+        def model_settings_signature() -> tuple:
+            """当前控件状态快照，供导出前校验是否与成功拟合时一致。"""
+            return (
+                line_var.get(),
+                metric_var.get(),
+                model_var.get(),
+                entries["拟合 fmin"].get(),
+                entries["拟合 fmax"].get(),
+                entries["积分 fmin"].get(),
+                entries["积分 fmax"].get(),
+            )
+
+        def render_model(_event: object = None) -> None:
+            # 重算开始即清缓存与显示：失败的旧结果绝不保留，导出不会取到旧值。
+            invalidate_model()
+            try:
+                select_line = line_var.get()
+                attribute, metric_code = metrics[metric_var.get()]
+                traces = [(r.rows_px, getattr(r, attribute)) for r in measurements[select_line]]
+                spectrum = roughness_spectrum(traces, pixel_size)
+                fit_min = parse_band(entries["拟合 fmin"].get(), "拟合 fmin")
+                fit_max = parse_band(entries["拟合 fmax"].get(), "拟合 fmax")
+                int_min = parse_band(entries["积分 fmin"].get(), "积分 fmin")
+                int_max = parse_band(entries["积分 fmax"].get(), "积分 fmax")
+                result = fit_psd_model(
+                    spectrum, model=model_var.get(), fit_min=fit_min, fit_max=fit_max,
+                    integration_min=int_min, integration_max=int_max,
+                    noise_context=window_context.noise_context,
+                )
+            except ValueError as exc:
+                # 失败解析同样先清缓存（已在 invalidate_model 执行），仅显示错误。
+                model_diag.configure(text=str(exc))
+                return
+            current_model_result["result"] = result
+            current_model_result["metric_code"] = metric_code
+            current_model_result["line"] = select_line
+            current_model_result["spectrum"] = spectrum
+            # 快照当时请求的模型与频段约束，导出只用此快照，不回 live 控件取标签。
+            current_model_result["model_requested"] = model_var.get()
+            current_model_result["fit_min_requested"] = fit_min
+            current_model_result["fit_max_requested"] = fit_max
+            current_model_result["int_min_requested"] = int_min
+            current_model_result["int_max_requested"] = int_max
+            current_model_result["settings_signature"] = model_settings_signature()
+            frequencies = result.frequency_per_nm
+            floor = max(float(result.measured_density_nm3.max()) * 1e-12, np.finfo(float).tiny)
+            # 测得谱与结构谱用对数；符号校正谱用线性（可显负值，不截零伪装）。
+            magnitude_chart = fft_line_chart_rgb(
+                frequencies, (
+                    (np.log10(np.maximum(result.measured_density_nm3, floor)), "Measured", "#66d7ea"),
+                    (np.log10(np.maximum(result.total_fit_density_nm3, floor)), "Total fit", "#8ef0c0"),
+                    (np.log10(np.maximum(result.structure_density_nm3, floor)), "Structure", "#ffb45e"),
+                    (np.log10(np.maximum(result.noise_density_nm3, floor)), "Noise", "#ff7f9f"),
+                ),
+                title=f"{metric_code.upper()} 模型谱（对数）", x_label="cycles/nm", y_label="log10 PSD",
+                size=(680, 260), full_range=True,
+            )
+            signed_chart = fft_line_chart_rgb(
+                frequencies, (
+                    (result.corrected_density_nm3, "Signed corrected", "#c08bff"),
+                    (result.residual_density_nm3, "Residual", "#9a9a9a"),
+                ),
+                title="符号校正谱（线性，可显负值）", x_label="cycles/nm", y_label="PSD nm³",
+                size=(680, 200), full_range=True,
+            )
+            combined = Image.fromarray(np.vstack((magnitude_chart, signed_chart)))
+            model_chart.image = ImageTk.PhotoImage(combined, master=dialog)
+            model_chart.configure(image=model_chart.image)
+
+            status_cn = {"ok": "可靠", "unreliable": "不可靠", "unidentifiable": "结构/噪声不可分离", "error": "错误"}.get(result.status, result.status)
+            lines = [
+                f"状态：{status_cn}　模型：{result.model_name or '—'}　噪声上下文：{result.noise_context}",
+                f"参数 A（幅度，nm³）＝{result.amplitude_nm3:.4g}　B（谱形参数，nm）＝{result.corner_length_nm:.4g}　C（噪声底，nm³）＝{result.noise_floor_nm3:.4g}",
+                f"实际拟合频段 {result.fit_band_per_nm[0]:.4g}–{result.fit_band_per_nm[1]:.4g} cycles/nm　积分频段 {result.rms_band_per_nm[0]:.4g}–{result.rms_band_per_nm[1]:.4g} cycles/nm",
+                f"测得 RMS {result.measured_rms_nm:.4g} nm　结构 RMS {result.structure_rms_nm:.4g} nm　噪声 RMS {result.noise_rms_nm:.4g} nm　总拟合 RMS {result.total_fit_rms_nm:.4g} nm",
+                f"残差 SSE {result.selected_sse_nm6:.4g} nm⁶　白噪底 SSE {result.white_floor_sse_nm6:.4g} nm⁶　证据改善 {result.structure_evidence_improvement:.3g}",
+            ]
+            if result.reliable and result.corrected_rms_nm is not None:
+                lines.append(f"正式校正 RMS（频谱自由度）＝{result.corrected_rms_nm:.4g} nm")
+            else:
+                reason = "；".join(result.reliability_reasons) or "未给出"
+                lines.append(f"正式校正 RMS：缺失（不可靠）　原因：{reason}")
+            model_diag.configure(text="\n".join(lines))
+            self._model_dialog_folded = None
+            if result.candidate_corrected_rms_nm is not None:
+                model_diag.configure(text="\n".join(lines + [f"诊断（非可靠）：候选校正 RMS＝{result.candidate_corrected_rms_nm:.4g} nm，候选模型 {', '.join(sorted(result.candidates))}。"]))
+
+        def export_model_csv() -> None:
+            result = current_model_result.get("result")
+            if result is None:
+                messagebox.showinfo("尚未拟合", "请重新点击“应用模型拟合”得到与当前设置一致的结果。", parent=dialog)
+                return
+            # 导出前校验当前控件状态与成功拟合时完全一致，否则拒绝过期导出。
+            if current_model_result.get("settings_signature") != model_settings_signature():
+                messagebox.showinfo(
+                    "设置已变更", "检测到拟合参数或选择已改变，请重新点击“应用模型拟合”后再导出。", parent=dialog,
+                )
+                return
+            metric_code = current_model_result["metric_code"]
+            stem = psd_export_stem(window_context)
+            target = filedialog.asksaveasfilename(
+                parent=dialog, title="保存单图模型估计", defaultextension=".csv",
+                initialdir=str(fitted_image.parent) if fitted_image else None,
+                initialfile=f"{stem}_{metric_code}_psd_model.csv", filetypes=[("CSV 文件", "*.csv")],
+            )
+            if not target:
+                return
+            try:
+                model_requested = current_model_result["model_requested"]
+                with open(target, "w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerows([
+                        ("source", window_context.source_path),
+                        ("fitted_image", window_context.fitted_image_path),
+                        ("line", current_model_result["line"]), ("metric", metric_code),
+                        ("pixel_size_nm", pixel_size),
+                        ("preprocessing_signature", window_context.preprocessing_signature),
+                        ("noise_context", result.noise_context),
+                        ("model", result.model_name), ("model_requested", model_requested),
+                        ("model_constraints", PSD_MODEL_CONSTRAINTS),
+                        ("objective", PSD_MODEL_OBJECTIVE),
+                        ("fit_min_requested_cycles_per_nm", current_model_result["fit_min_requested"]),
+                        ("fit_max_requested_cycles_per_nm", current_model_result["fit_max_requested"]),
+                        ("integration_min_requested_cycles_per_nm", current_model_result["int_min_requested"]),
+                        ("integration_max_requested_cycles_per_nm", current_model_result["int_max_requested"]),
+                        ("status", result.status), ("reliable", int(result.reliable)),
+                        ("amplitude_nm3", result.amplitude_nm3),
+                        ("corner_length_B_nm", result.corner_length_nm),
+                        ("noise_floor_C_nm3", result.noise_floor_nm3),
+                        ("fit_band_min_cycles_per_nm", result.fit_band_per_nm[0]),
+                        ("fit_band_max_cycles_per_nm", result.fit_band_per_nm[1]),
+                        ("rms_band_min_cycles_per_nm", result.rms_band_per_nm[0]),
+                        ("rms_band_max_cycles_per_nm", result.rms_band_per_nm[1]),
+                        ("measured_rms_nm", result.measured_rms_nm),
+                        ("noise_rms_nm", result.noise_rms_nm),
+                        ("structure_rms_nm", result.structure_rms_nm),
+                        ("total_fit_rms_nm", result.total_fit_rms_nm),
+                        ("corrected_rms_nm", result.corrected_rms_nm),
+                        ("candidate_corrected_rms_nm", result.candidate_corrected_rms_nm),
+                        ("corrected_variance_nm2", result.corrected_variance_nm2),
+                        ("selected_sse_nm6", result.selected_sse_nm6),
+                        ("white_floor_sse_nm6", result.white_floor_sse_nm6),
+                        ("structure_evidence_improvement", result.structure_evidence_improvement),
+                        ("reliability_reasons", ";".join(result.reliability_reasons)),
+                        ("candidate_models", ",".join(sorted(result.candidates))),
+                    ])
+                    spectrum = current_model_result["spectrum"]
+                    writer.writerows([
+                        ("hann_window_rows", spectrum.segment_rows), ("window_count", spectrum.window_count),
+                        ("contributing_lines", spectrum.contributing_lines), ("covered_rows", spectrum.covered_rows),
+                        ("total_rows", spectrum.total_rows),
+                        ("frequency_step_cycles_per_nm", spectrum.frequency_step_per_nm),
+                    ])
+                    write_psd_localization_block(writer, window_context)
+                    writer.writerow([])
+                    writer.writerow(["frequency_cycles_per_nm", "measured_nm3", "total_fit_nm3", "structure_nm3", "noise_nm3", "signed_corrected_nm3", "residual_nm3"])
+                    writer.writerows(zip(
+                        result.frequency_per_nm, result.measured_density_nm3, result.total_fit_density_nm3,
+                        result.structure_density_nm3, result.noise_density_nm3, result.corrected_density_nm3,
+                        result.residual_density_nm3,
+                    ))
+            except OSError as exc:
+                messagebox.showerror("导出失败", str(exc), parent=dialog)
+                return
+            self.status_var.set(f"已导出单图模型估计：{target}")
+
+        for entry in entries.values():
+            entry.bind("<Return>", render_model)
+        # 任何选择或参数的写变更都清缓存与显示；定义顺序先建好 vars 再 trace，避免引用未定义变量。
+        for variable in (line_var, metric_var, model_var, *entry_vars.values()):
+            variable.trace_add("write", invalidate_model)
+        ttk.Button(model_controls, text="应用模型拟合", command=render_model).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(model_controls, text="导出模型 CSV", command=export_model_csv).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Label(
+            frame, text="B 仅是谱形参数（nm），不是物理相关长度 / 半高相关长度(HHCF)。测得 / 单图模型共用线号与 LER/LWR 选择。",
+            wraplength=680, foreground="#8a8a8a",
+        ).pack(anchor="w", pady=(6, 0))
 
     def build_repeat_scan_psd_tab(
         self, dialog: tk.Toplevel, tab: ttk.Frame,
         first: RepeatScanMeasurement, first_line: str, initial_metric: str,
+        window_context: PsdWindowContext,
     ) -> None:
         scroll = VerticalScrollFrame(tab, padding=16)
         scroll.pack(fill=tk.BOTH, expand=True)
         content = scroll.content
         second: RepeatScanMeasurement | None = None
-        ttk.Label(content, text=f"图 A　{first.source.name}", wraplength=620).pack(anchor="w")
+        ttk.Label(content, text=f"图 A　{first.source.name}", wraplength=680).pack(anchor="w")
         ttk.Label(
             content, text="保留此窗口。在主窗口打开并测量同一视野的第二次独立扫描，再载入为图 B。",
-            wraplength=620,
+            wraplength=680,
         ).pack(anchor="w", pady=(4, 4))
-        second_label = ttk.Label(content, text="图 B　待载入", wraplength=620)
+        second_label = ttk.Label(content, text="图 B　待载入", wraplength=680)
         second_label.pack(anchor="w")
         selectors = ttk.Frame(content)
         selectors.pack(anchor="w", pady=5)
@@ -8111,25 +9237,64 @@ class LERLWRApp(AppBase):
         metrics = {"左边缘 LER": "ler_left", "右边缘 LER": "ler_right", "线宽 LWR": "lwr"}
         metric = tk.StringVar(dialog, value=initial_metric)
         ttk.Combobox(selectors, textvariable=metric, values=tuple(metrics), state="readonly", width=14).pack(side=tk.LEFT, padx=(8, 0))
+
+        # model controls (shared with single-image model semantics)
+        model_controls = ttk.Frame(content)
+        model_controls.pack(anchor="w", pady=(6, 2))
+        ttk.Label(model_controls, text="模型").pack(side=tk.LEFT, padx=(0, 4))
+        model_var = tk.StringVar(dialog, value="auto")
+        ttk.Combobox(model_controls, textvariable=model_var, values=("auto", "Gaussian", "Lorentzian"), state="readonly", width=12).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(model_controls, text="拟合 fmin").pack(side=tk.LEFT, padx=(0, 2))
+        fit_min_var = tk.StringVar(dialog)
+        fit_min_entry = ttk.Entry(model_controls, textvariable=fit_min_var, width=8)
+        fit_min_entry.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(model_controls, text="fmax").pack(side=tk.LEFT, padx=(0, 2))
+        fit_max_var = tk.StringVar(dialog)
+        fit_max_entry = ttk.Entry(model_controls, textvariable=fit_max_var, width=8)
+        fit_max_entry.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(model_controls, text="积分 fmin").pack(side=tk.LEFT, padx=(0, 2))
+        int_min_var = tk.StringVar(dialog)
+        int_min_entry = ttk.Entry(model_controls, textvariable=int_min_var, width=8)
+        int_min_entry.pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(model_controls, text="fmax").pack(side=tk.LEFT, padx=(0, 2))
+        int_max_var = tk.StringVar(dialog)
+        int_max_entry = ttk.Entry(model_controls, textvariable=int_max_var, width=8)
+        int_max_entry.pack(side=tk.LEFT, padx=(0, 0))
+
         controls = ttk.Frame(content)
-        controls.pack(anchor="w", pady=(4, 2))
+        controls.pack(anchor="w", pady=(6, 2))
         ttk.Label(controls, text="B 沿线移到 A（px）").pack(side=tk.LEFT, padx=(0, 4))
         offset_var = tk.StringVar(dialog, value="0")
         offset_entry = ttk.Entry(controls, textvariable=offset_var, width=6)
         offset_entry.pack(side=tk.LEFT, padx=(0, 6))
-        ttk.Label(content, text="B 中同一特征在 A 的上方时填正数，例如 B 第 100 行对应 A 第 103 行，填 +3。", wraplength=620).pack(anchor="w")
-        summary = ttk.Label(content, text="载入图 B 后，请确认两次测量覆盖同一根线和同一段位置。", wraplength=620, justify=tk.LEFT)
+        ttk.Label(content, text="B 中同一特征在 A 的上方时填正数。", wraplength=680).pack(anchor="w")
+        summary = ttk.Label(content, text="载入图 B 后，请确认两次测量覆盖同一根线和同一段位置。", wraplength=680, justify=tk.LEFT)
         summary.pack(anchor="w", pady=5)
         comparison_view = ttk.Label(content)
         comparison_view.pack(anchor="w")
 
         def clear_charts(*_args: str) -> None:
+            current_comparison.clear()
             comparison_view.configure(image="")
             comparison_view.image = None
             summary.configure(text="请计算当前所选线条和行偏移。")
 
+        def parse_band(text: str, what: str) -> float | None:
+            text = text.strip()
+            if not text:
+                return None
+            try:
+                value = float(text)
+            except ValueError:
+                raise ValueError(f"{what} 请输入数字（cycles/nm）或留空。")
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{what} 必须是正数。")
+            return value
+
         def load_second() -> None:
             nonlocal second
+            second = None
+            clear_charts()
             candidate = self.repeat_scan_measurement(self.roughness_measurements())
             if candidate is None:
                 messagebox.showinfo("暂无图 B 测量", "请先在主窗口打开并完成第二张图的 LER / LWR 测量。", parent=dialog)
@@ -8140,13 +9305,23 @@ class LERLWRApp(AppBase):
             if first.settings != candidate.settings:
                 messagebox.showwarning("测量设置不同", "请用相同的图像旋转、预处理和异常点设置重新测量图 B。", parent=dialog)
                 return
+            # A/B 快照处理签名须一致（打开各自窗口时固化的真实处理元数据，非 live 控件）。
+            if first.preprocessing_signature != candidate.preprocessing_signature:
+                messagebox.showwarning(
+                    "处理设置不同",
+                    "两次扫描保存的处理签名不一致，请用相同的平滑与归一化设置重新测量图 B。",
+                    parent=dialog,
+                )
+                return
             second = candidate
             b_selector.configure(values=tuple(candidate.lines))
             b_var.set(next(iter(candidate.lines)))
             second_label.configure(text=f"图 B　{candidate.source.name}")
             clear_charts()
 
-        def render() -> RepeatScanSpectrum | None:
+        current_comparison: dict = {}
+
+        def render() -> RepeatScanModelComparison | None:
             if second is None:
                 messagebox.showinfo("请载入图 B", "完成第二张图的测量后，点击“载入主窗口测量为 B”。", parent=dialog)
                 return None
@@ -8167,83 +9342,199 @@ class LERLWRApp(AppBase):
                     tuple(item.right_px - item.left_px for item in (a, b)) if code == "lwr"
                     else tuple(getattr(item, position_attr[code]) for item in (a, b))
                 )
-                comparison = repeat_scan_spectrum(
+                repeat = repeat_scan_spectrum(
                     a.rows_px + first.row_origin, values[0], b.rows_px + second.row_origin, values[1],
                     a.pixel_size_nm, offset, remove_slope=code != "lwr",
+                )
+                comparison = repeat_scan_model_comparison(
+                    repeat, a.pixel_size_nm, model=model_var.get(),
+                    fit_min=parse_band(fit_min_entry.get(), "拟合 fmin"),
+                    fit_max=parse_band(fit_max_entry.get(), "拟合 fmax"),
+                    integration_min=parse_band(int_min_entry.get(), "积分 fmin"),
+                    integration_max=parse_band(int_max_entry.get(), "积分 fmax"),
+                    noise_context=window_context.noise_context,
                 )
             except ValueError as exc:
                 clear_charts()
                 summary.configure(text=str(exc))
                 return None
-            measured, noise, corrected = comparison.rms_nm()
-            estimate = f"{corrected:.3g} nm" if corrected is not None else "未分辨出正的校正方差"
-            summary.configure(text=(
-                f"测得 RMS（A、B 平均方差）{measured:.3g} nm　单次扫描噪声 RMS {noise:.3g} nm\n"
-                f"校正 RMS {estimate}　覆盖 {comparison.measured.covered_rows}/{len(comparison.common_rows)} 行"
-                f"　{comparison.measured.window_count} 个 Hann 窗\n"
-                "请在上图检查 A、B 的起伏位置是否对齐。校正假设样品未变化且两次扫描误差独立。"
-            ))
-            rows = comparison.common_rows
-            cuts = np.flatnonzero(np.diff(rows) != 1) + 1
-            positions = np.insert(rows, cuts, rows[cuts] - 0.5)
-            overlay = fft_line_chart_rgb(
-                positions, (
-                    (np.insert(comparison.first_residual_nm, cuts, np.nan), "A", "#66d7ea"),
-                    (np.insert(comparison.second_residual_nm, cuts, np.nan), "B", "#ffb45e"),
-                ),
-                title="A / B", x_label="Image A row (px)", y_label="Residual (nm)", size=(620, 170), full_range=True,
+            current_comparison["comparison"] = comparison
+            current_comparison["repeat"] = repeat
+            current_comparison["code"] = code
+            current_comparison["a"] = first.source
+            current_comparison["b"] = second.source
+            current_comparison["a_name"] = a_name
+            current_comparison["b_name"] = b_name
+            current_comparison["offset"] = offset
+            # 计算实际使用的像素标定（来自 A/B 测量结果），导出只取此快照。
+            current_comparison["pixel_size_nm"] = a.pixel_size_nm
+            current_comparison["first_model"] = comparison.first_model
+            current_comparison["second_model"] = comparison.second_model
+            # 固化为各自快照的处理签名与噪声上下文，导出不再回 live 控件取值。
+            current_comparison["a_preprocessing_signature"] = first.preprocessing_signature
+            current_comparison["b_preprocessing_signature"] = second.preprocessing_signature
+            current_comparison["a_noise_context"] = first.noise_context
+            current_comparison["b_noise_context"] = second.noise_context
+            # 快照当时请求的模型与频段约束，供导出校验 + 记录，不回 live 控件。
+            current_comparison["model_requested"] = model_var.get()
+            current_comparison["fit_min_requested"] = parse_band(fit_min_entry.get(), "拟合 fmin")
+            current_comparison["fit_max_requested"] = parse_band(fit_max_entry.get(), "拟合 fmax")
+            current_comparison["int_min_requested"] = parse_band(int_min_entry.get(), "积分 fmin")
+            current_comparison["int_max_requested"] = parse_band(int_max_entry.get(), "积分 fmax")
+            current_comparison["settings_signature"] = (
+                a_var.get(), b_var.get(), metric.get(), offset, model_var.get(),
+                fit_min_entry.get(), fit_max_entry.get(), int_min_entry.get(), int_max_entry.get(),
             )
-            measured_psd = comparison.measured
-            floor = max(float(measured_psd.density_nm3.max()) * 1e-12, np.finfo(float).tiny)
-            power_chart = fft_line_chart_rgb(
-                measured_psd.frequency_per_nm, (
-                    (np.log10(np.maximum(measured_psd.density_nm3, floor)), "Measured", "#66d7ea"),
-                    (np.log10(np.maximum(comparison.noise_density_nm3, floor)), "Noise", "#ffb45e"),
-                ),
-                title=code.upper(), x_label="cycles/nm", y_label="log10 PSD", size=(620, 220), full_range=True,
+            # A/B 同物理线随行对齐预览（复用并入前的迹线对比，不改动拟合数据）。
+            comparison_view_preview = repeat_scan_alignment_preview_rgb(
+                repeat.common_rows, repeat.first_residual_nm, repeat.second_residual_nm,
+                offset=offset,
             )
-            comparison_plot = Image.fromarray(np.vstack((overlay, power_chart)))
-            comparison_view.image = ImageTk.PhotoImage(comparison_plot, master=dialog)
+            frequencies = comparison.frequency_per_nm
+            floor = max(float(comparison.measured_density_nm3.max()) * 1e-12, np.finfo(float).tiny)
+            noise_chart = fft_line_chart_rgb(
+                frequencies, (
+                    (np.log10(np.maximum(comparison.measured_density_nm3, floor)), "Measured", "#66d7ea"),
+                    (np.log10(np.maximum(comparison.model_noise_density_nm3, floor)), "Model noise (avg)", "#8ef0c0"),
+                    (np.log10(np.maximum(comparison.difference_noise_density_nm3, floor)), "Difference noise /2", "#ff7f9f"),
+                ),
+                title=f"{code.upper()} 噪声对照（对数）", x_label="cycles/nm", y_label="log10 PSD",
+                size=(680, 260), full_range=True,
+            )
+            corrected_chart = fft_line_chart_rgb(
+                frequencies, (
+                    (comparison.model_corrected_density_nm3, "Model corrected", "#c08bff"),
+                    (comparison.difference_corrected_density_nm3, "Difference corrected", "#ffb45e"),
+                ),
+                title="两条独立校正（线性）", x_label="cycles/nm", y_label="PSD nm³",
+                size=(680, 200), full_range=True,
+            )
+            combined = Image.fromarray(np.vstack((comparison_view_preview, noise_chart, corrected_chart)))
+            comparison_view.image = ImageTk.PhotoImage(combined, master=dialog)
             comparison_view.configure(image=comparison_view.image)
+
+            status_cn = {"ok": "可靠", "unreliable": "不可靠"}.get(comparison.status, comparison.status)
+            model_rms = f"{comparison.model_corrected_rms_nm:.4g} nm" if comparison.model_corrected_rms_nm is not None else "缺失（任一单图模型不可靠）"
+            diff_rms = f"{comparison.difference_corrected_rms_nm:.4g} nm" if comparison.difference_corrected_rms_nm is not None else "缺失（差分方差非正）"
+            summary.configure(text="\n".join((
+                f"状态：{status_cn}　噪声一致性：{comparison.noise_agreement}",
+                f"测得 RMS {comparison.measured_rms_nm:.4g} nm　模型噪声 RMS {comparison.model_noise_rms_nm:.4g} nm　差分噪声 RMS {comparison.difference_noise_rms_nm:.4g} nm",
+                f"模型校正 RMS {model_rms}　差分校正 RMS {diff_rms}",
+                f"共同有效段 {comparison.rms_band_per_nm[0]:.4g}–{comparison.rms_band_per_nm[1]:.4g} cycles/nm",
+                f"覆盖 {repeat.measured.covered_rows}/{len(repeat.common_rows)} 行　{repeat.measured.window_count} 个 Hann 窗　每窗 {repeat.measured.segment_rows} 行",
+            )))
+            if comparison.status_reasons:
+                summary.configure(text=summary.cget("text") + f"\n原因：{';'.join(comparison.status_reasons)}")
             return comparison
 
         def export_comparison() -> None:
-            comparison = render()
+            comparison = current_comparison.get("comparison")
             if comparison is None or second is None:
+                messagebox.showinfo("尚未计算", "请先点击“计算差分对照”得到结果。", parent=dialog)
+                return
+            # 导出前校验当前控件状态与成功计算时一致，否则拒绝过期导出。
+            current_settings = (
+                a_var.get(), b_var.get(), metric.get(), current_comparison["offset"],
+                model_var.get(), fit_min_entry.get(), fit_max_entry.get(),
+                int_min_entry.get(), int_max_entry.get(),
+            )
+            if current_comparison.get("settings_signature") != current_settings:
+                messagebox.showinfo(
+                    "设置已变更", "检测到拟合参数或选择已改变，请重新点击“计算差分对照”后再导出。", parent=dialog,
+                )
                 return
             target = filedialog.asksaveasfilename(
-                parent=dialog, title="保存双图噪声校正", defaultextension=".csv",
-                initialfile=f"{first.source.stem}_{metrics[metric.get()]}_repeat_scan_psd.csv",
+                parent=dialog, title="保存双图差分对照", defaultextension=".csv",
+                initialfile=f"{first.source.stem}_{current_comparison['code']}_repeat_scan_model.csv",
                 filetypes=[("CSV 文件", "*.csv")],
             )
             if not target:
                 return
-            measured, noise, corrected = comparison.rms_nm()
-            spectrum = comparison.measured
+            repeat = current_comparison["repeat"]
+            first_model = current_comparison["first_model"]
+            second_model = current_comparison["second_model"]
             try:
                 with open(target, "w", newline="", encoding="utf-8-sig") as handle:
                     writer = csv.writer(handle)
                     writer.writerows([
-                        ("source_a", first.source), ("source_b", second.source),
-                        ("line_a", a_var.get()), ("line_b", b_var.get()), ("metric", metrics[metric.get()]),
-                        ("b_row_offset_px", int(offset_var.get())), ("common_rows", len(comparison.common_rows)),
-                        ("covered_rows", spectrum.covered_rows), ("segment_rows", spectrum.segment_rows),
-                        ("window_count", spectrum.window_count), ("frequency_step_cycles_per_nm", spectrum.frequency_step_per_nm),
-                        ("measured_rms_nm", measured), ("noise_rms_nm", noise), ("corrected_rms_nm", corrected),
-                        (),
-                        ("frequency_cycles_per_nm", "measured_psd_nm3", "noise_psd_nm3", "corrected_psd_estimate_nm3"),
+                        ("source_a", current_comparison["a"]), ("source_b", current_comparison["b"]),
+                        ("line_a", current_comparison["a_name"]), ("line_b", current_comparison["b_name"]),
+                        ("metric", current_comparison["code"]),
+                        ("b_row_offset_px", current_comparison["offset"]),
+                        ("preprocessing_signature", window_context.preprocessing_signature),
+                        ("noise_context", window_context.noise_context),
+                        ("a_preprocessing_signature", current_comparison["a_preprocessing_signature"]),
+                        ("b_preprocessing_signature", current_comparison["b_preprocessing_signature"]),
+                        ("a_noise_context", current_comparison["a_noise_context"]),
+                        ("b_noise_context", current_comparison["b_noise_context"]),
+                        ("model", current_comparison["model_requested"]),
+                        ("fit_min_requested_cycles_per_nm", current_comparison["fit_min_requested"]),
+                        ("fit_max_requested_cycles_per_nm", current_comparison["fit_max_requested"]),
+                        ("integration_min_requested_cycles_per_nm", current_comparison["int_min_requested"]),
+                        ("integration_max_requested_cycles_per_nm", current_comparison["int_max_requested"]),
+                        ("model_constraints", PSD_MODEL_CONSTRAINTS),
+                        ("objective", PSD_MODEL_OBJECTIVE),
+                        ("pixel_size_nm", current_comparison["pixel_size_nm"]),
+                        ("status", comparison.status), ("reliable", int(comparison.reliable)),
+                        ("noise_agreement", comparison.noise_agreement),
+                        ("measured_rms_nm", comparison.measured_rms_nm),
+                        ("model_noise_rms_nm", comparison.model_noise_rms_nm),
+                        ("difference_noise_rms_nm", comparison.difference_noise_rms_nm),
+                        ("model_corrected_rms_nm", comparison.model_corrected_rms_nm),
+                        ("difference_corrected_rms_nm", comparison.difference_corrected_rms_nm),
+                        ("rms_band_min_cycles_per_nm", comparison.rms_band_per_nm[0]),
+                        ("rms_band_max_cycles_per_nm", comparison.rms_band_per_nm[1]),
+                        ("first_model_status", first_model.status),
+                        ("first_model_name", first_model.model_name),
+                        ("first_model_reliability_reasons", ";".join(first_model.reliability_reasons)),
+                        ("first_model_amplitude_nm3", first_model.amplitude_nm3),
+                        ("first_model_B_nm", first_model.corner_length_nm),
+                        ("first_model_C_nm3", first_model.noise_floor_nm3),
+                        ("first_model_fit_band_min_cycles_per_nm", first_model.fit_band_per_nm[0]),
+                        ("first_model_fit_band_max_cycles_per_nm", first_model.fit_band_per_nm[1]),
+                        ("second_model_status", second_model.status),
+                        ("second_model_name", second_model.model_name),
+                        ("second_model_reliability_reasons", ";".join(second_model.reliability_reasons)),
+                        ("second_model_amplitude_nm3", second_model.amplitude_nm3),
+                        ("second_model_B_nm", second_model.corner_length_nm),
+                        ("second_model_C_nm3", second_model.noise_floor_nm3),
+                        ("second_model_fit_band_min_cycles_per_nm", second_model.fit_band_per_nm[0]),
+                        ("second_model_fit_band_max_cycles_per_nm", second_model.fit_band_per_nm[1]),
+                        ("status_reasons", ";".join(comparison.status_reasons)),
+                        ("method_note", comparison.method_note),
+                        ("common_rows", len(repeat.common_rows)),
+                        ("covered_rows", repeat.measured.covered_rows),
+                        ("total_rows", repeat.measured.total_rows),
+                        ("segment_rows", repeat.measured.segment_rows),
+                        ("window_count", repeat.measured.window_count),
+                        ("frequency_step_cycles_per_nm", repeat.measured.frequency_step_per_nm),
                     ])
-                    writer.writerows(zip(spectrum.frequency_per_nm, spectrum.density_nm3,
-                                         comparison.noise_density_nm3, comparison.corrected_density_nm3))
+                    write_psd_localization_block(writer, window_context)
+                    writer.writerow([])
+                    writer.writerow([
+                        "frequency_cycles_per_nm", "measured_nm3", "first_model_fit_nm3",
+                        "first_model_structure_nm3", "first_model_residual_nm3",
+                        "second_model_fit_nm3", "second_model_structure_nm3", "second_model_residual_nm3",
+                        "first_model_noise_nm3", "second_model_noise_nm3", "model_noise_avg_nm3", "difference_noise_nm3",
+                        "model_corrected_nm3", "difference_corrected_nm3",
+                    ])
+                    writer.writerows(zip(
+                        comparison.frequency_per_nm, comparison.measured_density_nm3,
+                        first_model.total_fit_density_nm3, first_model.structure_density_nm3, first_model.residual_density_nm3,
+                        second_model.total_fit_density_nm3, second_model.structure_density_nm3, second_model.residual_density_nm3,
+                        comparison.first_model_noise_density_nm3, comparison.second_model_noise_density_nm3,
+                        comparison.model_noise_density_nm3, comparison.difference_noise_density_nm3,
+                        comparison.model_corrected_density_nm3, comparison.difference_corrected_density_nm3,
+                    ))
             except OSError as exc:
                 messagebox.showerror("导出失败", str(exc), parent=dialog)
                 return
-            self.status_var.set(f"已导出双图噪声校正：{target}")
+            self.status_var.set(f"已导出双图差分对照：{target}")
 
-        for variable in (offset_var, a_var, b_var, metric):
+        for variable in (offset_var, a_var, b_var, metric, model_var, fit_min_var, fit_max_var, int_min_var, int_max_var):
             variable.trace_add("write", clear_charts)
         ttk.Button(controls, text="载入主窗口测量为 B", command=load_second).pack(side=tk.LEFT)
-        ttk.Button(controls, text="计算校正", command=render).pack(side=tk.LEFT, padx=6)
+        ttk.Button(controls, text="计算差分对照", command=render).pack(side=tk.LEFT, padx=6)
         ttk.Button(controls, text="导出 CSV", command=export_comparison).pack(side=tk.LEFT)
 
     def image_export_roi_bounds(self) -> tuple[int, int, int, int] | None:
@@ -8289,6 +9580,7 @@ class LERLWRApp(AppBase):
             self.gaussian_kernel_size(),
             self.gaussian_sigma_scale(),
             self.blur_method_var.get(),
+            background_degree=self.background_degree(),
         )
         if image is None:
             messagebox.showerror("导出失败", "图像未准备完成。")
@@ -8525,6 +9817,11 @@ class LERLWRApp(AppBase):
                 writer.writerow(["pixel_size_nm_per_px", "" if pixel_size is None else pixel_size])
                 writer.writerow(["sigma_multiplier", multiplier])
                 writer.writerow(["outlier_rejection_threshold_px", self.outlier_threshold_px()])
+                degree = self.background_degree()
+                writer.writerow(["background_correction", "on" if degree is not None else "off"])
+                writer.writerow(["background_degree", degree if degree is not None else "none"])
+                writer.writerow(["background_fit_scope", "full_working_image_low_order_additive_polynomial"])
+                writer.writerow(["background_pipeline", "rotate_crop_then_raw_image_background_fit_then_normalize_then_single_smoothing_pass"])
                 if self.result is not None:
                     result = self.result
                     aggregate = self.era_aggregate_result if result.edge_detector == EDGE_DETECTOR_ERA else None
@@ -8534,41 +9831,30 @@ class LERLWRApp(AppBase):
                     reported_total_ler = aggregate.total_ler_sigma_nm if aggregate is not None else result.total_ler_sigma_nm
                     reported_correlation = aggregate.edge_correlation if aggregate is not None else result.edge_correlation
                     reported_mean_width = aggregate.mean_width_nm if aggregate is not None else result.mean_width_nm
-                    periodic_count = sum(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples) if result.edge_detector == EDGE_DETECTOR_ERA else 0
+                    periodic_count = sum(sample.edge_profile_kind == "bright_band" for sample in self.era_line_samples)
                     actual_method = result.localization_method or result.edge_detector
-                    method_name = "周期亮边（半高取点）" if actual_method == EDGE_DETECTOR_HALF and periodic_count == len(self.era_line_samples) else actual_method
-                    writer.writerow(["edge_detector", method_name])
+                    writer.writerow(["edge_detector", actual_method])
                     writer.writerow(["line_localization_method", actual_method])
-                    writer.writerow(["line_gradient_response_threshold_fraction_of_p75", result.localization_threshold_fraction if actual_method == EDGE_DETECTOR_SCHARR else "not_used"])
-                    writer.writerow(["line_short_noise_filter_enabled", result.localization_continuity_filter if actual_method in (EDGE_DETECTOR_SCHARR, EDGE_DETECTOR_CANNY) else "not_used"])
-                    writer.writerow(["line_trajectory_policy", "one_directed_edge_per_roi_reject_ambiguous_rows_no_gap_filling" if result.edge_detector == EDGE_DETECTOR_ERA else "legacy_single_region"])
-                    if result.edge_detector == EDGE_DETECTOR_ERA:
-                        writer.writerow(["era_input", "current_preprocessed_image_no_internal_spatial_filter" if actual_method in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF) else "current_preprocessed_image_selected_gradient_kernel"])
-                        automatic_count = sum(sample.selection_source != "manual" for sample in self.era_line_samples)
-                        writer.writerow(["era_automatic_line_sample_count", automatic_count])
-                        writer.writerow(["periodic_bright_band_sample_count", periodic_count])
-                        writer.writerow(["periodic_position_method", ("individual_flank_half_height_linear_interpolation_center_is_midpoint" if actual_method == EDGE_DETECTOR_HALF else "independent_flank_polynomial_half_height_center_is_midpoint" if actual_method == EDGE_DETECTOR_ERA else "directed_laplacian_zero_crossings_center_is_midpoint" if actual_method == EDGE_DETECTOR_LAPLACIAN else "directed_gradient_peaks_subpixel_parabola_center_is_midpoint") if periodic_count else "not_used"])
-                        writer.writerow(["periodic_row_support_policy", "both_flanks_single_peak_and_amplitude_gt_0.2_roi_p75" if periodic_count else "not_used"])
-                        writer.writerow(["periodic_peak_identity_policy", "preview_band_center_radius_max_2px_0.75_halfheight_width_no_dark_region_fallback" if periodic_count else "not_used"])
-                        writer.writerow(["era_automatic_polarity_policy", "per_sample_profile_model" if periodic_count else "per_line_bright_dark_left_right" if automatic_count else "not_used"])
-                        writer.writerow(["era_automatic_row_support_policy", "per_sample_profile_model" if periodic_count else "flank_contrast_gt_max_3sigma_noise_0.2_p75_contrast" if automatic_count else "not_used"])
-                        writer.writerow(["era_failed_line_sample_count", sum(sample.measurement_error is not None for sample in self.era_line_samples)])
-                        writer.writerow(["era_polynomial_degree", self.era_polynomial_degree() if actual_method == EDGE_DETECTOR_ERA else "not_used"])
-                        writer.writerow(["era_requested_polarity", self.era_polarity_var.get()])
-                        writer.writerow(["era_difference_weight_power", ERA_DIFFERENCE_POWER if actual_method == EDGE_DETECTOR_ERA else "not_used"])
-                        if self.era_aggregate_result is not None:
-                            aggregate = self.era_aggregate_result
-                            writer.writerow(["era_complete_line_count", aggregate.line_count])
-                            writer.writerow(["era_total_common_valid_points", aggregate.point_count])
-                            writer.writerow(["era_mean_cd_nm", aggregate.mean_width_nm])
-                    if result.edge_detector != EDGE_DETECTOR_ERA or actual_method not in (EDGE_DETECTOR_ERA, EDGE_DETECTOR_HALF):
-                        writer.writerow(["edge_detector_kernel_size_px", result.edge_kernel_size])
-                        writer.writerow(["edge_detector_diagonal_weight", result.edge_diagonal_weight])
-                        writer.writerow(["edge_detector_axial_weight", result.edge_axial_weight])
-                        writer.writerow(["canny_high_threshold", result.canny_high_threshold])
-                        writer.writerow(["canny_threshold_ratio", result.canny_threshold_ratio])
-                        writer.writerow(["canny_low_threshold", result.canny_low_threshold])
-                        writer.writerow(["canny_normalization_scale_p99", result.canny_normalization_scale])
+                    writer.writerow(["line_trajectory_policy", "one_directed_edge_per_roi_reject_ambiguous_rows_no_gap_filling"])
+                    writer.writerow(["era_input", "current_preprocessed_image_no_internal_spatial_filter"])
+                    automatic_count = sum(sample.selection_source != "manual" for sample in self.era_line_samples)
+                    writer.writerow(["era_automatic_line_sample_count", automatic_count])
+                    writer.writerow(["periodic_bright_band_sample_count", periodic_count])
+                    writer.writerow(["periodic_position_method", "individual_flank_polynomial_half_height_center_is_midpoint" if periodic_count else "not_used"])
+                    writer.writerow(["periodic_bright_band_polynomial_degree", self.era_polynomial_degree() if periodic_count else "not_used"])
+                    writer.writerow(["periodic_row_support_policy", "both_flanks_single_peak_and_amplitude_gt_0.2_roi_p75" if periodic_count else "not_used"])
+                    writer.writerow(["periodic_peak_identity_policy", "preview_band_center_radius_max_2px_0.75_halfheight_width_no_dark_region_fallback" if periodic_count else "not_used"])
+                    writer.writerow(["era_automatic_polarity_policy", "per_sample_profile_model" if periodic_count else "per_line_bright_dark_left_right" if automatic_count else "not_used"])
+                    writer.writerow(["era_automatic_row_support_policy", "per_sample_profile_model" if periodic_count else "flank_contrast_gt_max_3sigma_noise_0.2_p75_contrast" if automatic_count else "not_used"])
+                    writer.writerow(["era_failed_line_sample_count", sum(sample.measurement_error is not None for sample in self.era_line_samples)])
+                    writer.writerow(["era_polynomial_degree", self.era_polynomial_degree() if not periodic_count else "not_used"])
+                    writer.writerow(["era_requested_polarity", self.era_polarity_var.get()])
+                    writer.writerow(["era_difference_weight_power", ERA_DIFFERENCE_POWER if not periodic_count else "not_used"])
+                    if self.era_aggregate_result is not None:
+                        aggregate = self.era_aggregate_result
+                        writer.writerow(["era_complete_line_count", aggregate.line_count])
+                        writer.writerow(["era_total_common_valid_points", aggregate.point_count])
+                        writer.writerow(["era_mean_cd_nm", aggregate.mean_width_nm])
                     writer.writerow(["ler_left_sigma_nm", reported_ler_left])
                     writer.writerow(["ler_right_sigma_nm", reported_ler_right])
                     writer.writerow(["lwr_sigma_nm", reported_lwr])
@@ -8675,13 +9961,13 @@ class LERLWRApp(AppBase):
                             status = "failed" if sample.measurement_error else "complete" if sample.paired_result is not None else "incomplete"
                             writer.writerow([line_index, sample.selection_source, sample.line_polarity or "", sample.recognition_support_fraction, status, sample.measurement_error or "", sample.edge_profile_kind, sample.target_kind or "", sample.interval_index, sample.reference_interval, sample.reference_kind or "", *(sample.left_reference_band_px or ("", "")), *(sample.right_reference_band_px or ("", "")), sample.left_position_definition, sample.right_position_definition, sample.sample_id, sample.pitch_next_id, actual_method])
                         writer.writerow([])
-                        writer.writerow(["era_line_index", "side", "roi_left_px", "roi_top_px", "roi_right_px", "roi_bottom_px", "polarity", "polynomial_degree", "row_px", "edge_px", "edge_residual_nm", "canny_normalization_scale_p99"])
+                        writer.writerow(["era_line_index", "side", "roi_left_px", "roi_top_px", "roi_right_px", "roi_bottom_px", "polarity", "polynomial_degree", "row_px", "edge_px", "edge_residual_nm"])
                         for line_index, sample in enumerate(self.era_line_samples, start=1):
                             for side, edge in (("left", sample.left_edge), ("right", sample.right_edge)):
                                 if edge is None:
                                     continue
                                 for row, position, residual in zip(edge.rows_px, edge.edge_px, edge.residual_nm):
-                                    writer.writerow([line_index, side, *edge.roi_bounds_px, edge.polarity, edge.polynomial_degree, row, position, residual, edge.normalization_scale])
+                                    writer.writerow([line_index, side, *edge.roi_bounds_px, edge.polarity, edge.polynomial_degree, row, position, residual])
                         writer.writerow([])
                         writer.writerow(["era_line_index", "mean_cd_nm", "ler_left_sigma_nm", "ler_right_sigma_nm", "lwr_sigma_nm", "common_valid_point_count"])
                         for line_index, sample in enumerate(self.era_line_samples, start=1):
@@ -8689,6 +9975,62 @@ class LERLWRApp(AppBase):
                                 continue
                             paired = sample.paired_result
                             writer.writerow([line_index, paired.mean_width_nm, paired.ler_left_sigma_nm, paired.ler_right_sigma_nm, paired.lwr_sigma_nm, len(paired.rows_px)])
+                        # Per-side localization statistics (empty values are "", never 0).
+                        # ``valid_rows`` = primary + recovered (same definition as every
+                        # other row count here; existing field names are preserved).
+                        writer.writerow([])
+                        writer.writerow(["era_line_index", "side", "total_rows", "valid_rows", "primary_rows", "recovered_rows", "missing_rows", "coverage_fraction", "longest_gap_rows", "reason_counts"])
+                        for line_index, sample in enumerate(self.era_line_samples, start=1):
+                            for side in ("left", "right"):
+                                diag = self._sample_side_diagnostics(sample, side)
+                                if diag is None:
+                                    continue
+                                stats = localization_stats(diag)
+                                reasons = ";".join(f"{reason}={count}" for reason, count in sorted(stats.reasons.items()))
+                                writer.writerow([
+                                    line_index, side, stats.total_rows,
+                                    stats.primary_rows + stats.recovered_rows,
+                                    stats.primary_rows,
+                                    stats.recovered_rows, stats.missing_rows,
+                                    "" if not math.isfinite(stats.coverage_fraction) else stats.coverage_fraction,
+                                    stats.longest_gap_rows, reasons,
+                                ])
+                        # Per-line pair statistics (common valid rows / vertical overlap).
+                        writer.writerow([])
+                        writer.writerow(["era_line_index", "left_total_rows", "right_total_rows", "left_valid_rows", "right_valid_rows", "overlap_rows", "common_valid_rows", "pair_coverage_fraction", "longest_common_gap_rows"])
+                        for line_index, sample in enumerate(self.era_line_samples, start=1):
+                            left_diag = self._sample_side_diagnostics(sample, "left")
+                            right_diag = self._sample_side_diagnostics(sample, "right")
+                            if left_diag is None and right_diag is None:
+                                continue
+                            pair_stats = pair_localization_stats(left_diag, right_diag)
+                            writer.writerow([
+                                line_index, pair_stats.left_total_rows, pair_stats.right_total_rows,
+                                pair_stats.left_valid_rows, pair_stats.right_valid_rows,
+                                pair_stats.overlap_rows, pair_stats.common_valid_rows,
+                                "" if not math.isfinite(pair_stats.coverage_fraction) else pair_stats.coverage_fraction,
+                                pair_stats.longest_common_gap_rows,
+                            ])
+                        # Per-row localization records: candidate / final global x, validity,
+                        # stage, reason, recovery seed, and the parameters that produced them.
+                        writer.writerow([])
+                        writer.writerow(["era_line_index", "side", "global_row", "candidate_global_x", "final_global_x", "valid", "stage", "reason", "recovered_from_global_x", "fit_degree", "position_definition", "polarity", "max_jump_px"])
+                        for line_index, sample in enumerate(self.era_line_samples, start=1):
+                            for side in ("left", "right"):
+                                diag = self._sample_side_diagnostics(sample, side)
+                                if diag is None:
+                                    continue
+                                left, top, _right, _bottom = diag.roi_bounds_px
+                                for record in diag_row_records(diag):
+                                    writer.writerow([
+                                        line_index, side, record["global_row"],
+                                        "" if not math.isfinite(record["candidate_global_x"]) else record["candidate_global_x"],
+                                        "" if not math.isfinite(record["final_global_x"]) else record["final_global_x"],
+                                        "1" if record["stage"] != "missing" else "0",
+                                        record["stage"], record["reason"],
+                                        "" if not math.isfinite(record["recovered_from_global_x"]) else repr(float(record["recovered_from_global_x"])),
+                                        diag.fit_degree, diag.position_definition, diag.polarity, diag.max_jump_px,
+                                    ])
                     else:
                         result = self.result
                         writer.writerow([])

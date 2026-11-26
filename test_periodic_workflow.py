@@ -24,7 +24,6 @@ def periodic_image(noise=0.0):
 
 def periodic_state(image=None):
     state = headless_app(periodic_image() if image is None else image)
-    state.edge_detector_var.set(app.EDGE_DETECTOR_HALF)
     state.auto_line_mode_var.set(app.AUTO_MODE_PERIODIC)
     state.preview_periodic_lines()
     state.periodic_reference_kind_var.set("槽")
@@ -277,7 +276,13 @@ class PeriodicWorkflowTests(unittest.TestCase):
         self.assertEqual([s.interval_index for s in state.era_line_samples], [1, 3, 5])
 
     def test_all_nine_left_right_position_combinations(self):
-        half_width = 2.2 * np.sqrt(2 * np.log(2))
+        # The periodic flanks now use the ERA polynomial local-baseline half-height
+        # (degree 3 default), so the half-height crossing sits at the polynomial
+        # reconstruction's 0.5 level, measured as ~2.6595 px from the band center for
+        # the Gaussian periodic_image (analytic linear half-width 2.2*sqrt(2 ln2)=2.588
+        # is superseded by the polynomial fit).  The left/right/center definitions stay
+        # independent and center is the arithmetic midpoint of the two half-heights.
+        half_width = 2.6595
         shift = {"center": 0.0, "left": -half_width, "right": half_width}
         image = periodic_image()
         for left in ("center", "left", "right"):
@@ -289,7 +294,7 @@ class PeriodicWorkflowTests(unittest.TestCase):
                 result = app.pair_single_edges(a, b, 0.2)
                 expected = (35 + shift[right] - shift[left]) * 0.2
                 self.assertAlmostEqual(result.mean_width_nm, expected, delta=0.04)
-                self.assertEqual(a.polynomial_degree, 0)
+                self.assertEqual(a.polynomial_degree, 3)
                 self.assertGreaterEqual(len(result.rows_px), 150)
 
     def test_definition_changes_invalidate_and_do_not_append_lcdu(self):
@@ -494,7 +499,8 @@ class PeriodicWorkflowTests(unittest.TestCase):
                 state.export_csv()
             with target.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.reader(handle))
-        self.assertIn(["edge_detector", "周期亮边（半高取点）"], rows)
+        self.assertIn(["edge_detector", app.LINE_LOCALIZATION_UNIFIED], rows)
+        self.assertIn(["line_localization_method", app.LINE_LOCALIZATION_UNIFIED], rows)
         self.assertIn(["periodic_bright_band_sample_count", "3"], rows)
         self.assertIn(["era_polynomial_degree", "not_used"], rows)
         index = next(i for i, row in enumerate(rows) if row[:2] == ["era_line_index", "selection_source"])

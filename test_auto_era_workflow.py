@@ -54,10 +54,13 @@ def headless_app(image):
         annotations=[], show_era_rois=True, ler_lwr_roi_mode=False,
         bcp_metrics_finalized=False, rotation_degrees=0, fit_left_color="#00e5ff",
         fit_right_color="#ffb000", roi_canvas=None, export_roi_bounds_px=None,
+        background_enabled_var=Value(False), background_degree_var=Value("1"),
+        normalize_var=Value(True), gaussian_denoise_var=Value(True),
+        blur_method_var=Value(app.BLUR_METHOD_GAUSSIAN),
     )
     for name in (
         "refresh_era_sample_list", "update_lcdu_summary_text", "clear_auto_line_candidates",
-        "clear_detected_edges", "clear_bcp_completion_selection", "update_edge_kernel_preview",
+        "clear_detected_edges", "clear_bcp_completion_selection",
         "record_undo_state", "draw_image",
     ):
         setattr(state, name, Mock())
@@ -67,6 +70,12 @@ def headless_app(image):
     state.fit_line_width = lambda: 2
     state.gaussian_kernel_size = lambda: 3
     state.gaussian_sigma_scale = lambda: 1.0
+    state.background_enabled = lambda: bool(state.background_enabled_var.get())
+    state.background_degree = lambda: int(state.background_degree_var.get()) if state.background_enabled_var.get() else None
+    state._background_degree_selected = lambda: int(state.background_degree_var.get()) if str(state.background_degree_var.get()).strip() not in ("", "None") else app.BACKGROUND_DEFAULT_DEGREE
+    state._background_config_resolved = lambda: (bool(state.background_enabled_var.get()), state._background_degree_selected())
+    state._background_last_applied = app.LERLWRApp._background_config_resolved(state)
+    state._sample_side_diagnostics = lambda sample, side: getattr(sample, f"{side}_diagnostics", None)
     for name in (
         "invalidate_era_results", "run_era_analysis", "recognize_era_lines",
         "active_lcdu_samples", "lcdu_sigma_nm", "update_era_result_text", "export_csv",
@@ -76,7 +85,6 @@ def headless_app(image):
         "apply_exported_edge_detection_overlay", "draw_exported_annotations", "draw_exported_bcp",
         "automatic_line_region", "periodic_line_settings", "clear_periodic_preview",
         "confirm_line_pitch_adjacency", "line_position_changed", "invalidate_line_parameters",
-        "edge_detector_parameters", "edge_kernel_size",
         "clear_era_line_samples",
         "periodic_options_changed", "preview_periodic_lines", "draw_periodic_preview",
         "periodic_scope_changed", "periodic_reference_index", "periodic_interval_label",

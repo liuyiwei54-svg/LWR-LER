@@ -1,4 +1,4 @@
-"""Regression checks for shared sample geometry, detector dispatch and line Pitch."""
+"""Regression checks for shared sample geometry, unified localization and line Pitch."""
 import csv
 from dataclasses import replace
 from pathlib import Path
@@ -13,15 +13,9 @@ from test_auto_era_workflow import Value, headless_app, stripe_image
 from test_periodic_workflow import periodic_image, periodic_state
 
 
-def configured_state(image=None, method=app.EDGE_DETECTOR_SCHARR):
+def configured_state(image=None, method=app.LINE_LOCALIZATION_UNIFIED):
     state = headless_app(stripe_image() if image is None else image)
     state.edge_detector_var.set(method)
-    state.edge_diagonal_weight_var = Value("1" if method == app.EDGE_DETECTOR_CANNY else "3")
-    state.edge_axial_weight_var = Value("2" if method == app.EDGE_DETECTOR_CANNY else "10")
-    state.edge_kernel_size_var = Value("3 × 3")
-    state.canny_high_threshold_var = Value(0.125)
-    state.canny_threshold_ratio_var = Value(2.5)
-    state.edge_use_vertical_continuity_filter_var = Value(False)
     state.pitch_confirm_var = Value(False)
     state.era_sample_listbox = None
     return state
@@ -37,54 +31,64 @@ class SharedLineWorkflowTests(unittest.TestCase):
             self.assertAlmostEqual(correction, -angle, delta=.3)
             np.testing.assert_array_equal(tilted, before)
 
-    def test_discovery_keeps_method_and_all_methods_reuse_identical_boxes(self):
+    def test_discovery_keeps_method_and_reuses_identical_boxes(self):
         state = configured_state()
         state.recognize_era_lines()
-        self.assertEqual(state.edge_detector_var.get(), app.EDGE_DETECTOR_SCHARR)
+        self.assertEqual(state.edge_detector_var.get(), app.LINE_LOCALIZATION_UNIFIED)
         bounds = [(s.left_roi_bounds_px, s.right_roi_bounds_px) for s in state.era_line_samples]
-        for method in (app.EDGE_DETECTOR_SCHARR, app.EDGE_DETECTOR_CANNY, app.EDGE_DETECTOR_ERA):
-            state.edge_detector_var.set(method)
-            state.run_era_analysis()
-            self.assertEqual(state.era_aggregate_result.line_count, 3)
-            self.assertEqual(len(state.era_lcdu_cd_samples_nm), 3)
-            self.assertEqual(bounds, [(s.left_roi_bounds_px, s.right_roi_bounds_px) for s in state.era_line_samples])
-            self.assertEqual(state.result.localization_method, method)
-            for sample, expected in zip(state.era_line_samples, (5.6, 6.0, 6.4)):
-                self.assertAlmostEqual(sample.paired_result.mean_width_nm, expected, delta=0.1)
+        state.run_era_analysis()
+        self.assertEqual(state.era_aggregate_result.line_count, 3)
+        self.assertEqual(len(state.era_lcdu_cd_samples_nm), 3)
+        self.assertEqual(bounds, [(s.left_roi_bounds_px, s.right_roi_bounds_px) for s in state.era_line_samples])
+        self.assertEqual(state.result.localization_method, app.LINE_LOCALIZATION_UNIFIED)
+        for sample, expected in zip(state.era_line_samples, (5.6, 6.0, 6.4)):
+            self.assertAlmostEqual(sample.paired_result.mean_width_nm, expected, delta=0.1)
 
     def test_dark_line_polarity_and_independent_global_rows(self):
-        for method in (app.EDGE_DETECTOR_SCHARR, app.EDGE_DETECTOR_CANNY):
-            state = configured_state(255 - stripe_image(), method)
-            state.auto_line_polarity_var.set(app.AUTO_LINE_DARK)
-            state.recognize_era_lines()
-            state.era_line_samples[0].right_roi_bounds_px = tuple(
-                v if i % 2 == 0 else (20 if i == 1 else 170)
-                for i, v in enumerate(state.era_line_samples[0].right_roi_bounds_px)
-            )
-            state.run_era_analysis()
-            sample = state.era_line_samples[0]
-            self.assertEqual(sample.left_edge.polarity, app.ERA_POLARITY_FALLING)
-            self.assertEqual(sample.right_edge.polarity, app.ERA_POLARITY_RISING)
-            self.assertEqual((min(sample.paired_result.rows_px), max(sample.paired_result.rows_px)), (20, 169))
+        state = configured_state(255 - stripe_image())
+        state.auto_line_polarity_var.set(app.AUTO_LINE_DARK)
+        state.recognize_era_lines()
+        state.era_line_samples[0].right_roi_bounds_px = tuple(
+            v if i % 2 == 0 else (20 if i == 1 else 170)
+            for i, v in enumerate(state.era_line_samples[0].right_roi_bounds_px)
+        )
+        state.run_era_analysis()
+        sample = state.era_line_samples[0]
+        self.assertEqual(sample.left_edge.polarity, app.ERA_POLARITY_FALLING)
+        self.assertEqual(sample.right_edge.polarity, app.ERA_POLARITY_RISING)
+        self.assertEqual((min(sample.paired_result.rows_px), max(sample.paired_result.rows_px)), (20, 169))
 
     def test_gradient_dropout_rows_remain_absent_and_split_overlays(self):
         image = stripe_image()
         image[50:70] = 35
-        for method in (app.EDGE_DETECTOR_SCHARR, app.EDGE_DETECTOR_CANNY):
-            state = configured_state(image, method)
-            state.recognize_era_lines(measure=True)
-            for sample in state.era_line_samples:
-                self.assertFalse(np.any((sample.paired_result.rows_px >= 52) & (sample.paired_result.rows_px < 68)))
-                self.assertGreaterEqual(len(app.single_edge_segments(sample.left_edge, True)), 2)
+        state = configured_state(image)
+        state.recognize_era_lines(measure=True)
+        for sample in state.era_line_samples:
+            self.assertFalse(np.any((sample.paired_result.rows_px >= 52) & (sample.paired_result.rows_px < 68)))
+            self.assertGreaterEqual(len(app.single_edge_segments(sample.left_edge, True)), 2)
 
-    def test_competing_transitions_are_rejected(self):
+    def test_symmetric_double_step_rejects_as_ambiguous(self):
         x = np.arange(40)
         # Two equally strong rising transitions in one claimed single-edge rectangle.
+        # The unified localizer rejects the row as ambiguous_peak; with every row
+        # ambiguous the whole side fails with a ValueError carrying a diagnostic record.
         profile = 30 + 80 / (1 + np.exp(-(x - 12))) + 80 / (1 + np.exp(-(x - 23)))
         image = np.tile(profile, (180, 1))
-        for method in (app.EDGE_DETECTOR_SCHARR, app.EDGE_DETECTOR_CANNY):
+        with self.assertRaises(ValueError) as ctx:
+            app.analyze_sample_edge(image, (0, 0, 40, 180), 0.2, app.LINE_LOCALIZATION_UNIFIED,
+                                    polarity=app.ERA_POLARITY_RISING)
+        # The failure is a LocalizationFailure carrying the full per-row diagnostics.
+        self.assertIsInstance(ctx.exception, app.LocalizationFailure)
+        self.assertIsNotNone(ctx.exception.diagnostics)
+        self.assertTrue(all(row.reason == "ambiguous_peak" for row in ctx.exception.diagnostics.rows))
+
+    def test_legacy_detector_strings_are_rejected(self):
+        x = np.arange(40)
+        profile = 30 + 80 / (1 + np.exp(-(x - 12)))
+        image = np.tile(profile, (180, 1))
+        for stale in ("Scharr", "Canny", "拉普拉斯", "周期亮边（半高取点）"):
             with self.assertRaises(ValueError):
-                app.analyze_sample_edge(image, (0, 0, 40, 180), 0.2, method, polarity=app.ERA_POLARITY_RISING)
+                app.analyze_sample_edge(image, (0, 0, 40, 180), 0.2, stale, polarity=app.ERA_POLARITY_RISING)
 
     def test_preview_is_not_exportable_metrology(self):
         state = configured_state()
@@ -125,18 +129,18 @@ class SharedLineWorkflowTests(unittest.TestCase):
         self.assertEqual(state.era_line_samples[0].left_roi_bounds_px, bounds)
         self.assertTrue(all(s.left_edge is None and s.paired_result is None for s in state.era_line_samples))
 
-    def test_repeat_scan_identity_distinguishes_detectors_and_parameters(self):
+    def test_repeat_scan_identity_uses_unified_localization(self):
         state = configured_state()
         state.recognize_era_lines(measure=True)
-        scharr = app.line_localization_signature(state.result)
-        self.assertNotEqual(scharr, app.line_localization_signature(replace(state.result, localization_threshold_fraction=.2)))
-        state.edge_detector_var.set(app.EDGE_DETECTOR_CANNY)
+        baseline = app.line_localization_signature(state.result)
+        self.assertEqual(baseline, (app.LINE_LOCALIZATION_UNIFIED,))
+        # Re-running the same scan reports the same identity; the legacy ERA container
+        # marker is never used as the actual algorithm once localization_method is set.
+        self.assertEqual(baseline, app.line_localization_signature(replace(state.result)))
         state.run_era_analysis()
-        canny = app.line_localization_signature(state.result)
-        self.assertNotEqual(scharr, canny)
-        self.assertEqual(canny, app.line_localization_signature(replace(state.result)))
+        self.assertEqual(app.line_localization_signature(state.result), (app.LINE_LOCALIZATION_UNIFIED,))
 
-    def test_undo_restores_detector_pitch_and_matching_statistics(self):
+    def test_undo_restores_pitch_and_matching_statistics(self):
         state = configured_state()
         state.recognize_era_lines(measure=True)
         state.pitch_confirm_var.set(True)
@@ -148,24 +152,22 @@ class SharedLineWorkflowTests(unittest.TestCase):
                             ("rotation_var", "0.00")):
             setattr(state, name, Value(value))
         state.undo_history = [app.LERLWRApp.snapshot_editor_state(state)]
-        state.edge_detector_var.set(app.EDGE_DETECTOR_CANNY)
         state.invalidate_line_parameters()
         for name in ("update_gaussian_kernel_preview", "rebuild_working_images", "clear_fft_analysis", "update_result_text"):
             setattr(state, name, Mock())
         app.LERLWRApp.undo_last_action(state)
-        self.assertEqual(state.edge_detector_var.get(), app.EDGE_DETECTOR_SCHARR)
-        self.assertEqual(state.result.localization_method, app.EDGE_DETECTOR_SCHARR)
+        self.assertEqual(state.edge_detector_var.get(), app.LINE_LOCALIZATION_UNIFIED)
+        self.assertEqual(state.result.localization_method, app.LINE_LOCALIZATION_UNIFIED)
         self.assertEqual(len(app.line_pitch_pairs(state.era_line_samples)), 2)
         self.assertTrue(state.pitch_confirm_var.get())
 
-    def test_hidden_canny_parameters_do_not_block_era_or_scharr(self):
+    def test_unified_localization_never_routes_analysis_to_stale_detectors(self):
+        # 统一定位后已移除旧多识别器控件与 stub 回调：analyze_sample_edge 只接受
+        # 统一方法或旧 ERA 容器标记，任何 Scharr/Canny/Laplacian/半高 字符串直接拒绝。
         state = configured_state()
-        state.canny_high_threshold_var.set("invalid")
-        state.canny_threshold_ratio_var.set("invalid")
-        self.assertEqual(state.edge_detector_parameters()[0], app.EDGE_DETECTOR_SCHARR)
-        state.edge_detector_var.set(app.EDGE_DETECTOR_ERA)
-        state.edge_diagonal_weight_var.set("invalid")
-        self.assertEqual(state.edge_detector_parameters()[0], app.EDGE_DETECTOR_ERA)
+        state.recognize_era_lines(measure=True)
+        self.assertEqual(state.result.localization_method, app.LINE_LOCALIZATION_UNIFIED)
+        self.assertEqual(app.line_localization_signature(state.result), (app.LINE_LOCALIZATION_UNIFIED,))
 
     def test_manual_completion_inherits_bright_band_identity_and_revokes_pitch(self):
         state = periodic_state()
@@ -210,20 +212,23 @@ class SharedLineWorkflowTests(unittest.TestCase):
         state.export_roi_bounds_px = None
         self.assertIsNone(state.image_export_roi_bounds())
 
-    def test_periodic_all_side_combinations_keep_objects_across_methods(self):
+    def test_periodic_all_side_combinations_use_unified_localization(self):
         image = periodic_image()
-        for method in (app.EDGE_DETECTOR_HALF, app.EDGE_DETECTOR_ERA, app.EDGE_DETECTOR_SCHARR, app.EDGE_DETECTOR_CANNY, app.EDGE_DETECTOR_LAPLACIAN):
-            for left in ("left", "right", "center"):
-                for right in ("left", "right", "center"):
-                    with self.subTest(method=method, left=left, right=right):
-                        sample = app.periodic_line_samples(image, app.PeriodicLineSettings(left_definition=left, right_definition=right))[0]
-                        edges = [app.analyze_sample_edge(image, getattr(sample, side + "_roi_bounds_px"), .2, method,
-                                 bright_band=True, definition=definition, reference_band=getattr(sample, side + "_reference_band_px"))
-                                 for side, definition in (("left", left), ("right", right))]
-                        result = app.pair_single_edges(*edges, .2)
-                        self.assertGreater(len(result.rows_px), 140)
-                        self.assertGreater(result.mean_width_nm, 5)
-                        self.assertLess(result.mean_width_nm, 9)
+        for left in ("left", "right", "center"):
+            for right in ("left", "right", "center"):
+                with self.subTest(left=left, right=right):
+                    sample = app.periodic_line_samples(image, app.PeriodicLineSettings(left_definition=left, right_definition=right))[0]
+                    edges = [app.analyze_sample_edge(image, getattr(sample, side + "_roi_bounds_px"), .2,
+                             app.LINE_LOCALIZATION_UNIFIED,
+                             bright_band=True, definition=definition, reference_band=getattr(sample, side + "_reference_band_px"))
+                             for side, definition in (("left", left), ("right", right))]
+                    result = app.pair_single_edges(*edges, .2)
+                    # Low-level pairing keeps the legacy ERA container marker; the app-level
+                    # run_era_analysis path stamps the unified localization method.
+                    self.assertEqual(result.edge_detector, app.EDGE_DETECTOR_ERA)
+                    self.assertGreater(len(result.rows_px), 140)
+                    self.assertGreater(result.mean_width_nm, 5)
+                    self.assertLess(result.mean_width_nm, 9)
 
 
 class LinePitchTests(unittest.TestCase):
@@ -286,8 +291,9 @@ class LinePitchTests(unittest.TestCase):
             with target.open(encoding="utf-8-sig", newline="") as handle:
                 rows = list(csv.reader(handle))
         self.assertIn(["line_pitch_valid_pair_count", "2"], rows)
-        self.assertIn(["line_localization_method", app.EDGE_DETECTOR_SCHARR], rows)
-        self.assertIn(["era_polynomial_degree", "not_used"], rows)
+        self.assertIn(["line_localization_method", app.LINE_LOCALIZATION_UNIFIED], rows)
+        self.assertIn(["era_polynomial_degree", "3"], rows)
+        self.assertIn(["era_difference_weight_power", "4"], rows)
         self.assertIn(["line_pitch_direction", "working_image_x_after_user_rotation"], rows)
         index = rows.index(["pitch_first_line_index", "pitch_second_line_index", "mean_pitch_nm", "local_along_line_1sigma_nm", "common_valid_row_count"])
         self.assertAlmostEqual(float(rows[index + 1][2]), pairs[0].mean_nm)
