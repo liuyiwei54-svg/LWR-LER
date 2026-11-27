@@ -33,6 +33,7 @@ from line_diagnostics import (
     live_still_same,
     row_focus_region,
 )
+from projection_tilt import ProjectionTiltResult, refine_projection_tilt
 from line_localization import (
     LocalizationStats,
     PairLocalizationStats,
@@ -66,7 +67,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-APP_VERSION = "6.1.0"
+APP_VERSION = "6.2.0"
 
 MAX_VIEW_WIDTH = 980
 MAX_VIEW_HEIGHT = 620
@@ -80,6 +81,11 @@ MIN_BRIGHT_BAND_ROI_WIDTH = 5
 MIN_ERA_ROI_HEIGHT = 80
 ROI_HANDLE_SIZE = 5
 ROI_HANDLE_HIT = 10
+# 主图下方「灰度曲线」面板的曲线模式：平均灰度差 ΔI，或平均灰度 I（默认平均灰度）。
+# 仅影响新打开/首次构建面板的默认选择；重复构建保留已有合法选择。
+GRAY_DIFFERENCE_MODE_INTENSITY = "平均灰度"
+GRAY_DIFFERENCE_MODE_DIFFERENCE = "平均灰度差"
+GRAY_DIFFERENCE_MODE_LABELS = (GRAY_DIFFERENCE_MODE_INTENSITY, GRAY_DIFFERENCE_MODE_DIFFERENCE)
 ANNOTATION_HANDLE_HIT = 10
 ANNOTATION_COLORS = {
     "length": "#ffde59",
@@ -1582,8 +1588,13 @@ def estimate_line_tilt_degrees(image: np.ndarray) -> float:
     return math.degrees(normal_angle)
 
 
-def find_rotation_to_vertical(image: np.ndarray) -> float:
-    """Find the image rotation that makes the dominant ROI direction vertical."""
+def find_structure_tensor_rotation(image: np.ndarray) -> float:
+    """Coarse structure-tensor rotation estimate to vertical (original algorithm).
+
+    Kept verbatim as the first stage: a 1° coarse search (on a <=360 px preview)
+    around ±45°, then a 0.1° fine search around the coarse best.  Its resolution
+    (±0.1°) is what the projection refinement starts from; it is not accuracy.
+    """
     height, width = image.shape
     scale = min(1.0, 360.0 / max(height, width))
     if scale < 1.0:
@@ -1603,6 +1614,38 @@ def find_rotation_to_vertical(image: np.ndarray) -> float:
     coarse_best = min(coarse_angles, key=lambda angle: score(preview, angle))
     fine_angles = np.arange(coarse_best - 3.0, coarse_best + 3.01, 0.1)
     return float(min(fine_angles, key=lambda angle: score(image, angle)))
+
+
+def estimate_rotation_to_vertical(image: np.ndarray) -> ProjectionTiltResult:
+    """Two-stage rotation estimate: coarse structure tensor, then projection refine.
+
+    The coarse angle comes from :func:`find_structure_tensor_rotation`; the
+    real :func:`refine_projection_tilt` (from ``projection_tilt``) then searches
+    a small residual around it.  ``correction_degrees`` is the refinement when
+    it accepts, and the coarse angle unchanged (with the concrete reason) when
+    it refuses.  No contrast in the ROI still raises a friendly ``ValueError``.
+    """
+    initial = find_structure_tensor_rotation(image)
+    return refine_projection_tilt(image, initial)
+
+
+def describe_tilt_estimate(estimate: ProjectionTiltResult) -> str:
+    """One-line, UI-facing summary of a two-stage tilt estimate.
+
+    A refined estimate is only described by its angles, never by the search
+    step or a claimed accuracy.  A refused estimate keeps the coarse angle and
+    states the concrete reason.
+    """
+    initial = f"{estimate.initial_degrees:+.3f}"
+    if estimate.refined:
+        return (f"初估 {initial}° → 精修 {estimate.correction_degrees:+.3f}°"
+                f"（{estimate.peak_count} 条亮带）")
+    return f"保留初估 {initial}°：{estimate.reason}"
+
+
+def find_rotation_to_vertical(image: np.ndarray) -> float:
+    """Public float wrapper: rotation (degrees) that makes the ROI direction vertical."""
+    return float(estimate_rotation_to_vertical(image).correction_degrees)
 
 
 def row_boxes_overlap(box: tuple[float, float, float, float],
@@ -3207,7 +3250,7 @@ class LERLWRApp(AppBase):
         self.sigma_multiplier_var = tk.DoubleVar(value=1.0)
         self.outlier_level_var = tk.StringVar(value=DEFAULT_OUTLIER_LEVEL)
         self.lcdu_summary_var = tk.StringVar(value="LCDU 样本：0 条线")
-        self.rotation_var = tk.StringVar(value="0.00")
+        self.rotation_var = tk.StringVar(value="0.000")
         self.pitch_confirm_var = tk.BooleanVar(value=False)
         self.measurement_tool_var = tk.StringVar(value="框选标注")
         self.measurement_color = ANNOTATION_COLORS["length"]
@@ -3256,6 +3299,8 @@ class LERLWRApp(AppBase):
         self.gray_difference_start_entry_var: tk.StringVar | None = None
         self.gray_difference_end_entry_var: tk.StringVar | None = None
         self.gray_difference_status_var: tk.StringVar | None = None
+        # 曲线模式：``平均灰度``（I）或 ``平均灰度差``（ΔI）；下拉切换，默认平均灰度。
+        self.gray_difference_mode_var: tk.StringVar | None = None
         # 仅显示层的“非法范围”状态：置位后 update_gray_difference_curve 只清画布、
         # 保留错误提示，直到范围有效或新图/处理源改变时复位。
         self.gray_difference_error: str | None = None
@@ -3449,8 +3494,8 @@ class LERLWRApp(AppBase):
 
         self.analysis_tools_panel = ttk.LabelFrame(body, text="分析功能", padding=(10, 6))
         self.analysis_tools_panel_visible = False
-        ttk.Button(self.analysis_tools_panel, text="测量 LER / LWR", command=self.open_ler_lwr_dialog).pack(side=tk.LEFT, padx=(0, 8))
-        ttk.Button(self.analysis_tools_panel, text="识别 BCP 点阵", command=self.open_bcp_recognition_dialog).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(self.analysis_tools_panel, text="line", command=self.open_ler_lwr_dialog).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(self.analysis_tools_panel, text="dots", command=self.open_bcp_recognition_dialog).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(self.analysis_tools_panel, text="二维 FFT 频谱 / 相位", command=self.open_fft_dialog).pack(side=tk.LEFT)
         ttk.Label(self.analysis_tools_panel, text="各项分析均在独立窗口中设置与操作。", foreground="#666666").pack(side=tk.LEFT, padx=(12, 0))
 
@@ -3596,7 +3641,7 @@ class LERLWRApp(AppBase):
             "“图像处理”可独立切换归一化、可调高斯卷积和 BCP DoG 对比增强。\n"
             "取消 DoG 后，BCP 将以原始亮暗强度进行分割。\n\n"
             "LER/LWR 假设线条沿竖直方向；ROI 在测量窗口中选择，结果会保留在主窗口。"
-            "\n\nBCP 点阵：点击“识别 BCP 点阵”，先标示至少 3 个代表圆柱，再识别整图点位；绿色线为二值连通区域轮廓，蓝线为 Delaunay 三角网，红线为依据局部六重对称取向变化推断的晶界。"
+            "\n\nBCP 点阵：点击“dots”，先标示至少 3 个代表圆柱，再识别整图点位；绿色线为二值连通区域轮廓，蓝线为 Delaunay 三角网，红线为依据局部六重对称取向变化推断的晶界。"
         )
         ttk.Label(result_frame, text=hint, justify=tk.LEFT, wraplength=210).pack(anchor="nw")
         ttk.Label(body, textvariable=self.status_var, anchor="w", padding=(12, 6)).pack(side=tk.BOTTOM, fill=tk.X)
@@ -3640,7 +3685,7 @@ class LERLWRApp(AppBase):
         self.undo_history.clear()
         self.pending_undo_state = None
         self.rotation_degrees = 0.0
-        self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        self.rotation_var.set(f"{self.rotation_degrees:.3f}")
         if hasattr(self, "_background_last_applied"):
             # 载入新图后，背景控件与上次实际应用配置重新对齐（载入不触发
             # record_undo_state，直接同步缓存即可）。
@@ -3742,7 +3787,7 @@ class LERLWRApp(AppBase):
         self.annotations = [MeasurementAnnotation(item.kind, item.bounds_px, item.color) for item in state.annotations]
         self.active_annotation_index = state.active_annotation_index
         self.rotation_degrees = state.rotation_degrees
-        self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        self.rotation_var.set(f"{self.rotation_degrees:.3f}")
         self.normalize_var.set(state.normalize_enabled)
         self.gaussian_denoise_var.set(state.gaussian_denoise_enabled)
         self.gaussian_kernel_size_var.set(state.gaussian_kernel_size)
@@ -3850,13 +3895,16 @@ class LERLWRApp(AppBase):
             if self.era_pending_roi_target is not None:
                 raise ValueError("请先完成单边框编辑；倾角估计使用总体 ROI 或全图。")
             roi, _, _, _ = self.selected_ler_lwr_region()
-            correction = find_rotation_to_vertical(roi)
+            estimate = estimate_rotation_to_vertical(roi)
+            correction = float(estimate.correction_degrees)
             window = tk.Toplevel(self)
             window.title("倾角预览 / 微调")
             window.transient(self)
-            angle_var = tk.StringVar(value=f"{self.rotation_degrees + correction:.2f}")
+            angle_var = tk.StringVar(value=f"{self.rotation_degrees + correction:.3f}")
             preview = ttk.Label(window)
             preview.pack(padx=12, pady=12)
+            ttk.Label(window, text=describe_tilt_estimate(estimate),
+                      anchor=tk.W, justify=tk.LEFT).pack(fill=tk.X, padx=12)
             row = ttk.Frame(window, padding=12)
             row.pack(fill=tk.X)
             ttk.Label(row, text="累计角度（°）：").pack(side=tk.LEFT)
@@ -3886,7 +3934,7 @@ class LERLWRApp(AppBase):
 
             def adjust(delta):
                 try:
-                    angle_var.set(f"{float(angle_var.get()) + delta:.2f}")
+                    angle_var.set(f"{float(angle_var.get()) + delta:.3f}")
                 except ValueError:
                     messagebox.showwarning("角度无效", "请输入有效角度后微调。", parent=window)
 
@@ -3904,7 +3952,7 @@ class LERLWRApp(AppBase):
             return
         self.record_undo_state()
         self.rotation_degrees = 0.0
-        self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        self.rotation_var.set(f"{self.rotation_degrees:.3f}")
         if hasattr(self, "_background_last_applied"):
             self._background_last_applied = (self.background_enabled(), self._background_degree_selected())
         self.reset_zoom_control()
@@ -3932,7 +3980,7 @@ class LERLWRApp(AppBase):
             angle = float(self.rotation_var.get())
         except ValueError:
             messagebox.showwarning("角度无效", "请输入数字角度，例如 1.5 或 -0.3。")
-            self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+            self.rotation_var.set(f"{self.rotation_degrees:.3f}")
             return
         self.set_rotation_degrees(angle)
 
@@ -3940,15 +3988,15 @@ class LERLWRApp(AppBase):
         if not math.isfinite(angle_degrees):
             raise ValueError("旋转角度必须为有限数值。")
         if self.original_image is None:
-            self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+            self.rotation_var.set(f"{self.rotation_degrees:.3f}")
             return
         if math.isclose(angle_degrees, self.rotation_degrees, abs_tol=1e-9):
-            self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+            self.rotation_var.set(f"{self.rotation_degrees:.3f}")
             return
         self.record_undo_state()
         view_center = self.current_view_center()
         self.rotation_degrees = angle_degrees
-        self.rotation_var.set(f"{self.rotation_degrees:.2f}")
+        self.rotation_var.set(f"{self.rotation_degrees:.3f}")
         if hasattr(self, "_background_last_applied"):
             # 旋转不改变背景开关/阶数本身，只重建工作图；对齐缓存以保持
             # 后续背景切换的上一配置判断一致。
@@ -3968,7 +4016,7 @@ class LERLWRApp(AppBase):
         self.draw_image()
         self.restore_view_center(view_center)
         self.result_var.set("图像角度已手动调整；请重新框选 ROI，或直接使用整图重新识别 / 分析。")
-        self.status_var.set(f"当前累计旋转角度：{self.rotation_degrees:+.2f}°。")
+        self.status_var.set(f"当前累计旋转角度：{self.rotation_degrees:+.3f}°。")
 
     def show_metadata(self) -> None:
         window = tk.Toplevel(self)
@@ -4987,7 +5035,7 @@ class LERLWRApp(AppBase):
         """Build the vertical SEM-canvas / gray-difference paned layout.
 
         在 ``canvas_frame`` 内创建一个垂直 ``ttk.PanedWindow``：上方为 SEM canvas
-        宿主 ``image_pane``，下方为「灰度差曲线」``LabelFrame``（通过 ``build_panel``
+        宿主 ``image_pane``，下方为「灰度曲线」``LabelFrame``（通过 ``build_panel``
         填装曲线控件）。两个 pane 是彼此分离的 widget，曲线绝不画进 SEM canvas。
 
         返回 ``image_pane``（SEM canvas 的父容器），供调用方继续挂载画布与滚动条。
@@ -4999,7 +5047,7 @@ class LERLWRApp(AppBase):
         canvas_split = ttk.PanedWindow(canvas_frame, orient=tk.VERTICAL)
         canvas_split.pack(fill=tk.BOTH, expand=True)
         image_pane = ttk.Frame(canvas_split, width=780, height=400)
-        difference_pane = ttk.LabelFrame(canvas_split, text="灰度差曲线", padding=(4, 4), width=780, height=220)
+        difference_pane = ttk.LabelFrame(canvas_split, text="灰度曲线", padding=(4, 4), width=780, height=220)
         canvas_split.add(image_pane, weight=5)
         canvas_split.add(difference_pane, weight=2)
         image_pane.pack_propagate(False)
@@ -5011,12 +5059,30 @@ class LERLWRApp(AppBase):
         """Build the inline gray-difference (ΔI) curve panel widget.
 
         一个单独的 ``ttk.LabelFrame``（不画进 SEM canvas，也不作为任何注释/导出
-        图片的一部分）。含一行紧凑的行范围控件（起/止 y 输入框 + 应用，支持
-        Return），以及一个只读的曲线 Canvas。曲线数据只读，不改变图像/ROI/样本/
-        结果/undo。默认平均范围=整幅处理图高度，载图后立即绘制，无需点击。
+        图片的一部分）。含一行紧凑控件：曲线模式下拉（``平均灰度`` / ``平均灰度差``，
+        默认平均灰度）、平均行范围起/止 y 输入框 + 应用（支持 Return），以及一个只读的
+        曲线 Canvas。每次只画一种曲线，切换时整幅重绘（清旧曲线，不叠加）。曲线数据
+        只读，不改变图像/ROI/样本/结果/undo。默认平均范围=整幅处理图高度，载图后
+        立即绘制，无需点击。重复构建时保留已有模式选择。
         """
         control_row = ttk.Frame(parent)
         control_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        ttk.Label(control_row, text="曲线").pack(side=tk.LEFT)
+        selected_mode = getattr(self, "gray_difference_mode_var", None)
+        current_mode = selected_mode.get() if selected_mode is not None else ""
+        if current_mode not in GRAY_DIFFERENCE_MODE_LABELS:
+            current_mode = GRAY_DIFFERENCE_MODE_INTENSITY
+        # 每次只显示一种曲线：平均灰度 I（默认）或平均灰度差 ΔI；重复构建保留已有合法选择。
+        self.gray_difference_mode_var = tk.StringVar(parent, value=current_mode)
+        mode_selector = ttk.Combobox(
+            control_row,
+            textvariable=self.gray_difference_mode_var,
+            state="readonly",
+            values=GRAY_DIFFERENCE_MODE_LABELS,
+            width=12,
+        )
+        mode_selector.pack(side=tk.LEFT, padx=(6, 14))
+        mode_selector.bind("<<ComboboxSelected>>", self.gray_difference_mode_changed)
         ttk.Label(control_row, text="平均行范围 y").pack(side=tk.LEFT)
         self.gray_difference_start_entry_var = tk.StringVar(parent, value="")
         start_entry = ttk.Entry(control_row, textvariable=self.gray_difference_start_entry_var, width=6)
@@ -5026,9 +5092,7 @@ class LERLWRApp(AppBase):
         end_entry = ttk.Entry(control_row, textvariable=self.gray_difference_end_entry_var, width=6)
         end_entry.pack(side=tk.LEFT, padx=(6, 2))
         apply_button = ttk.Button(control_row, text="应用", command=self.gray_difference_view_range)
-        apply_button.pack(side=tk.LEFT, padx=(2, 8))
-        ttk.Label(control_row, text="先平均各行，再做水平差分 ΔI = I[x+1] − I[x]；横坐标 x+0.5").pack(
-            side=tk.LEFT, padx=(0, 0))
+        apply_button.pack(side=tk.LEFT, padx=(2, 0))
         for widget in (start_entry, end_entry):
             widget.bind("<Return>", self.gray_difference_view_range)
         self.gray_difference_status_var = tk.StringVar(parent, value="未载入图像。")
@@ -5134,21 +5198,54 @@ class LERLWRApp(AppBase):
                 return max(1, int(round(step)))
         return max(1, int(round(10.0 * base)))
 
-    def update_gray_difference_curve(self) -> None:
-        """Redraw the inline ΔI curve from the *real* processed measurement input.
+    @staticmethod
+    def gray_difference_mode_value(var: object) -> str:
+        """Return the selected curve mode label, defaulting to 平均灰度.
 
-        只读、纯显示：先对 ``processed_image`` 所选 y 范围做算术平均（float64），再取
-        水平差分，用原生 Canvas 画线与刻度，使横轴在任意缩放/水平滚动/空格拖动/重设
-        大小时都与上方 SEM 图像素物理对齐（图像外空白保留为空白，不拉伸到面板全宽）。
+        ``var`` 可为 Tk ``StringVar`` / fake / ``None``。未配置 modevar 的旧 headless
+        fixture 及任何非法/空值一律安全默认为 ``平均灰度``（I）；合法选择原样返回。
+        """
+        if var is None:
+            return GRAY_DIFFERENCE_MODE_INTENSITY
+        try:
+            value = var.get()
+        except Exception:
+            return GRAY_DIFFERENCE_MODE_INTENSITY
+        return value if value in GRAY_DIFFERENCE_MODE_LABELS else GRAY_DIFFERENCE_MODE_INTENSITY
+
+    def gray_difference_mode(self) -> str:
+        """当前曲线模式（``平均灰度`` / ``平均灰度差``），缺失时默认 ``平均灰度``。"""
+        resolver = getattr(self, "gray_difference_mode_value", None)
+        if resolver is None:
+            resolver = type(self).gray_difference_mode_value
+        return resolver(getattr(self, "gray_difference_mode_var", None))
+
+    def gray_difference_mode_changed(self, _event: object = None) -> None:
+        """``<<ComboboxSelected>>`` 回调：按新模式整幅重绘（清旧曲线，不叠加）。
+
+        只切显示模式：同样的 y 范围、同样的缓存平均剖面，不重新做整图平均；不改变
+        图像/ROI/样本/结果/undo，也不触碰 BCP DoG 预览。
+        """
+        self._cancel_gray_difference_redraw()
+        self.update_gray_difference_curve()
+
+    def update_gray_difference_curve(self) -> None:
+        """Redraw the inline mean curve (平均灰度 I or 平均灰度差 ΔI) from the real image.
+
+        只读、纯显示：先对 ``processed_image`` 所选 y 范围做算术平均（float64，缓存），
+        再按模式取 ``I``（默认；x = 工作图列 0..width-1）或 ``ΔI = I[x+1] - I[x]``
+        （x = idx + 0.5），用原生 Canvas 画线与刻度，使横轴在任意缩放/水平滚动/空格拖动/重设大小
+        时都与上方 SEM 图像素物理对齐（图像外空白保留为空白，不拉伸到面板全宽）。每次
+        只画一种曲线，切换模式即整幅重绘。
 
         屏幕 x 变换（与 ``draw_image`` 的图像 NW 锚点一致）::
 
             screen_x(x_img) = x_img * display_scale - main.canvasx(0)
                               + main.winfo_rootx() - graph.winfo_rootx()
 
-        数据点 x 为半像素 ``idx + 0.5``；图像右边界在 ``x = width``（不是 width+0.5）。
-        顶部保留一行刻度文字带、底部预留纵向单位标注带，两者都不改变水平映射（不设
-        左侧数据边距）。不碰 BCP DoG 预览、不拟合背景、不改任何测量状态。
+        数据点 x 图像右边界在 ``x = width``（不是 width+0.5）。顶部保留一行刻度文字带、
+        底部预留纵向单位标注带，两者都不改变水平映射（不设左侧数据边距）。不碰 BCP
+        DoG 预览、不拟合背景、不改任何测量状态。
         """
         canvas = getattr(self, "gray_difference_canvas", None)
         if canvas is None:
@@ -5182,11 +5279,16 @@ class LERLWRApp(AppBase):
                 status_var.set("未载入图像。")
             return
         height, width = image.shape
-        if width < 2:
+        mode = self.gray_difference_mode()
+        is_difference = mode == GRAY_DIFFERENCE_MODE_DIFFERENCE
+        unit = "ΔI" if is_difference else "I"
+        axis_note = ("x 为列间中点 x+0.5，ΔI = I[x+1] − I[x]。" if is_difference
+                     else "x 为工作图列坐标 0..宽度−1，I 为行平均灰度。")
+        if is_difference and width < 2:
             canvas.delete("all")
             self.gray_difference_photo = None
             if status_var is not None:
-                status_var.set("图像过窄，无法计算灰度差。")
+                status_var.set("图像过窄（宽度 1 px），无法计算灰度差。")
             return
         resolved = self.gray_difference_resolved_range()
         if resolved is None:
@@ -5202,16 +5304,41 @@ class LERLWRApp(AppBase):
             if status_var is not None:
                 status_var.set(str(exc))
             return
-        difference = profile_adjacent_difference(mean_profile)
-        n = len(difference)
+        mean_profile = np.asarray(mean_profile, dtype=float).ravel()
+        if len(mean_profile) != width:
+            canvas.delete("all")
+            self.gray_difference_photo = None
+            if status_var is not None:
+                status_var.set("平均剖面长度与图像宽度不一致，暂不绘制。")
+            return
+        if is_difference:
+            # 平均剖面至少 2 列时差分长度 = width − 1；单列已在上面显式报“过窄”。
+            try:
+                values = np.asarray(profile_adjacent_difference(mean_profile), dtype=float)
+            except ValueError:
+                canvas.delete("all")
+                self.gray_difference_photo = None
+                if status_var is not None:
+                    status_var.set("图像过窄（宽度 1 px），无法计算灰度差。")
+                return
+            n = len(values)
+            sample_x = lambda idx: idx + 0.5  # noqa: E731 - 半像素列间中点
+        else:
+            values = mean_profile
+            n = len(values)
+            sample_x = lambda idx: float(idx)  # noqa: E731 - 整列坐标
+
+        self.gray_difference_photo = None
+        # 图像右边界固定为工作图 x = width（不因灰度模式少画右界竖线）；两种模式都把
+        # 最右一列/最后一个半像素点画到该边界内侧。
+        image_right_img = float(width)
+        caption = (
+            f"{mode}｜平均行 {y_start}..{y_end}（共 {y_end - y_start} 行 / 全高 {height}），"
+            f"分辨率 {width} px，{unit} 点数 {n}。{axis_note}"
+        )
 
         canvas.delete("all")
         self.gray_difference_photo = None
-        caption = (
-            f"平均行 {y_start}..{y_end}（共 {y_end - y_start} 行 / 全高 {height}），"
-            f"分辨率 {width} px，ΔI 长度 {n}。"
-        )
-
         # ---- 物理对齐坐标 -------------------------------------------------
         main = getattr(self, "canvas", None)
         try:
@@ -5236,12 +5363,11 @@ class LERLWRApp(AppBase):
 
         # 仅绘制落在面板可见视口内的部分；不设左侧数据边距。
         left_edge, right_edge = 0.0, float(wig)
-        # 图像右边界（工作图 x = width）。
-        image_right = screen_x(float(width))
+        # 图像右边界固定为工作图 x = width（刻度/零轴右锚点）；灰度模式最右数据列
+        # 仍是 width − 1，不把 width−1 写死成边界。
+        image_right = screen_x(image_right_img)
         zero_x0 = screen_x(0.0)
-        zero_x1 = screen_x(min(float(width), float(n)))
-        if zero_x1 > image_right:
-            zero_x1 = image_right
+        zero_x1 = image_right
 
         # ---- 纵向带：顶部刻度文字、底部单位标注 ------------------------
         tick_band = 14.0
@@ -5255,10 +5381,10 @@ class LERLWRApp(AppBase):
             bottom = max(top + 1.0, float(vig) - 2.0)
         y_span = max(1.0, bottom - top)
 
-        low = float(np.nanmin(difference)) if n else 0.0
-        high = float(np.nanmax(difference)) if n else 0.0
+        low = float(np.nanmin(values)) if n else 0.0
+        high = float(np.nanmax(values)) if n else 0.0
         if not np.isfinite(low) or not np.isfinite(high):
-            low, high = -1.0, 1.0
+            low, high = (-1.0, 1.0) if is_difference else (0.0, 255.0)
         if high <= low:
             pad = 1.0 if high == low else (high - low) * 0.05
             low -= pad
@@ -5268,13 +5394,13 @@ class LERLWRApp(AppBase):
             low -= pad
             high += pad
         if not (np.isfinite(low) and np.isfinite(high)) or high <= low:
-            low, high = -1.0, 1.0
+            low, high = (-1.0, 1.0) if is_difference else (0.0, 255.0)
 
         def data_y(value: float) -> float:
             return bottom - (float(value) - low) * y_span / max(1e-12, high - low)
 
-        # ---- 刻度：水平位置（工作图 px）与纵向 ΔI ----------------------
-        if tick_band > 0.0:
+        # ---- 刻度：水平位置（工作图 px）与纵向 I / ΔI -------------------
+        if tick_band > 0.0 and scale > 0.0:
             step = self.gray_difference_nice_tick_step(scale)
             first_tick = int(np.ceil(max(0.0, (left_edge - origin) / scale) / step) * step)
             tick = first_tick
@@ -5287,34 +5413,45 @@ class LERLWRApp(AppBase):
                                        text=f"{int(tick)}",
                                        fill="#a0a0a0", anchor=tk.S, font=("Helvetica", 8))
                 tick += step
-            # 纵向 ΔI 单位：最大值/最小值/零轴标签放在右端（不占左侧数据边距）。
+            # 纵向单位：最大值/最小值/零轴标签放在右端（不占左侧数据边距）。
             label_x = min(right_edge - 2.0, max(left_edge + 2.0, image_right - 2.0))
-            canvas.create_text(label_x, top + 1.0, text=f"ΔI {high:+.2f}",
+            canvas.create_text(label_x, top + 1.0, text=f"{unit} {high:+.2f}",
                                fill="#a0a0a0", anchor=tk.NE, font=("Helvetica", 8))
-            canvas.create_text(label_x, bottom - 1.0, text=f"ΔI {low:+.2f}",
+            canvas.create_text(label_x, bottom - 1.0, text=f"{unit} {low:+.2f}",
                                fill="#a0a0a0", anchor=tk.SE, font=("Helvetica", 8))
-            canvas.create_text(label_x, data_y(0.0) - 1.0, text="ΔI 0",
-                               fill="#808080", anchor=tk.SE, font=("Helvetica", 8))
+            if low <= 0.0 <= high:
+                canvas.create_text(label_x, data_y(0.0) - 1.0, text=f"{unit} 0",
+                                   fill="#808080", anchor=tk.SE, font=("Helvetica", 8))
 
-        # ---- 零轴（水平虚线，截断到图像右边界内）----------------------
-        if zero_x1 >= zero_x0 and zero_x0 <= right_edge and zero_x1 >= left_edge:
+        # ---- 零轴（水平虚线；灰度 mode 仅在纵轴含 0 时出现）------------
+        show_zero_axis = is_difference or (low <= 0.0 <= high)
+        if show_zero_axis and zero_x1 > zero_x0 and zero_x0 <= right_edge and zero_x1 >= left_edge:
             canvas.create_line(max(zero_x0, left_edge), data_y(0.0),
                                min(zero_x1, right_edge), data_y(0.0),
                                fill="#555555", dash=(2, 2))
 
         # ---- 曲线：按可见片段断开，不跨空白处连线 ----------------------
         curve_fill = "#7fd4ff"
+
+        def draw_curve_run(points: list[float]) -> None:
+            # 单点（灰度模式单列图）也要画出，不当空段丢弃：Tk create_line 至少要
+            # 4 个坐标（两个点），一点时用 level-1 原子图元 create_oval 画实心小点。
+            if len(points) >= 4:
+                canvas.create_line(*points, fill=curve_fill, width=1)
+            elif len(points) == 2:
+                px, py = points
+                canvas.create_oval(px - 1.0, py - 1.0, px + 1.0, py + 1.0,
+                                   fill=curve_fill, outline=curve_fill, width=1)
+
         segment: list[float] = []
         for idx in range(n):
-            sx = screen_x(idx + 0.5)
+            sx = screen_x(sample_x(idx))
             if sx < left_edge - 1.0 or sx > right_edge + 1.0:
-                if len(segment) >= 4:
-                    canvas.create_line(*segment, fill=curve_fill, width=1)
+                draw_curve_run(segment)
                 segment = []
                 continue
-            segment.extend((min(max(sx, left_edge), right_edge), data_y(float(difference[idx]))))
-        if len(segment) >= 4:
-            canvas.create_line(*segment, fill=curve_fill, width=1)
+            segment.extend((min(max(sx, left_edge), right_edge), data_y(float(values[idx]))))
+        draw_curve_run(segment)
 
         # 图像右边界竖线：标记“图像以外横向空白仍为空白”。
         if left_edge <= image_right <= right_edge:
@@ -5326,6 +5463,7 @@ class LERLWRApp(AppBase):
             end_var.set(str(y_end))
         if status_var is not None:
             status_var.set(caption)
+
 
     def _gray_difference_xscroll(self, first: float, last: float) -> None:
         """主 SEM canvas 的 ``xscrollcommand`` 包装：保留滚条 ``set`` 并合并调度曲线重绘。
@@ -5375,7 +5513,7 @@ class LERLWRApp(AppBase):
         canvas = getattr(self, "gray_difference_canvas", None)
         if canvas is not None:
             canvas.delete("all")
-        self.gray_difference_photo = None
+            self.gray_difference_photo = None
         status_var = getattr(self, "gray_difference_status_var", None)
         if status_var is not None:
             status_var.set(reason)
