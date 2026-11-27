@@ -66,7 +66,7 @@ except ImportError:
     DND_AVAILABLE = False
 
 
-APP_VERSION = "6.0.0"
+APP_VERSION = "6.1.0"
 
 MAX_VIEW_WIDTH = 980
 MAX_VIEW_HEIGHT = 620
@@ -719,6 +719,22 @@ def profile_difference_x_axis(intensity: np.ndarray, origin_x: float = 0.0) -> n
     """x 轴（半像素 x + 0.5）供灰度差曲线使用，工作图全局 px。"""
     count = max(0, len(np.asarray(intensity, dtype=float)) - 1)
     return np.arange(count, dtype=float) + 0.5 + origin_x
+
+
+def profile_mean_intensity(image: np.ndarray, y_start: int, y_end: int) -> np.ndarray:
+    """平均 profile：对 ``image[y_start:y_end, :]`` 取算术平均（float64）。
+
+    ``y_start`` 为包含起点、``y_end`` 为不含终点，均严格落在 ``0..height``，
+    且 ``y_end > y_start``。返回长度等于图像宽度的 float 数组，供灰度差/平均
+    灰度曲线共用。与 ``profile_scanline_intensity``（单行）互为独立数据函数，
+    粗定位/单行诊断的现有多行中位数逻辑保持不变。
+    """
+    if image.ndim != 2:
+        raise ValueError("图像必须是二维灰度数组。")
+    height, width = image.shape
+    if not (0 <= y_start < y_end <= height):
+        raise ValueError(f"平均范围 {y_start}..{y_end} 不在 0..{height} 内。")
+    return np.mean(image[y_start:y_end, :], axis=0, dtype=np.float64)
 
 
 @dataclass
@@ -3227,6 +3243,31 @@ class LERLWRApp(AppBase):
         self.fit_right_color = DEFAULT_FIT_RIGHT_COLOR
         self.grain_overlay_image: ImageTk.PhotoImage | None = None
         self.centroid_layout_overlay_image: ImageTk.PhotoImage | None = None
+        # Inline gray-difference (ΔI) curve panel beneath the main SEM canvas.
+        # ``gray_difference_y_start`` / ``gray_difference_y_end`` hold the working-image
+        # global inclusive/exclusive row range over which the arithmetic mean profile
+        # is taken; ``None`` means "not applied yet" and is resolved to the full image
+        # height on the first image load.  Display-only: changing this range never
+        # mutates image/ROI/sample/results/undo/PSD/FFT/BCP/export state.
+        self.gray_difference_y_start: int | None = None
+        self.gray_difference_y_end: int | None = None
+        self.gray_difference_photo: ImageTk.PhotoImage | None = None
+        self.gray_difference_canvas: tk.Canvas | None = None
+        self.gray_difference_start_entry_var: tk.StringVar | None = None
+        self.gray_difference_end_entry_var: tk.StringVar | None = None
+        self.gray_difference_status_var: tk.StringVar | None = None
+        # 仅显示层的“非法范围”状态：置位后 update_gray_difference_curve 只清画布、
+        # 保留错误提示，直到范围有效或新图/处理源改变时复位。
+        self.gray_difference_error: str | None = None
+        self._gray_diff_redraw_pending = False
+        # 缓存：按（processed_image 对象 id, y_start, y_end）缓存平均 profile，
+        # 避免平移/缩放/重绘时反复做整图平均；源或范围变化时失效重算。
+        self._gray_diff_cache_key: tuple[int, int, int] | None = None
+        self._gray_diff_cached_mean: np.ndarray | None = None
+        # 持有缓存对应的源数组引用，防止 ``id()`` 在旧数组被回收后被新对象复用
+        # 而返回过期平均；仅是一条引用，不做拷贝、不改图像。
+        self._gray_diff_cache_source: np.ndarray | None = None
+        self._gray_diff_after_token: str | None = None
 
         self._build_ui()
         for variable in (self.edge_detector_var, self.era_polarity_var, self.era_polynomial_degree_var,
@@ -3489,18 +3530,23 @@ class LERLWRApp(AppBase):
 
         canvas_frame = ttk.Frame(image_workspace)
         canvas_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self.canvas = tk.Canvas(canvas_frame, background="#202020", highlightthickness=0, width=780, height=620, takefocus=True)
-        self.image_vertical_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=self.canvas.yview)
-        self.image_horizontal_scrollbar = ttk.Scrollbar(canvas_frame, orient=tk.HORIZONTAL, command=self.canvas.xview)
+        # Vertical split: SEM canvas on top, inline gray-difference (ΔI) curve below.
+        # Both are separate widgets; the curve is never drawn into the SEM canvas.
+        image_pane = self._build_gray_difference_split(canvas_frame, self.build_gray_difference_panel)
+        self.canvas = tk.Canvas(image_pane, background="#202020", highlightthickness=0, width=780, height=400, takefocus=True)
+        self.image_vertical_scrollbar = ttk.Scrollbar(image_pane, orient=tk.VERTICAL, command=self.canvas.yview)
+        self.image_horizontal_scrollbar = ttk.Scrollbar(image_pane, orient=tk.HORIZONTAL, command=self.canvas.xview)
         self.canvas.configure(
-            xscrollcommand=self.image_horizontal_scrollbar.set,
+            xscrollcommand=self._gray_difference_xscroll,
             yscrollcommand=self.image_vertical_scrollbar.set,
         )
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.image_vertical_scrollbar.grid(row=0, column=1, sticky="ns")
         self.image_horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
-        canvas_frame.columnconfigure(0, weight=1)
-        canvas_frame.rowconfigure(0, weight=1)
+        image_pane.columnconfigure(0, weight=1)
+        image_pane.rowconfigure(0, weight=1)
+        # 主 SEM canvas 尺寸变化时，灰度差曲线的物理对齐坐标也变 → 合并调度重绘。
+        self.canvas.bind("<Configure>", lambda _event: self._schedule_gray_difference_redraw(), add="+")
         self.canvas.bind("<ButtonPress-1>", self.start_canvas_action)
         self.canvas.bind("<B1-Motion>", self.move_canvas_action)
         self.canvas.bind("<ButtonRelease-1>", self.finish_canvas_action)
@@ -3624,6 +3670,16 @@ class LERLWRApp(AppBase):
         self.clear_auto_line_candidates(redraw=False)
         self.annotations.clear()
         self.active_annotation_index = None
+        # 新图重置灰度差曲线到整幅高度，并清除旧的非法范围显示状态/排队重绘；
+        # 下一帧 draw_image 会按实际尺寸约束并重绘合法范围。
+        self.gray_difference_y_start = None
+        self.gray_difference_y_end = None
+        self.invalidate_gray_difference_cache()
+        self._cancel_gray_difference_redraw()
+        self.gray_difference_error = None
+        status_var = getattr(self, "gray_difference_status_var", None)
+        if status_var is not None:
+            status_var.set("")
         self.draw_image(reset_view=True)
         self.result_var.set("打开 LER/LWR 测量窗口，可自动找线并测量，或手动选择单边 ROI。")
         crop_note = f"；已自动裁掉底部信息栏 {self.info_bar_crop_height_px} px" if self.info_bar_crop_height_px else ""
@@ -3758,6 +3814,10 @@ class LERLWRApp(AppBase):
             background_degree=self.background_degree(),
         )
         self.rebuild_bcp_preview()
+        # 处理源变化：平均 profile 缓存失效（源对象 id 相应变化，缓存键自动失配），
+        # 并立即按新范围重绘；行范围保持整幅默认或已有合法范围。
+        self.invalidate_gray_difference_cache()
+        self.update_gray_difference_curve()
 
     def bcp_preview_diameter_px(self) -> float:
         """Choose a stable DoG preview scale without requiring BCP dialog input."""
@@ -3832,7 +3892,7 @@ class LERLWRApp(AppBase):
 
             for delta in (-0.1, 0.1):
                 ttk.Button(row, text=f"{delta:+.1f}°", command=lambda d=delta: adjust(d)).pack(side=tk.LEFT, padx=4)
-            ttk.Button(row, text="应用并重新找框", command=apply).pack(side=tk.LEFT, padx=8)
+            ttk.Button(row, text="应用倾角校正", command=apply).pack(side=tk.LEFT, padx=8)
             ttk.Button(row, text="取消", command=window.destroy).pack(side=tk.LEFT)
             angle_var.trace_add("write", redraw)
             redraw()
@@ -4923,8 +4983,461 @@ class LERLWRApp(AppBase):
         self.result_var.set("BCP 对比方式已切换；画布预览已刷新，请重新点击“开始识别”。")
         self.status_var.set(f"画布已切换为：{mode}；LER/LWR 分析输入不变。")
 
+    def _build_gray_difference_split(self, canvas_frame: ttk.Frame, build_panel) -> ttk.Frame:
+        """Build the vertical SEM-canvas / gray-difference paned layout.
+
+        在 ``canvas_frame`` 内创建一个垂直 ``ttk.PanedWindow``：上方为 SEM canvas
+        宿主 ``image_pane``，下方为「灰度差曲线」``LabelFrame``（通过 ``build_panel``
+        填装曲线控件）。两个 pane 是彼此分离的 widget，曲线绝不画进 SEM canvas。
+
+        返回 ``image_pane``（SEM canvas 的父容器），供调用方继续挂载画布与滚动条。
+        初始尺寸通过 child widget 的请求尺寸（
+        ``canvas_split.sashpos`` 仅在真实布局完成后按请求大小设置一次）表达，
+        绝不调用 ``ttk.PanedWindow.panes(...)`` 带参数——捆绑 Tk 的签名仅
+        ``panes(self)``（查询），带与会直接 ``TypeError``。
+        """
+        canvas_split = ttk.PanedWindow(canvas_frame, orient=tk.VERTICAL)
+        canvas_split.pack(fill=tk.BOTH, expand=True)
+        image_pane = ttk.Frame(canvas_split, width=780, height=400)
+        difference_pane = ttk.LabelFrame(canvas_split, text="灰度差曲线", padding=(4, 4), width=780, height=220)
+        canvas_split.add(image_pane, weight=5)
+        canvas_split.add(difference_pane, weight=2)
+        image_pane.pack_propagate(False)
+        difference_pane.pack_propagate(False)
+        build_panel(difference_pane)
+        return image_pane
+
+    def build_gray_difference_panel(self, parent: ttk.LabelFrame) -> None:
+        """Build the inline gray-difference (ΔI) curve panel widget.
+
+        一个单独的 ``ttk.LabelFrame``（不画进 SEM canvas，也不作为任何注释/导出
+        图片的一部分）。含一行紧凑的行范围控件（起/止 y 输入框 + 应用，支持
+        Return），以及一个只读的曲线 Canvas。曲线数据只读，不改变图像/ROI/样本/
+        结果/undo。默认平均范围=整幅处理图高度，载图后立即绘制，无需点击。
+        """
+        control_row = ttk.Frame(parent)
+        control_row.pack(side=tk.TOP, fill=tk.X, pady=(0, 2))
+        ttk.Label(control_row, text="平均行范围 y").pack(side=tk.LEFT)
+        self.gray_difference_start_entry_var = tk.StringVar(parent, value="")
+        start_entry = ttk.Entry(control_row, textvariable=self.gray_difference_start_entry_var, width=6)
+        start_entry.pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Label(control_row, text="≤ y <").pack(side=tk.LEFT)
+        self.gray_difference_end_entry_var = tk.StringVar(parent, value="")
+        end_entry = ttk.Entry(control_row, textvariable=self.gray_difference_end_entry_var, width=6)
+        end_entry.pack(side=tk.LEFT, padx=(6, 2))
+        apply_button = ttk.Button(control_row, text="应用", command=self.gray_difference_view_range)
+        apply_button.pack(side=tk.LEFT, padx=(2, 8))
+        ttk.Label(control_row, text="先平均各行，再做水平差分 ΔI = I[x+1] − I[x]；横坐标 x+0.5").pack(
+            side=tk.LEFT, padx=(0, 0))
+        for widget in (start_entry, end_entry):
+            widget.bind("<Return>", self.gray_difference_view_range)
+        self.gray_difference_status_var = tk.StringVar(parent, value="未载入图像。")
+        self.gray_difference_canvas = tk.Canvas(parent, background="#181818", highlightthickness=0, height=160)
+        self.gray_difference_canvas.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.gray_difference_canvas.bind("<Configure>", lambda _event: self._schedule_gray_difference_redraw())
+        ttk.Label(parent, textvariable=self.gray_difference_status_var).pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+        # 首绘空状态，之后随载图/处理/尺寸变化刷新。
+        self.update_gray_difference_curve()
+
+    def gray_difference_resolved_range(self) -> tuple[int, int] | None:
+        """Resolve the mean row range, defaulting to the full image height.
+
+        返回 ``(y_start, y_end)``（包含/不含），仅在没有处理图时返回 ``None``。
+        """
+        image = getattr(self, "processed_image", None)
+        if image is None:
+            return None
+        height = image.shape[0]
+        if height < 1:
+            return None
+        y_start = self.gray_difference_y_start
+        y_end = self.gray_difference_y_end
+        if y_start is None or y_end is None:
+            # 空则整幅高度。
+            y_start, y_end = 0, height
+            self.gray_difference_y_start, self.gray_difference_y_end = 0, height
+        else:
+            y_start = int(np.clip(y_start, 0, height - 1))
+            y_end = int(np.clip(y_end, y_start + 1, height))
+            self.gray_difference_y_start, self.gray_difference_y_end = y_start, y_end
+        return y_start, y_end
+
+    def gray_difference_cached_mean(self, y_start: int, y_end: int) -> np.ndarray:
+        """Return the cached (or freshly computed) mean profile for ``y_start:y_end``.
+
+        缓存键为 ``(id(processed_image), y_start, y_end)``；同时持有源数组引用
+        ``_gray_diff_cache_source`` 并用 ``is`` 校验同一对象，避免源数组被回收后
+        ``id()`` 被新数组复用而返回过期平均。源或范围变化时自动重算；平移/缩放只改
+        视口坐标，不触发整图平均重算。只读：不做任何图像赋值。
+        """
+        image = self.processed_image
+        key = (id(image), int(y_start), int(y_end))
+        cached = getattr(self, "_gray_diff_cached_mean", None)
+        if (cached is not None
+                and getattr(self, "_gray_diff_cache_key", None) == key
+                and getattr(self, "_gray_diff_cache_source", None) is image):
+            return cached
+        self._gray_diff_cached_mean = profile_mean_intensity(image, y_start, y_end)
+        self._gray_diff_cache_key = key
+        self._gray_diff_cache_source = image
+        return self._gray_diff_cached_mean
+
+    def invalidate_gray_difference_cache(self) -> None:
+        """Drop the cached mean profile (source image or its processing changed)."""
+        self._gray_diff_cache_key = None
+        self._gray_diff_cached_mean = None
+        self._gray_diff_cache_source = None
+
+    @staticmethod
+    def gray_difference_widget_root_x(widget: object) -> float | None:
+        """Absolute screen x of a widget's left edge via the real Tk API.
+
+        使用 ``winfo_rootx()``（Tk Canvas 没有 ``rootx`` 属性，那是 canvas 的 *坐标*
+        方法 ``canvasx`` 之外的另一套 API）；取不到（未布局、已销毁、fake 未实现）
+        时返回 ``None``，调用方据此安全退出，不把异常吞成错误对齐。
+        """
+        getter = getattr(widget, "winfo_rootx", None)
+        if getter is None:
+            return None
+        try:
+            return float(getter())
+        except (tk.TclError, TypeError, ValueError):
+            return None
+
+    def _gray_difference_main_root_x(self) -> float | None:
+        """主 SEM canvas 左边界在当前屏幕坐标系中的绝对 x 坐标。
+
+        返回 ``None`` 表示主 canvas 尚未布局（未映射或 ``winfo_rootx`` 不可用）；图表
+        据此把数据点画到与主图相同的水平屏幕坐标。
+        """
+        main = getattr(self, "canvas", None)
+        if main is None:
+            return None
+        try:
+            if not main.winfo_ismapped():
+                return None
+        except (tk.TclError, AttributeError):
+            pass
+        return self.gray_difference_widget_root_x(main)
+
+    @staticmethod
+    def gray_difference_nice_tick_step(scale: float, target_px: float = 100.0) -> int:
+        """Pick a 1/2/5×10^k image-pixel tick step whose screen spacing ≈ ``target_px``."""
+        if scale <= 0:
+            return 1
+        raw = max(1.0, float(target_px) / float(scale))
+        exponent = int(np.floor(np.log10(raw)))
+        base = 10.0 ** exponent
+        for factor in (1.0, 2.0, 5.0, 10.0):
+            step = factor * base
+            if step >= raw:
+                return max(1, int(round(step)))
+        return max(1, int(round(10.0 * base)))
+
+    def update_gray_difference_curve(self) -> None:
+        """Redraw the inline ΔI curve from the *real* processed measurement input.
+
+        只读、纯显示：先对 ``processed_image`` 所选 y 范围做算术平均（float64），再取
+        水平差分，用原生 Canvas 画线与刻度，使横轴在任意缩放/水平滚动/空格拖动/重设
+        大小时都与上方 SEM 图像素物理对齐（图像外空白保留为空白，不拉伸到面板全宽）。
+
+        屏幕 x 变换（与 ``draw_image`` 的图像 NW 锚点一致）::
+
+            screen_x(x_img) = x_img * display_scale - main.canvasx(0)
+                              + main.winfo_rootx() - graph.winfo_rootx()
+
+        数据点 x 为半像素 ``idx + 0.5``；图像右边界在 ``x = width``（不是 width+0.5）。
+        顶部保留一行刻度文字带、底部预留纵向单位标注带，两者都不改变水平映射（不设
+        左侧数据边距）。不碰 BCP DoG 预览、不拟合背景、不改任何测量状态。
+        """
+        canvas = getattr(self, "gray_difference_canvas", None)
+        if canvas is None:
+            return
+        wig = canvas.winfo_width()
+        vig = canvas.winfo_height()
+        if wig <= 2:
+            # 尚未布局完成：不在此自排，也不调度 after_idle——等真实 <Configure>
+            # 事件（回调里合并调度）再画。
+            return
+        image = getattr(self, "processed_image", None)
+        start_var = getattr(self, "gray_difference_start_entry_var", None)
+        end_var = getattr(self, "gray_difference_end_entry_var", None)
+        status_var = getattr(self, "gray_difference_status_var", None)
+        # 非法范围（display-only 错误态）：只清画布并保留错误文字。
+        error = getattr(self, "gray_difference_error", None)
+        if error is not None:
+            canvas.delete("all")
+            self.gray_difference_photo = None
+            if status_var is not None:
+                status_var.set(error)
+            return
+        if image is None or image.size == 0 or image.ndim != 2:
+            canvas.delete("all")
+            self.gray_difference_photo = None
+            if start_var is not None:
+                start_var.set("")
+            if end_var is not None:
+                end_var.set("")
+            if status_var is not None:
+                status_var.set("未载入图像。")
+            return
+        height, width = image.shape
+        if width < 2:
+            canvas.delete("all")
+            self.gray_difference_photo = None
+            if status_var is not None:
+                status_var.set("图像过窄，无法计算灰度差。")
+            return
+        resolved = self.gray_difference_resolved_range()
+        if resolved is None:
+            canvas.delete("all")
+            self.gray_difference_photo = None
+            return
+        y_start, y_end = resolved
+        try:
+            mean_profile = self.gray_difference_cached_mean(y_start, y_end)
+        except ValueError as exc:
+            canvas.delete("all")
+            self.gray_difference_photo = None
+            if status_var is not None:
+                status_var.set(str(exc))
+            return
+        difference = profile_adjacent_difference(mean_profile)
+        n = len(difference)
+
+        canvas.delete("all")
+        self.gray_difference_photo = None
+        caption = (
+            f"平均行 {y_start}..{y_end}（共 {y_end - y_start} 行 / 全高 {height}），"
+            f"分辨率 {width} px，ΔI 长度 {n}。"
+        )
+
+        # ---- 物理对齐坐标 -------------------------------------------------
+        main = getattr(self, "canvas", None)
+        try:
+            scale = float(getattr(self, "display_scale", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            scale = 0.0
+        main_root_x = self._gray_difference_main_root_x()
+        graph_root_x = self.gray_difference_widget_root_x(canvas)
+        if main is None or scale <= 0 or main_root_x is None or graph_root_x is None:
+            # 主图/图表尚未完成布局：坐标未知，宁可不画也不假装对齐。
+            if status_var is not None:
+                status_var.set(caption + " 主图未布局，暂不绘制曲线。")
+            return
+        try:
+            main_canvasx_zero = float(main.canvasx(0))
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            main_canvasx_zero = 0.0
+        origin = main_root_x - graph_root_x - main_canvasx_zero
+
+        def screen_x(x_img: float) -> float:
+            return origin + float(x_img) * scale
+
+        # 仅绘制落在面板可见视口内的部分；不设左侧数据边距。
+        left_edge, right_edge = 0.0, float(wig)
+        # 图像右边界（工作图 x = width）。
+        image_right = screen_x(float(width))
+        zero_x0 = screen_x(0.0)
+        zero_x1 = screen_x(min(float(width), float(n)))
+        if zero_x1 > image_right:
+            zero_x1 = image_right
+
+        # ---- 纵向带：顶部刻度文字、底部单位标注 ------------------------
+        tick_band = 14.0
+        unit_band = 12.0
+        top = tick_band + 4.0
+        bottom = max(top + 1.0, float(vig) - unit_band - 2.0)
+        if bottom - top < 6.0:
+            # 视口过矮：只画曲线，不画刻度文字，避免重叠。
+            tick_band = 0.0
+            top = 2.0
+            bottom = max(top + 1.0, float(vig) - 2.0)
+        y_span = max(1.0, bottom - top)
+
+        low = float(np.nanmin(difference)) if n else 0.0
+        high = float(np.nanmax(difference)) if n else 0.0
+        if not np.isfinite(low) or not np.isfinite(high):
+            low, high = -1.0, 1.0
+        if high <= low:
+            pad = 1.0 if high == low else (high - low) * 0.05
+            low -= pad
+            high += pad
+        else:
+            pad = (high - low) * 0.05
+            low -= pad
+            high += pad
+        if not (np.isfinite(low) and np.isfinite(high)) or high <= low:
+            low, high = -1.0, 1.0
+
+        def data_y(value: float) -> float:
+            return bottom - (float(value) - low) * y_span / max(1e-12, high - low)
+
+        # ---- 刻度：水平位置（工作图 px）与纵向 ΔI ----------------------
+        if tick_band > 0.0:
+            step = self.gray_difference_nice_tick_step(scale)
+            first_tick = int(np.ceil(max(0.0, (left_edge - origin) / scale) / step) * step)
+            tick = first_tick
+            label_y = tick_band - 2.0
+            while tick <= width and screen_x(tick) <= right_edge + 0.5:
+                tx = screen_x(tick)
+                if tx >= left_edge - 0.5:
+                    canvas.create_line(tx, top - 3.0, tx, bottom, fill="#2c2c2c")
+                    canvas.create_text(tx, label_y,
+                                       text=f"{int(tick)}",
+                                       fill="#a0a0a0", anchor=tk.S, font=("Helvetica", 8))
+                tick += step
+            # 纵向 ΔI 单位：最大值/最小值/零轴标签放在右端（不占左侧数据边距）。
+            label_x = min(right_edge - 2.0, max(left_edge + 2.0, image_right - 2.0))
+            canvas.create_text(label_x, top + 1.0, text=f"ΔI {high:+.2f}",
+                               fill="#a0a0a0", anchor=tk.NE, font=("Helvetica", 8))
+            canvas.create_text(label_x, bottom - 1.0, text=f"ΔI {low:+.2f}",
+                               fill="#a0a0a0", anchor=tk.SE, font=("Helvetica", 8))
+            canvas.create_text(label_x, data_y(0.0) - 1.0, text="ΔI 0",
+                               fill="#808080", anchor=tk.SE, font=("Helvetica", 8))
+
+        # ---- 零轴（水平虚线，截断到图像右边界内）----------------------
+        if zero_x1 >= zero_x0 and zero_x0 <= right_edge and zero_x1 >= left_edge:
+            canvas.create_line(max(zero_x0, left_edge), data_y(0.0),
+                               min(zero_x1, right_edge), data_y(0.0),
+                               fill="#555555", dash=(2, 2))
+
+        # ---- 曲线：按可见片段断开，不跨空白处连线 ----------------------
+        curve_fill = "#7fd4ff"
+        segment: list[float] = []
+        for idx in range(n):
+            sx = screen_x(idx + 0.5)
+            if sx < left_edge - 1.0 or sx > right_edge + 1.0:
+                if len(segment) >= 4:
+                    canvas.create_line(*segment, fill=curve_fill, width=1)
+                segment = []
+                continue
+            segment.extend((min(max(sx, left_edge), right_edge), data_y(float(difference[idx]))))
+        if len(segment) >= 4:
+            canvas.create_line(*segment, fill=curve_fill, width=1)
+
+        # 图像右边界竖线：标记“图像以外横向空白仍为空白”。
+        if left_edge <= image_right <= right_edge:
+            canvas.create_line(image_right, top, image_right, bottom, fill="#3a3a3a")
+
+        if start_var is not None:
+            start_var.set(str(y_start))
+        if end_var is not None:
+            end_var.set(str(y_end))
+        if status_var is not None:
+            status_var.set(caption)
+
+    def _gray_difference_xscroll(self, first: float, last: float) -> None:
+        """主 SEM canvas 的 ``xscrollcommand`` 包装：保留滚条 ``set`` 并合并调度曲线重绘。
+
+        水平滚动改变主图 ``canvasx(0)``，进而移动灰度差曲线的数据屏幕坐标，所以
+        每次滚动都要在 idle 里合并重绘（去重，避免事件递归）；垂直滚动不影响对齐，
+        但仍会触发主 canvas 的 Configure，已由独立的 <Configure> 调度覆盖。
+        """
+        scrollbar = getattr(self, "image_horizontal_scrollbar", None)
+        if scrollbar is not None and hasattr(scrollbar, "set"):
+            scrollbar.set(first, last)
+        self._schedule_gray_difference_redraw()
+
+    def _schedule_gray_difference_redraw(self) -> None:
+        """Coalesce a pending inline-curve redraw onto ``after_idle`` exactly once."""
+        if getattr(self, "_gray_diff_redraw_pending", False):
+            return
+        self._gray_diff_redraw_pending = True
+
+        def _run() -> None:
+            self._gray_diff_redraw_pending = False
+            self._gray_diff_after_token = None
+            self.update_gray_difference_curve()
+
+        try:
+            token = self.after_idle(_run)
+        except Exception:
+            self._gray_diff_redraw_pending = False
+            return
+        # 记录回调句柄，供取消（无效输入清空后不当即被 Configure 盖回）。
+        self._gray_diff_after_token = token
+
+    def _cancel_gray_difference_redraw(self) -> None:
+        """Drop any queued idle redraw so a subsequent manual state change wins."""
+        if getattr(self, "_gray_diff_redraw_pending", False):
+            self._gray_diff_redraw_pending = False
+            token = getattr(self, "_gray_diff_after_token", None)
+            self._gray_diff_after_token = None
+            if token is not None:
+                try:
+                    self.after_cancel(token)
+                except Exception:
+                    pass
+
+    def _clear_gray_difference(self, reason: str) -> None:
+        """Clear the curve and caption the failure reason (never leaves stale art)."""
+        canvas = getattr(self, "gray_difference_canvas", None)
+        if canvas is not None:
+            canvas.delete("all")
+        self.gray_difference_photo = None
+        status_var = getattr(self, "gray_difference_status_var", None)
+        if status_var is not None:
+            status_var.set(reason)
+
+    def gray_difference_view_range(self, _event: object = None) -> None:
+        """Apply a user-entered y range and refresh only the curve (display-only).
+
+        起/止均为严格整数（不接受 ``"1.5"``、``"2.0"``、``inf``/``nan`` 等）；起包含、
+        止不含，需满足 ``0 <= start < end <= height``。任一为空则回退到整幅高度；
+        非法输入清空旧曲线并标明原因，不抛未处理异常，也不偷偷改成别的范围。
+        """
+        if getattr(self, "processed_image", None) is None:
+            return
+        height = self.processed_image.shape[0]
+        start_var = getattr(self, "gray_difference_start_entry_var", None)
+        end_var = getattr(self, "gray_difference_end_entry_var", None)
+        raw_start = start_var.get().strip() if start_var is not None else ""
+        raw_end = end_var.get().strip() if end_var is not None else ""
+        # 空输入（两者皆空）→ 整幅高度，并清除残留错误态。
+        if not raw_start and not raw_end:
+            self.gray_difference_error = None
+            self.gray_difference_y_start = None
+            self.gray_difference_y_end = None
+            self.update_gray_difference_curve()
+            return
+        # 单边为空无法构成范围 → 报错，不偷偷补默认。
+        if not raw_start or not raw_end:
+            self._cancel_gray_difference_redraw()
+            self.gray_difference_error = "平均范围需同时填写起始与结束 y（或两者留空=整幅）。"
+            self._clear_gray_difference(self.gray_difference_error)
+            return
+
+        def parse_int(raw: str) -> int | None:
+            try:
+                return int(raw, 10)
+            except ValueError:
+                return None
+
+        start = parse_int(raw_start)
+        end = parse_int(raw_end)
+        if start is None or end is None:
+            bad = raw_start if start is None else raw_end
+            self._cancel_gray_difference_redraw()
+            self.gray_difference_error = f"无效范围“{bad}”，请输入 0..{height} 的整数。"
+            self._clear_gray_difference(self.gray_difference_error)
+            return
+        if not (0 <= start < end <= height):
+            self._cancel_gray_difference_redraw()
+            self.gray_difference_error = (
+                f"范围“{raw_start}..{raw_end}”不满足 0 ≤ start < end ≤ {height}。"
+            )
+            self._clear_gray_difference(self.gray_difference_error)
+            return
+        # 有效输入：恢复显示合法范围。
+        self.gray_difference_error = None
+        self.gray_difference_y_start = start
+        self.gray_difference_y_end = end
+        self.update_gray_difference_curve()
+
     def draw_image(self, reset_view: bool = False) -> None:
         if self.raw_image is None:
+            self.update_gray_difference_curve()
             return
         image = self.bcp_preview_image if self.bcp_use_dog_var.get() else self.processed_image
         if image is None:
@@ -4962,6 +5475,7 @@ class LERLWRApp(AppBase):
         if reset_view:
             self.canvas.xview_moveto(0)
             self.canvas.yview_moveto(0)
+        self.update_gray_difference_curve()
 
     def display_bounds(self) -> tuple[float, float]:
         if self.raw_image is None:

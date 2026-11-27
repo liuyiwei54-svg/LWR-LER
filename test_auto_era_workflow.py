@@ -58,6 +58,28 @@ def headless_app(image):
         normalize_var=Value(True), gaussian_denoise_var=Value(True),
         blur_method_var=Value(app.BLUR_METHOD_GAUSSIAN),
     )
+    # Display-only bindings: processing/undo paths that redraw the canvas may touch the
+    # inline gray-difference panel; bind its real methods so headless hosts stay safe
+    # (no controls are present, so they only clear/keep the display state).
+    for name in (
+        "update_gray_difference_curve", "_schedule_gray_difference_redraw",
+        "_cancel_gray_difference_redraw", "_clear_gray_difference",
+        "invalidate_gray_difference_cache",
+    ):
+        setattr(state, name, MethodType(getattr(app.LERLWRApp, name), state))
+    state.gray_difference_canvas = None
+    state.gray_difference_photo = None
+    state.gray_difference_start_entry_var = None
+    state.gray_difference_end_entry_var = None
+    state.gray_difference_status_var = None
+    state.gray_difference_y_start = None
+    state.gray_difference_y_end = None
+    state.gray_difference_error = None
+    state._gray_diff_cache_key = None
+    state._gray_diff_cached_mean = None
+    state._gray_diff_cache_source = None
+    state._gray_diff_after_token = None
+    state._gray_diff_redraw_pending = False
     for name in (
         "refresh_era_sample_list", "update_lcdu_summary_text", "clear_auto_line_candidates",
         "clear_detected_edges", "clear_bcp_completion_selection",
